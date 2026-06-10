@@ -211,13 +211,20 @@ FilterParams_PAL = {
     # PAL builds its RF video filter as a split high-pass (low edge) + low-pass
     # (high edge) cascade so the two skirts can be shaped independently
     # (see computevideofilters).  The low edge is kept gentle (order 2) to
-    # protect the lower chroma sideband (~2.67 MHz) and its group delay; the
-    # high edge is a little sharper and a touch higher to better reject HF noise
-    # and the folded upper-J2 product (~16 MHz) while keeping the upper chroma
-    # sideband (~12.3 MHz) flat.
+    # protect the lower chroma sideband (~2.67 MHz) and its group delay; it
+    # also sits on the measured Pareto front between fold-over rejection
+    # (reflected J2 chroma sidebands at 1.4-1.8 MHz) and the lower sidebands
+    # of 5-5.8 MHz luma that share that spectrum.  The high edge is sharper
+    # to trim HF noise and the folded upper-J2 product (~16 MHz); 13 MHz was
+    # chosen by measurement on real captures - the player/capture chain rolls
+    # off above ~12.5 MHz anyway, so 14 MHz only admitted extra noise
+    # (13 vs 14: +0.1 dB wSNR on GGV, +0.4/+1.7 dB wSNR/bPSNR on an EFM
+    # disc, with multiburst response and colour-bar chroma unchanged).
+    # Captures from unusually wide-band chains can restore the old edge with
+    # --video_bpf_high 14.
     "video_bpf_low": 2300000,
     "video_bpf_low_order": 2,
-    "video_bpf_high": 14000000,
+    "video_bpf_high": 13000000,
     "video_bpf_high_order": 3,
     # video_bpf_order is retained for the shared bandpass path (NTSC) and the
     # --lowband override below; the PAL split path uses the two orders above.
