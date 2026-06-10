@@ -200,8 +200,12 @@ FilterParams_NTSC_lowband['video_bpf_high'] = 12500000
 FilterParams_NTSC_lowband['video_lpf_freq'] = 4200000
 
 FilterParams_PAL = {
-    # The audio notch filters are important with DD v3.0+ boards
-    "audio_notchwidth": 200000,
+    # Half-width of the analog audio carrier notches (see computevideofilters).
+    # +-150 kHz covers the carriers' FM spread (+-100 kHz deviation, +-150 kHz
+    # instantaneous peak per IEC 60856) while minimising the bite the notches
+    # take out of the video FM lower sidebands that share this part of the
+    # spectrum (high-frequency luma at dark levels).
+    "audio_notchwidth": 150000,
     "audio_notchorder": 2,
     "video_deemp": (100e-9, 400e-9),
     # PAL builds its RF video filter as a split high-pass (low edge) + low-pass
@@ -488,6 +492,29 @@ class RFDecode:
             (f + notchwidth) / (self.freq_hz_half if hz else self.freq_half)
         ]
 
+    def pal_audio_carriers_present(self, indata_fft, threshold=5.0):
+        """Detect whether the PAL analog audio FM carriers are present in this
+        block, by comparing the mean RF power around each carrier (+-40 kHz,
+        covering their FM deviation) against the spectrum flanking it
+        (+-100..250 kHz).  Discs with analog audio measure >15x on both
+        carriers; discs without (EFM/digital-only) measure ~1x or less, so a
+        threshold of 5 separates them cleanly."""
+        fpb = self.freq_hz / self.blocklen
+
+        def bandpower(f0, width):
+            lo, hi = int((f0 - width) / fpb), int((f0 + width) / fpb) + 1
+            return np.mean(sqsum(indata_fft[lo:hi]) ** 2)
+
+        for fcarrier in (self.SysParams["audio_lfreq"], self.SysParams["audio_rfreq"]):
+            carrier = bandpower(fcarrier, 40e3)
+            flank = (
+                bandpower(fcarrier - 175e3, 75e3) + bandpower(fcarrier + 175e3, 75e3)
+            ) / 2
+            if carrier < threshold * flank:
+                return False
+
+        return True
+
     def build_groupdelay_equalizer(self, lpf_fft):
         """All-pass equaliser matching the IEC 60856 sub-clause 9.1.6 video
         group-delay pre-distortion (PAL).
@@ -603,7 +630,17 @@ class RFDecode:
             SF["RFVideo"] = filtfft(filt_rfvideo, self.blocklen)
 
         # Notch filters for analog audio RF.  DdD captures on NTSC need this.
-        if SP["analog_audio"] and self.system == "NTSC":
+        # On PAL the carriers (683.59/1066.41 kHz, -26 dBc per IEC 60856) only
+        # get ~13 dB from the band-pass low skirt, and their beats against the
+        # video carrier land at |fv - fa| ~ 5.7-6.4 MHz - inside the 5.8 MHz
+        # video LPF - showing up as ~0.9 IRE of audio-correlated shimmer.  The
+        # notches cut that by ~15 dB.  They do also remove a sliver of the
+        # video FM lower sidebands (costing ~0.2 dB at 4.43 MHz / ~1.4 dB at
+        # 5.5 MHz in dark areas), so on PAL they are applied per block in
+        # demodblock_cpu, only when the carriers are actually present (PAL
+        # discs carry either analog audio or EFM, never both).  EFM and the
+        # audio decode paths tap indata_fft directly and are unaffected.
+        if SP["analog_audio"]:
             cut_left = sps.butter(
                 DP["audio_notchorder"],
                 self.notchrange(SP["audio_lfreq"], DP['audio_notchwidth'], True),
@@ -618,7 +655,10 @@ class RFDecode:
             )
             SF["Fcutr"] = filtfft(cut_right, self.blocklen)
 
-            SF["RFVideo"] *= SF["Fcutl"] * SF["Fcutr"]
+            if self.system == "NTSC":
+                SF["RFVideo"] *= SF["Fcutl"] * SF["Fcutr"]
+            else:
+                SF["FcutPAL"] = SF["Fcutl"] * SF["Fcutr"]
 
         SF["hilbert"] = build_hilbert(self.blocklen)
         SF["RFVideo"] *= SF["hilbert"]
@@ -805,6 +845,11 @@ class RFDecode:
                 indata_fft[self.blocklen - (i + 1 + sl.start)] = 0
 
         indata_fft_filt = indata_fft * self.Filters["RFVideo"]
+
+        # PAL: notch the analog audio carriers out of the video path, but only
+        # when they're actually on the disc (see computevideofilters)
+        if "FcutPAL" in self.Filters and self.pal_audio_carriers_present(indata_fft):
+            indata_fft_filt = indata_fft_filt * self.Filters["FcutPAL"]
 
         if mtf_level != 0:
             indata_fft_filt *= self.Filters["MTF"] ** mtf_level
@@ -3812,7 +3857,10 @@ class LDdecode:
         oldmtf = self.mtf_level
 
         if not self.autoMTF:
-            self.mtf_level = np.max(1 - (self.frameNumber / 10000), 0)
+            # np.maximum, not np.max: np.max(x, 0) treats 0 as the axis
+            # argument and returns x unchanged, so the level went negative
+            # past frame 10000 and MTF**negative blurred the HF instead.
+            self.mtf_level = np.maximum(1 - (self.frameNumber / 10000), 0)
         else:
             if len(self.bw_ratios) == 0:
                 return True
@@ -4142,7 +4190,10 @@ class LDdecode:
                     actualwhiteIRE = f.rf.hztoire(ire100_hz)
 
                     sync_ire_diff = nb_abs(self.rf.hztoire(sync_hz) - self.rf.DecoderParams["vsync_ire"])
-                    whitediff = nb_abs(self.rf.hztoire(ire100_hz) - actualwhiteIRE)
+                    # measured white should sit at 100 IRE under the current
+                    # calibration (comparing it against itself made this 0, so
+                    # a pure white-gain drift could never retrigger the AGC)
+                    whitediff = nb_abs(actualwhiteIRE - 100)
                     ire0_diff = nb_abs(self.rf.hztoire(ire0_hz))
 
                     acceptable_diff = 2 if self.fields_written else 0.5
