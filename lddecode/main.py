@@ -188,6 +188,16 @@ def main(args=None):
         default=False,
         help="LD-V4300D PAL/digital audio captures: remove spurious ~8.5mhz signal",
     )
+    parser.add_argument(
+        "--V4300D_coherent_subtract",
+        dest="V4300D_coherent_subtract",
+        action="store_true",
+        default=False,
+        help="Experimental alternative to --V4300D_notch_filter: coherently "
+        "estimate and subtract the ~8.5mhz spurious tone instead of zeroing "
+        "FFT bins (more suppression on synthetic tests; takes precedence "
+        "over -V if both are given)",
+    )
 
     parser.add_argument(
         "--deemp_low",
@@ -364,8 +374,8 @@ def main(args=None):
     if vid_standard == "PAL" and args.V4300D_notch_filter:
         extra_options["PAL_V4300D_NotchFilter"] = True
 
-    if vid_standard == "PAL" and args.V4300D_notch_filter:
-        extra_options["PAL_V4300D_NotchFilter"] = True
+    if vid_standard == "PAL" and args.V4300D_coherent_subtract:
+        extra_options["PAL_V4300D_CoherentSubtract"] = True
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")

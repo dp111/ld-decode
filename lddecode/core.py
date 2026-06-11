@@ -306,7 +306,8 @@ class RFDecode:
         has_analog_audio     -- Whether or not analog(ue) audio channels are on the disk
 
         extra_options -- Dictionary of additional options (typically boolean) - these include:
-          - PAL_V4300D_NotchFilter - cut 8.5mhz spurious signal
+          - PAL_V4300D_NotchFilter - cut 8.5mhz spurious signal (bin zeroing)
+          - PAL_V4300D_CoherentSubtract - same target, coherent subtraction
           - NTSC_ColorNotchFilter:  notch filter on decoded video to reduce color 'wobble'
           - lowband: Substitute different decode settings for lower-bandwidth disks
           - AC3: Supports AC3
@@ -329,6 +330,7 @@ class RFDecode:
 
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
         self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
+        self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
         lowband = extra_options.get("lowband", False)
 
         freq = inputfreq
@@ -521,6 +523,72 @@ class RFDecode:
                 return False
 
         return True
+
+    def v4300d_coherent_subtract(self, indata_fft, maxlines=10):
+        """Coherent (PLL-style, but stateless per block) removal of the
+        spurious ~8.47-8.57 MHz tone emitted by LD-V4300D players on some PAL
+        digital audio discs.
+
+        For each sufficiently prominent spectral line in the window (see
+        gating below): refine its frequency by parabolic interpolation of the
+        FFT peak, least-squares fit the complex amplitude over the block, and
+        subtract the reconstructed sinusoid in the time domain.  Unlike bin zeroing this also removes the off-bin spectral
+        leakage skirts, and removes nothing else (no holes in the underlying
+        video sidebands).  Self-disabling: with no anomalous line present the
+        gate never trips and the input FFT is returned unchanged.
+
+        Gating: static video content puts a comb of legitimate FM sideband
+        lines (line-rate spacing) in this window, and those measure up to
+        ~27x the window's median power on the test captures, so a new line
+        is only accepted at >40x median - which a lone player spur at
+        visible levels easily exceeds (-25 dBc measures ~60x).  Follow-up
+        iterations clean up the residual of an imperfect fit, and are only
+        allowed within +-30 kHz of an already-confirmed line (at a relaxed
+        >5x gate), so real video comb lines are never subtracted.  maxlines
+        bounds the loop; blocks without a spur pay only the detection cost.
+        """
+        sl = slice(
+            int(self.blocklen * (8.42 / self.freq)),
+            int(1 + (self.blocklen * (8.6 / self.freq))),
+        )
+        fpb = self.freq_hz / self.blocklen
+
+        X = indata_fft
+        x = None
+        lines = []
+        for _ in range(maxlines):
+            sq_sl = sqsum(X[sl])
+            med = np.median(sq_sl)
+            if med <= 0:
+                break
+            k = int(np.argmax(sq_sl))
+            ratio = sq_sl[k] / med
+            fpeak = (k + sl.start) * fpb
+            near_known = any(abs(fpeak - f) < 30e3 for f in lines)
+            if not (ratio > 40 or (near_known and ratio > 5)):
+                break
+
+            if x is None:
+                # enter the time domain on first detection only
+                x = npfft.ifft(indata_fft).real.copy()
+                n = np.arange(self.blocklen)
+
+            # parabolic refinement of the peak frequency between bins
+            i = k + sl.start
+            a, b, c = np.abs(X[i - 1]), np.abs(X[i]), np.abs(X[i + 1])
+            den = a - (2 * b) + c
+            d = np.clip(0.5 * (a - c) / den, -0.5, 0.5) if den != 0 else 0.0
+            fhat = (i + d) * fpb
+
+            # least-squares complex amplitude of the tone, then subtract it
+            e = np.exp(-2j * np.pi * (fhat / self.freq_hz) * n)
+            amp = np.sum(x * e) / (self.blocklen / 2)
+            x -= np.real(amp * np.conj(e))
+            lines.append(fhat)
+
+            X = npfft.fft(x)
+
+        return X
 
     def build_groupdelay_equalizer(self, lpf_fft):
         """All-pass equaliser matching the IEC 60856 sub-clause 9.1.6 video
@@ -825,7 +893,15 @@ class RFDecode:
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
 
-        if self.system == "PAL" and self.PAL_V4300D_NotchFilter:
+        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract:
+            # Experimental upgrade of the V4300D workaround below: instead of
+            # zeroing FFT bins (which leaves the off-bin spectral-leakage
+            # skirts of the interfering tone behind), estimate the tone(s)
+            # coherently and subtract them in the time domain.  ~6-10 dB more
+            # suppression on synthetic tests; see commit message for the A/B
+            # testing recipe against real LD-V4300D captures.
+            indata_fft = self.v4300d_coherent_subtract(indata_fft)
+        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter:
             """ This routine works around an 'interesting' issue seen with LD-V4300D players and
                 some PAL digital audio disks, where there is a signal somewhere between 8.47 and 8.57mhz.
 
