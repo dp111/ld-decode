@@ -217,6 +217,23 @@ def main(args=None):
     )
 
     parser.add_argument(
+        "--rf_echo_cancel",
+        dest="rf_echo_cancel",
+        action="store_true",
+        default=False,
+        help="Cancel the capture/player multi-path reflection (faint 'ghost to "
+        "the right'): auto-detect the echo delays from the RF cepstrum.",
+    )
+    parser.add_argument(
+        "--rf_echo",
+        dest="rf_echo",
+        type=str,
+        default="",
+        help="Manual echo taps for --rf_echo_cancel as comma-separated "
+        "delay_samples:amplitude pairs (e.g. 17:0.11,28:0.05); overrides auto.",
+    )
+
+    parser.add_argument(
         "--deemp_low",
         metavar="deemp_low",
         type=float,
@@ -397,6 +414,14 @@ def main(args=None):
     if args.fm_pll:
         extra_options["fm_pll"] = True
         extra_options["fm_pll_fn"] = args.fm_pll_fn * 1e6
+
+    if args.rf_echo:
+        extra_options["rf_echo_cancel"] = [
+            (float(p.split(":")[0]), float(p.split(":")[1]))
+            for p in args.rf_echo.split(",") if ":" in p
+        ]
+    elif args.rf_echo_cancel:
+        extra_options["rf_echo_cancel"] = True
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")

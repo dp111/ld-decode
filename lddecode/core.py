@@ -339,6 +339,21 @@ class RFDecode:
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
         self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
         self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
+        # RF multi-path echo cancellation.  Removes the *asymmetric* (causal,
+        # trailing) reflection from the player/capture chain - NOT the symmetric
+        # pre+post ring around edges, which is inherent to the source video and
+        # is left untouched.  Value: a list of (delay_samples, amplitude) taps
+        # (manual), or True to auto-detect delays from the RF cepstrum
+        # (best-effort - the short-delay echoes overlap the de-emphasis spectral
+        # shape, so manual taps are preferred).
+        self.rf_echo_cancel = extra_options.get("rf_echo_cancel", False)
+        self._echo_inv = None
+        self._echo_accum = None
+        self._echo_n = 0
+        import threading as _threading
+        self._echo_lock = _threading.Lock()
+        if isinstance(self.rf_echo_cancel, (list, tuple)) and len(self.rf_echo_cancel):
+            self._echo_inv = self._build_echo_inverse(self.rf_echo_cancel)
         # Optional PLL FM discriminator (unwrap_hilbert_pll) in place of the
         # default conjugate-product one - trades speed for threshold extension
         # on poor captures.  fm_pll_fn is the loop natural frequency (Hz).
@@ -905,6 +920,30 @@ class RFDecode:
         return self.demodblock_cpu(data, mtf_level, fftdata, cut)
 
 
+    def _build_echo_inverse(self, taps):
+        """Stable exact inverse 1/H of the echo channel h = 1 + sum a_i z^-d_i
+        (taps are small, so |H| stays bounded away from zero)."""
+        h = np.zeros(self.blocklen)
+        h[0] = 1.0
+        for d, a in taps:
+            d = int(round(d))
+            if 0 < d < self.blocklen:
+                h[d] += a
+        return 1.0 / npfft.fft(h)
+
+    def _estimate_echo(self, maxechoes=3):
+        """Best-effort echo-delay detection from the averaged RF cepstrum.
+        Quefrencies below ~15 samples are the band-pass/de-emphasis envelope,
+        not echoes, so only past that is searched; the cepstrum value at a peak
+        approximates the echo amplitude."""
+        cep = self._echo_accum / max(self._echo_n, 1)
+        floor = np.median(np.abs(cep[80:180]))
+        peaks = [(k, float(cep[k])) for k in range(15, 180)
+                 if abs(cep[k]) > 6 * floor
+                 and abs(cep[k]) >= abs(cep[k - 1]) and abs(cep[k]) >= abs(cep[k + 1])]
+        peaks.sort(key=lambda t: -abs(t[1]))
+        return peaks[:maxechoes]
+
     def demodblock_cpu(self, data=None, mtf_level=0, fftdata=None, cut=False):
         rv = {}
 
@@ -914,6 +953,22 @@ class RFDecode:
             indata_fft = npfft.fft(data[: self.blocklen])
         else:
             raise Exception("demodblock called without raw or FFT data")
+
+        if self.rf_echo_cancel:
+            if self._echo_inv is None:
+                with self._echo_lock:
+                    if self._echo_inv is None:
+                        if data is not None:
+                            wd = data[: self.blocklen] * np.hanning(self.blocklen)
+                            c = npfft.ifft(np.log(np.abs(npfft.fft(wd)) + 1e-9)).real
+                        else:
+                            c = npfft.ifft(np.log(np.abs(indata_fft) + 1e-9)).real
+                        self._echo_accum = c.copy() if self._echo_accum is None else self._echo_accum + c
+                        self._echo_n += 1
+                        if self._echo_n >= 30:
+                            self._echo_inv = self._build_echo_inverse(self._estimate_echo())
+            if self._echo_inv is not None:
+                indata_fft = indata_fft * self._echo_inv
 
 
         rotdelay = 0
