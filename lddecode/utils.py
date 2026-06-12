@@ -853,6 +853,64 @@ def unwrap_hilbert(hilbert, freq_hz):
 
     return out * (freq_hz / tau)
 
+
+@njit(cache=True, nogil=True)
+def unwrap_hilbert_pll(hilbert, freq_hz, center_hz, loop_fn_hz, zeta):
+    """PLL FM discriminator: recover instantaneous frequency (Hz) of an analytic
+    signal with a second-order phase-locked loop instead of the conjugate-product
+    differentiator in unwrap_hilbert().
+
+    A digitally-controlled oscillator tracks the input phase; the loop's
+    frequency-integrator state IS the demodulated FM.
+
+    NOTE (negative result, kept for reference): PLL threshold extension only
+    helps *high* modulation-index FM.  LaserDisc video is low index - IEC 60856
+    9.2.3 gives only 800 kHz blanking-to-white deviation against a ~5 MHz message
+    bandwidth, so beta ~= 0.1 - and the loop must be wide enough to follow that
+    ~5.8 MHz message (loop_fn_hz >= ~5 MHz).  At the 40 MHz sample rate that loop
+    is near-unstable and amplifies noise rather than rejecting it; measured ~3.5 dB
+    *worse* wSNR than the conjugate-product unwrap_hilbert() on real captures.  The
+    conjugate-product discriminator is the right tool for this modulation; this is
+    retained behind --fm_pll only as an experiment / building block.
+
+    loop_fn_hz sets the loop natural frequency (must exceed the video modulation
+    rate to follow the picture); zeta is the damping (~0.707 critically damped).
+    """
+    n = len(hilbert)
+    out = np.empty(n, np.float64)
+    twopi = 2.0 * np.pi
+
+    # second-order loop gains from the normalised natural frequency
+    theta = twopi * loop_fn_hz / freq_hz
+    kp = 2.0 * zeta * theta
+    ki = theta * theta
+
+    omega_c = twopi * center_hz / freq_hz
+    phase = 0.0
+    integ = omega_c  # frequency integrator (rad/sample), seeded at the carrier
+
+    for i in range(n):
+        zr = hilbert[i].real
+        zi = hilbert[i].imag
+        c = np.cos(phase)
+        s = np.sin(phase)
+        # phase error = arg(z * exp(-j*phase)), already wrapped into (-pi, pi]
+        er = zr * c + zi * s
+        ei = zi * c - zr * s
+        err = np.arctan2(ei, er)
+
+        freq = integ + kp * err  # proportional + integral = instantaneous freq
+        out[i] = freq
+        integ += ki * err
+        phase += freq
+        if phase >= twopi:
+            phase -= twopi
+        elif phase < 0.0:
+            phase += twopi
+
+    return out * (freq_hz / twopi)
+
+
 def fft_determine_slices(center, min_bandwidth, freq_hz, bins_in):
     """ returns the # of sub-bins needed to get center+/-min_bandwidth.
         The returned lowbin is the first bin (symmetrically) needed to be saved.

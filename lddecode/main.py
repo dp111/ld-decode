@@ -198,6 +198,23 @@ def main(args=None):
         "FFT bins (more suppression on synthetic tests; takes precedence "
         "over -V if both are given)",
     )
+    parser.add_argument(
+        "--fm_pll",
+        dest="fm_pll",
+        action="store_true",
+        default=False,
+        help="Experimental: demodulate FM with a PLL discriminator instead of the "
+        "default conjugate-product one.  Slower, and measures WORSE on real "
+        "captures - LD's low-modulation-index FM gives a PLL no threshold "
+        "extension (see unwrap_hilbert_pll).  Kept for reference only.",
+    )
+    parser.add_argument(
+        "--fm_pll_fn",
+        dest="fm_pll_fn",
+        type=float,
+        default=4.8,
+        help="PLL FM discriminator loop natural frequency in MHz (default 4.8)",
+    )
 
     parser.add_argument(
         "--deemp_low",
@@ -376,6 +393,10 @@ def main(args=None):
 
     if vid_standard == "PAL" and args.V4300D_coherent_subtract:
         extra_options["PAL_V4300D_CoherentSubtract"] = True
+
+    if args.fm_pll:
+        extra_options["fm_pll"] = True
+        extra_options["fm_pll_fn"] = args.fm_pll_fn * 1e6
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")

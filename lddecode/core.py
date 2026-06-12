@@ -30,7 +30,7 @@ from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absm
 from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
 from .utils import findpeaks, findpulses, calczc, inrange, roundfloat
 from .utils import LRUupdate, clb_findbursts, angular_mean_helper, phase_distance
-from .utils import build_hilbert, unwrap_hilbert, emphasis_iir, filtfft
+from .utils import build_hilbert, unwrap_hilbert, unwrap_hilbert_pll, emphasis_iir, filtfft
 from .utils import fft_do_slice, fft_determine_slices, StridedCollector, hz_to_output_array
 from .utils import Pulse, nb_std, nb_gt, n_ornotrange, nb_concatenate, gen_bpf_supergauss, FieldInfo
 
@@ -331,6 +331,12 @@ class RFDecode:
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
         self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
         self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
+        # Optional PLL FM discriminator (unwrap_hilbert_pll) in place of the
+        # default conjugate-product one - trades speed for threshold extension
+        # on poor captures.  fm_pll_fn is the loop natural frequency (Hz).
+        self.fm_pll = extra_options.get("fm_pll", False)
+        self.fm_pll_fn = extra_options.get("fm_pll_fn", 4800000)
+        self.fm_pll_zeta = extra_options.get("fm_pll_zeta", 0.707)
         lowband = extra_options.get("lowband", False)
 
         freq = inputfreq
@@ -955,7 +961,13 @@ class RFDecode:
             indata_fft_filt *= self.Filters["MTF"] ** mtf_level
 
         hilbert = npfft.ifft(indata_fft_filt)
-        demod = unwrap_hilbert(hilbert, self.freq_hz)
+        if self.fm_pll:
+            demod = unwrap_hilbert_pll(
+                hilbert, self.freq_hz, self.DecoderParams["ire0"],
+                self.fm_pll_fn, self.fm_pll_zeta,
+            )
+        else:
+            demod = unwrap_hilbert(hilbert, self.freq_hz)
 
         # use a clipped demod for video output processing to reduce speckling impact.
         # demod is real and these video outputs are real, so the half-spectrum
