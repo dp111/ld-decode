@@ -1,0 +1,947 @@
+"""Multi-capture disc stacking, integrated into ld-decode.
+
+Combine several captures of the *same* disc into one improved output (video
+TBC, analog audio, and EFM) so that dropouts are filled, random noise is
+reduced by ~sqrt(N), and sub-pixel timing differences between captures are
+corrected.  Because it runs inside ld-decode, the per-disc TBCs are consumed
+frame-by-frame as they are produced -- there is no need to write twelve ~75 GB
+intermediate .tbc files.
+
+Pipeline
+--------
+1. Open N inputs.  Each is either a pre-decoded ``.tbc`` (with ``.tbc.json``)
+   or a raw ``.ldf`` that is decoded live in lockstep (``LDFFrameSource``).
+2. Align frames across captures by their CAV VBI picture number (CLV / non-CAV
+   discs fall back to sequential frame index).  The recording start may differ
+   per capture; aligning on the picture number absorbs that.
+3. Quality / master pass: on a sample of shared frames, estimate each capture's
+   noise and cluster captures by master (captures of a *different* glass master
+   disagree in a shared, structured way; same-master captures differ only by
+   independent noise).  Discard unusable captures and captures not belonging to
+   the chosen (largest) master group.
+4. For every output frame: sub-pixel + level register each capture's fields to a
+   reference, then combine dropout-aware and inverse-variance weighted.
+5. Audio: align (sub-sample lag) and weighted-average the analog audio.
+6. EFM: average the TBC-locked pre-PLL EFM waveforms across captures (LDF source
+   with --tbc_efm), then run the EFM PLL on the average.
+7. Write ``.tbc`` + ``.tbc.json`` + ``.tbc.db`` (sqlite) + ``.pcm`` + ``.efm``.
+
+Works for PAL and NTSC; the engine is system-agnostic and reads geometry/levels
+from the reference capture's videoParameters.
+"""
+
+import json
+import os
+import sqlite3
+from textwrap import dedent
+
+import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+#  VBI helpers
+# --------------------------------------------------------------------------- #
+def cav_picture(vbidata):
+    """CAV picture number from a field's VBI: an 0xFxxxxx code, low 5 nibbles BCD."""
+    for x in vbidata or []:
+        h = "%06x" % x
+        if h[0] == "f" and all(c in "0123456789" for c in h[1:]):
+            return int(h[1:])
+    return None
+
+
+def field_vbi(field_json):
+    return field_json.get("vbi", {}).get("vbiData", []) or []
+
+
+# --------------------------------------------------------------------------- #
+#  Frame model + sources
+# --------------------------------------------------------------------------- #
+class Frame:
+    """One disc frame from one capture: two fields plus their metadata."""
+
+    __slots__ = ("key", "f0", "f1", "meta0", "meta1", "do0", "do1",
+                 "audio", "efm")
+
+    def __init__(self, key, f0, f1, meta0, meta1, do0, do1, audio, efm):
+        self.key = key          # picture number (CAV) or sequential index
+        self.f0 = f0            # uint16 2D field array (height, width)
+        self.f1 = f1
+        self.meta0 = meta0      # dict: fieldPhaseID, isFirstField, ...
+        self.meta1 = meta1
+        self.do0 = do0          # list[(line, startx, endx)] dropouts
+        self.do1 = do1
+        self.audio = audio      # int16 (n,2) or None
+        self.efm = efm          # T-values (tbc path) or waveform (ldf, tbc_efm)
+
+
+class FrameSource:
+    """Abstract: yields Frame objects in disc order and exposes geometry."""
+
+    videoParameters = None      # dict (ld-decode videoParameters)
+    name = "?"
+
+    def frames(self):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class TBCFrameSource(FrameSource):
+    """Read a decoded ``.tbc`` (+ ``.tbc.json``).  Also the path used for tests
+    and for users who already have decoded captures."""
+
+    def __init__(self, base, cav=True):
+        self.base = base
+        self.name = os.path.basename(base)
+        self.cav = cav
+        j = json.load(open(base + ".tbc.json"))
+        self.videoParameters = j["videoParameters"]
+        self.fields = j["fields"]
+        fw = self.videoParameters["fieldWidth"]
+        fh = self.videoParameters["fieldHeight"]
+        n = len(self.fields)
+        self.tbc = np.memmap(base + ".tbc", dtype="<u2", mode="r",
+                             shape=(n, fh, fw))
+        self.pcm = None
+        p = base + ".pcm"
+        if os.path.exists(p):
+            self.pcm = np.fromfile(p, dtype="<i2").reshape(-1, 2)
+
+    def _dropouts(self, fj):
+        do = fj.get("dropOuts") or {}
+        fl = do.get("fieldLine") or []
+        sx = do.get("startx") or []
+        ex = do.get("endx") or []
+        return list(zip(fl, sx, ex))
+
+    def _build_index(self):
+        self._idx = {}
+        self._spf = 0
+        nframes = len(self.fields) // 2
+        if self.pcm is not None and nframes:
+            self._spf = len(self.pcm) // nframes
+        for fi in range(nframes):
+            j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
+            key = cav_picture(field_vbi(j0) + field_vbi(j1)) if self.cav else fi
+            if key is not None and key not in self._idx:
+                self._idx[key] = fi
+
+    def keys(self):
+        if not hasattr(self, "_idx"):
+            self._build_index()
+        return set(self._idx)
+
+    def get(self, key):
+        if not hasattr(self, "_idx"):
+            self._build_index()
+        fi = self._idx[key]
+        j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
+        audio = None
+        if self.pcm is not None and self._spf:
+            audio = np.asarray(self.pcm[fi * self._spf:(fi + 1) * self._spf])
+        return Frame(
+            key,
+            np.asarray(self.tbc[fi * 2]), np.asarray(self.tbc[fi * 2 + 1]),
+            j0, j1, self._dropouts(j0), self._dropouts(j1),
+            audio, None,
+        )
+
+    def frames(self):
+        for key in sorted(self.keys()):
+            yield self.get(key)
+
+
+def _do_pairs(fi):
+    do = fi.get("dropOuts") or {}
+    return list(zip(do.get("fieldLine", []) or [],
+                    do.get("startx", []) or [],
+                    do.get("endx", []) or []))
+
+
+class LDFFrameSource(FrameSource):
+    """Decode an ``.ldf`` live and yield frames, so no intermediate .tbc is
+    written.  EFM is taken TBC-locked (``--tbc_efm``) so the pre-PLL waveform can
+    be stacked across captures.
+
+    Fields are captured by overriding ``LDdecode.writeout`` (which receives
+    ``(field, field_json, picture, audio, efm)``), so ld-decode does all the
+    normal downscale / dropout-detection / VBI work but nothing large is written
+    to disk -- only a tiny throwaway temp base for the (empty) output handles.
+    """
+
+    def __init__(self, path, system="PAL", seek=None, length=None,
+                 inputfreq=None, analog_audio=44100, extra_options=None):
+        from lddecode import core
+        from lddecode.utils import make_loader
+        from lddecode.utils_logging import init_logging
+        import tempfile
+        self.path = path
+        self.name = os.path.basename(path)
+        self.seek = seek
+        self.length = length
+        opts = {"tbc_efm": True}
+        opts.update(extra_options or {})
+        self._captured = []
+        outer = self
+
+        class _CapturingLD(core.LDdecode):
+            def writeout(self, dataset):
+                outer._captured.append(dataset)  # (f, fi, picture, audio, efm)
+
+        # keep scratch next to the input (large media volume), not on /tmp
+        self._tmpdir = tempfile.mkdtemp(prefix="lddstack_",
+                                        dir=os.path.dirname(os.path.abspath(path)))
+        loader = make_loader(path, inputfreq)
+        logger = init_logging(os.path.join(self._tmpdir, "cap.log"))
+        self.ldd = _CapturingLD(
+            path, os.path.join(self._tmpdir, "cap"), loader, logger,
+            analog_audio=analog_audio, digital_audio=True,
+            # synchronous decode (threads=0): driving readfield() in-process
+            # after a programmatic seek leaves the async decode-thread state
+            # inconsistent and stalls; it also lets several captures share one
+            # process safely.
+            system=system, doDOD=True, threads=0, extra_options=opts,
+        )
+        self.videoParameters = None
+
+    def _vp(self):
+        if self.videoParameters is None:
+            self.videoParameters = self.ldd.build_json()["videoParameters"]
+        return self.videoParameters
+
+    def frames(self):
+        ldd = self.ldd
+        # mirror main.py's startup exactly: prime the reader with a roughseek
+        # before any decode, then seek (which does its own roughseek/retries).
+        # Without the initial roughseek the first decodefield never locks and
+        # seek() spins.
+        ldd.roughseek((int(self.seek) if self.seek else 0) * 2)
+        if self.seek:
+            ldd.seek(int(self.seek), int(self.seek))
+        pend = None
+        produced = 0
+        while True:
+            if self.length and produced >= self.length:
+                break
+            self._captured = []
+            f = ldd.readfield()
+            captured = list(self._captured)
+            for (ff, fi, picture, audio, efm) in captured:
+                vp = self._vp()
+                fw = vp["fieldWidth"]
+                arr = np.asarray(picture, dtype=np.float64)
+                h = arr.size // fw
+                field2d = arr[:h * fw].reshape(h, fw)
+                vbi = fi.get("vbi", {}).get("vbiData", []) or []
+                rec = (fi, field2d, _do_pairs(fi), audio, efm, vbi,
+                       bool(fi.get("isFirstField", True)))
+                isfirst = rec[6]
+                if isfirst:
+                    pend = rec          # (re)start a frame on a first field
+                    continue
+                if pend is None:
+                    continue            # orphan second field, skip
+                a, b = pend, rec
+                pend = None
+                key = cav_picture(a[5] + b[5])
+                if key is None:
+                    continue
+                aud = None
+                if a[3] is not None and b[3] is not None:
+                    aud = np.concatenate([np.asarray(a[3]), np.asarray(b[3])])
+                yield Frame(key, a[1], b[1], a[0], b[0], a[2], b[2], aud,
+                            (a[4], b[4]))
+                produced += 1
+            if f is None:
+                break
+
+    def keys(self):
+        raise NotImplementedError(
+            "live .ldf sources are streaming; the stacker buffers them "
+            "(see stack(); use TBC inputs for random access)")
+
+    def close(self):
+        try:
+            self.ldd.close()
+        except Exception:
+            pass
+        import shutil
+        shutil.rmtree(getattr(self, "_tmpdir", ""), ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+#  Registration + combine engine
+# --------------------------------------------------------------------------- #
+def _active(vp):
+    avs, ave = vp["activeVideoStart"], vp["activeVideoEnd"]
+    fh = vp["fieldHeight"]
+    return slice(24, fh - 6), slice(avs, ave)
+
+
+def integer_shift(ref, img):
+    a = ref - ref.mean()
+    b = img - img.mean()
+    R = np.fft.fft2(b) * np.conj(np.fft.fft2(a))
+    R /= np.abs(R) + 1e-9
+    c = np.real(np.fft.ifft2(R))
+    p = np.unravel_index(np.argmax(c), c.shape)
+    sy = p[0] - (c.shape[0] if p[0] > c.shape[0] // 2 else 0)
+    sx = p[1] - (c.shape[1] if p[1] > c.shape[1] // 2 else 0)
+    return sy, sx
+
+
+def fourier_shift(img, dy, dx):
+    if dy == 0 and dx == 0:
+        return img
+    H, W = img.shape
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.fftfreq(W)[None, :]
+    F = np.fft.fft2(img)
+    return np.real(np.fft.ifft2(F * np.exp(-2j * np.pi * (fy * dy + fx * dx))))
+
+
+def register_field(field, ref, ra, ca, subpixel=True):
+    """Return field resampled to align with ref, plus affine level-matched.
+    ra/ca are the active row/col slices used for measuring the shift."""
+    fa = field.astype(np.float64)
+    iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
+    best = (float(iy), float(ix))
+    if subpixel:
+        refblk = ref[ra, ca]
+        # two-stage grid search: coarse (0.25) then fine (0.05) around the best,
+        # so the fractional offset that distinguishes glass masters (~0.1 px) is
+        # resolved rather than quantised to the coarse step.
+        for step, span in ((0.25, 0.5), (0.05, 0.25)):
+            cy, cx = best
+            bestrms = None
+            for dy in cy + np.arange(-span, span + 1e-9, step):
+                for dx in cx + np.arange(-span, span + 1e-9, step):
+                    s = fourier_shift(fa, dy, dx)[ra, ca]
+                    rms = np.mean((s - refblk) ** 2)
+                    if bestrms is None or rms < bestrms:
+                        bestrms, best = rms, (dy, dx)
+    shifted = fourier_shift(fa, best[0], best[1])
+    # affine level match (gain+offset) to reference over active region
+    x = shifted[ra, ca].ravel()
+    y = ref[ra, ca].ravel()
+    A = np.vstack([x, np.ones_like(x)]).T
+    g, o = np.linalg.lstsq(A, y, rcond=None)[0]
+    return g * shifted + o, best
+
+
+def chroma_align_field(field, ref, ca, fsc_norm=0.25, halfband=0.06):
+    """Make a capture's chroma subcarrier phase-coherent with the reference,
+    per line, so it survives averaging.
+
+    ld-decode pilot-locks luma but the per-line chroma subcarrier phase wanders
+    (~1px) and that wander is INDEPENDENT between captures, so averaging the
+    composite partially cancels chroma.  Here we isolate each line's chroma band
+    (around fSC = fs/4 for both PAL and NTSC at 4*fSC sampling) and rotate its
+    phase to match the reference capture's chroma on the same line.  Luma is left
+    untouched (it is already pilot-solid).  The result shares the reference's
+    wander -- common-mode -- so it no longer cancels on combine.
+    """
+    F = field.astype(np.float64)
+    seg = F[:, ca]
+    R = ref.astype(np.float64)[:, ca]
+    n = seg.shape[1]
+    fr = np.fft.rfftfreq(n)
+    band = (fr > fsc_norm - halfband) & (fr < fsc_norm + halfband)
+    Ff = np.fft.rfft(seg, axis=1)
+    Rf = np.fft.rfft(R, axis=1)
+    cF = np.where(band, Ff, 0)
+    cR = np.where(band, Rf, 0)
+    # per-line phase offset of this capture's chroma vs the reference's
+    dphi = np.angle((cF * np.conj(cR)).sum(axis=1))
+    chroma = np.fft.irfft(cF, n, axis=1)
+    chroma_aligned = np.fft.irfft(cF * np.exp(-1j * dphi)[:, None], n, axis=1)
+    out = F.copy()
+    out[:, ca] = seg - chroma + chroma_aligned
+    return out
+
+
+def dropout_mask(shape, dropouts):
+    m = np.zeros(shape, dtype=bool)
+    for line, sx, ex in dropouts:
+        if 0 <= line < shape[0]:
+            m[int(line), int(sx):int(ex)] = True
+    return m
+
+
+def combine_fields(fields, masks, weights, sigma):
+    """Dropout-aware, inverse-variance weighted combine of registered fields.
+
+    fields: list of float 2D arrays (already registered to a common grid)
+    masks:  list of bool dropout masks (True = bad pixel, exclude)
+    weights: per-capture inverse-variance weights
+    sigma:  per-capture noise (for outlier rejection vs the median)
+    """
+    stack = np.stack(fields, 0)
+    good = ~np.stack(masks, 0)
+    med = np.median(np.where(good, stack, np.nan), axis=0)
+    med = np.where(np.isnan(med), stack.mean(0), med)
+    # reject pixels far from the median (catches un-flagged dropouts/glitches)
+    thr = (5.0 * np.array(sigma)).reshape(-1, 1, 1)
+    good &= np.abs(stack - med[None]) <= thr
+    w = np.array(weights).reshape(-1, 1, 1) * good
+    wsum = w.sum(0)
+    out = np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
+    return out, wsum
+
+
+def align_audio(ref, x, maxlag=4000):
+    """Integer-sample lag of x vs ref (mono), via central-segment xcorr."""
+    n = min(len(ref), len(x))
+    if n < 256:
+        return 0
+    s, L = n // 4, n // 2
+    r = ref[s:s + L] - ref[s:s + L].mean()
+    best = (-2.0, 0)
+    rn = np.linalg.norm(r) + 1e-9
+    for k in range(-maxlag, maxlag + 1, 1):
+        seg = x[s + k:s + k + L]
+        if len(seg) < L:
+            continue
+        seg = seg - seg.mean()
+        c = float((r * seg).sum() / (rn * (np.linalg.norm(seg) + 1e-9)))
+        if c > best[0]:
+            best = (c, k)
+    return best[1]
+
+
+# --------------------------------------------------------------------------- #
+#  Quality + master clustering
+# --------------------------------------------------------------------------- #
+def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0):
+    """Estimate per-capture noise and cluster captures by master.
+
+    frame_dicts: list of {name: Frame} for a sample of aligned frames.
+    Returns dict per source name: {'noise', 'dx', 'master', 'keep', 'reason'}.
+
+    Master discriminator = the horizontal sub-pixel registration offset.
+    Different glass masters lay the active video down at a slightly different
+    position relative to sync (a fixed, content-independent fractional-pixel
+    shift); same-master captures register to ~0 against each other.  This is far
+    more robust than residual correlation, which is confounded by shared edge
+    residuals on high-detail content (e.g. a test card).  Captures are clustered
+    by their median dx against a fixed reference; the largest cluster is the
+    primary master, the rest are alt masters (used for cross-master fill).
+    """
+    names = sorted({n for fd in frame_dicts for n in fd})
+    # fixed reference = the capture present in the most sample frames
+    refn = max(names, key=lambda n: sum(n in fd for fd in frame_dicts))
+    shifts = {n: [] for n in names}
+    noise = {n: [] for n in names}
+    for fd in frame_dicts:
+        if refn not in fd or len(fd) < 2:
+            continue
+        ref = fd[refn].f0.astype(np.float64)
+        reg = {}
+        for n, fr in fd.items():
+            r, best = register_field(fr.f0.astype(np.float64), ref, ra, ca,
+                                     subpixel=True)
+            shifts[n].append(best[1])           # dx (sub-pixel)
+            reg[n] = r[ra, ca]
+        med = np.median(np.stack(list(reg.values()), 0), 0)
+        gy, gx = np.gradient(med)
+        flat = np.hypot(gy, gx) < np.percentile(np.hypot(gy, gx), 40)
+        for n, r in reg.items():
+            noise[n].append((r - med)[flat].std())
+    info = {n: {} for n in names}
+    for n in names:
+        info[n]["noise"] = float(np.median(noise[n])) if noise[n] else float("inf")
+        info[n]["dx"] = float(np.median(shifts[n])) if shifts[n] else None
+    present = [n for n in names if shifts[n]]
+    # 1-D clustering of dx: sort, split where the gap exceeds shift_tol
+    order = sorted(present, key=lambda n: info[n]["dx"])
+    clusters, cur = [], []
+    for n in order:
+        if cur and (info[n]["dx"] - info[cur[-1]]["dx"]) > shift_tol:
+            clusters.append(cur); cur = []
+        cur.append(n)
+    if cur:
+        clusters.append(cur)
+    clusters.sort(key=lambda g: (-len(g),
+                                 np.mean([info[k]["noise"] for k in g])))
+    for ci, g in enumerate(clusters):
+        for n in g:
+            info[n]["master"] = ci
+    primary = clusters[0] if clusters else []
+    cutoff = (noise_mult * float(np.median([info[n]["noise"] for n in primary]))
+              if primary else float("inf"))
+    for n in names:
+        if n not in present:
+            info[n]["keep"], info[n]["reason"] = False, "no usable frames"
+        elif info[n].get("master", -1) != 0:
+            info[n]["keep"], info[n]["reason"] = \
+                False, "different master (dx=%+.2f)" % info[n]["dx"]
+        elif info[n]["noise"] > cutoff:
+            info[n]["keep"], info[n]["reason"] = False, "noise outlier"
+        else:
+            info[n]["keep"], info[n]["reason"] = True, "ok"
+    return info
+
+
+# --------------------------------------------------------------------------- #
+#  Output writer (.tbc / .tbc.json / .tbc.db / .pcm / .efm)
+# --------------------------------------------------------------------------- #
+class StackWriter:
+    def __init__(self, outbase, vp, system, git_commit=""):
+        self.outbase = outbase
+        self.vp = dict(vp)
+        self.system = system
+        self.git_commit = git_commit
+        self.tbc = open(outbase + ".tbc", "wb")
+        self.pcm = open(outbase + ".pcm", "wb")
+        self.fields_json = []
+        self.audio_total = 0
+        if os.path.exists(outbase + ".tbc.db"):
+            os.unlink(outbase + ".tbc.db")
+        self.db = sqlite3.connect(outbase + ".tbc.db")
+        self._schema()
+        self._field_id = 0
+
+    def _schema(self):
+        self.db.executescript(dedent('''\
+            PRAGMA user_version = 1;
+            CREATE TABLE capture(capture_id INTEGER PRIMARY KEY, system TEXT,
+                decoder TEXT, git_branch TEXT, git_commit TEXT,
+                video_sample_rate REAL, active_video_start INTEGER,
+                active_video_end INTEGER, field_width INTEGER, field_height INTEGER,
+                number_of_sequential_fields INTEGER, colour_burst_start INTEGER,
+                colour_burst_end INTEGER, is_mapped INTEGER, is_subcarrier_locked INTEGER,
+                is_widescreen INTEGER, white_16b_ire INTEGER, black_16b_ire INTEGER,
+                blanking_16b_ire INTEGER, capture_notes TEXT);
+            CREATE TABLE pcm_audio_parameters(capture_id INTEGER PRIMARY KEY,
+                bits INTEGER, is_signed INTEGER, is_little_endian INTEGER, sample_rate REAL);
+            CREATE TABLE field_record(capture_id INTEGER, field_id INTEGER,
+                audio_samples INTEGER, decode_faults INTEGER, disk_loc REAL,
+                efm_t_values INTEGER, field_phase_id INTEGER, file_loc INTEGER,
+                is_first_field INTEGER, median_burst_ire REAL, pad INTEGER,
+                sync_conf INTEGER, PRIMARY KEY(capture_id, field_id));
+            CREATE TABLE vbi(capture_id INTEGER, field_id INTEGER, vbi0 INTEGER,
+                vbi1 INTEGER, vbi2 INTEGER, PRIMARY KEY(capture_id, field_id));
+            CREATE TABLE drop_outs(capture_id INTEGER, field_id INTEGER,
+                field_line INTEGER, startx INTEGER, endx INTEGER);
+        '''))
+
+    def write_field(self, arr_u16, meta, vbidata, dropouts, efm_t, audio_n):
+        self.tbc.write(np.ascontiguousarray(arr_u16, dtype="<u2").tobytes())
+        fid = self._field_id
+        self._field_id += 1
+        fj = {
+            "isFirstField": bool(meta.get("isFirstField", fid % 2 == 0)),
+            "syncConf": int(meta.get("syncConf", 100)),
+            "seqNo": fid + 1,
+            "diskLoc": meta.get("diskLoc", 0),
+            "fieldPhaseID": meta.get("fieldPhaseID", 0),
+            "medianBurstIRE": meta.get("medianBurstIRE", 0),
+            "audioSamples": int(audio_n),
+            "efmTValues": int(efm_t),
+            "vbi": {"vbiData": list(vbidata)},
+        }
+        do = {"fieldLine": [], "startx": [], "endx": []}
+        for line, sx, ex in dropouts:
+            do["fieldLine"].append(int(line)); do["startx"].append(int(sx)); do["endx"].append(int(ex))
+        if do["fieldLine"]:
+            fj["dropOuts"] = do
+        self.fields_json.append(fj)
+        self.db.execute(
+            "INSERT INTO field_record(capture_id,field_id,audio_samples,efm_t_values,"
+            "field_phase_id,is_first_field,sync_conf,median_burst_ire,pad,disk_loc) "
+            "VALUES(0,?,?,?,?,?,?,?,0,?)",
+            (fid, int(audio_n), int(efm_t), int(fj["fieldPhaseID"]),
+             1 if fj["isFirstField"] else 0, fj["syncConf"], fj["medianBurstIRE"],
+             fj["diskLoc"]))
+        v = list(vbidata) + [0, 0, 0]
+        self.db.execute("INSERT INTO vbi VALUES(0,?,?,?,?)", (fid, v[0], v[1], v[2]))
+        for line, sx, ex in dropouts:
+            self.db.execute("INSERT INTO drop_outs VALUES(0,?,?,?,?)",
+                            (fid, int(line), int(sx), int(ex)))
+
+    def write_audio(self, audio):
+        if audio is None:
+            return
+        a = np.ascontiguousarray(np.clip(audio, -32768, 32767), dtype="<i2")
+        self.pcm.write(a.tobytes())
+        self.audio_total += a.shape[0]
+
+    def close(self, efm_bytes=None):
+        self.vp["numberOfSequentialFields"] = len(self.fields_json)
+        out = {"videoParameters": self.vp, "fields": self.fields_json}
+        if self.git_commit:
+            self.vp["gitCommit"] = self.git_commit
+        json.dump(out, open(self.outbase + ".tbc.json", "w"))
+        vp = self.vp
+        self.db.execute(
+            "INSERT INTO capture(capture_id,system,decoder,git_commit,video_sample_rate,"
+            "active_video_start,active_video_end,field_width,field_height,"
+            "number_of_sequential_fields,white_16b_ire,black_16b_ire,"
+            "is_mapped,is_subcarrier_locked,is_widescreen,capture_notes) "
+            "VALUES(0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.system, "ld-decode", self.git_commit,
+             vp.get("sampleRate"), vp.get("activeVideoStart"), vp.get("activeVideoEnd"),
+             vp.get("fieldWidth"), vp.get("fieldHeight"), len(self.fields_json),
+             int(vp.get("white16bIre", 0)), int(vp.get("black16bIre", 0)),
+             1 if vp.get("isMapped") else 0,
+             1 if vp.get("isSubcarrierLocked") else 0,
+             1 if vp.get("isWidescreen") else 0,
+             "stacked by ld-disc-stack"))
+        self.db.execute(
+            "INSERT INTO pcm_audio_parameters VALUES(0,16,1,1,?)",
+            (vp.get("audioSampleRate", 44100),))
+        self.db.commit()
+        self.db.close()
+        self.tbc.close()
+        self.pcm.close()
+        if efm_bytes is not None:
+            with open(self.outbase + ".efm", "wb") as f:
+                f.write(efm_bytes)
+
+
+# --------------------------------------------------------------------------- #
+#  Orchestrator
+# --------------------------------------------------------------------------- #
+def lockstep(sources):
+    """Merge several frame iterators (each yielding Frames in increasing key
+    order) into a stream of (key, {name: Frame}) for keys present in ALL
+    sources.  Buffer is bounded by the inter-capture alignment skew, so full
+    discs stream without holding everything in RAM."""
+    its = {s.name: iter(s.frames()) for s in sources}
+    buf = {n: {} for n in its}
+    head = {n: -1 for n in its}
+    done = {n: False for n in its}
+
+    def adv(n):
+        try:
+            fr = next(its[n])
+            buf[n][fr.key] = fr
+            head[n] = fr.key
+            return True
+        except StopIteration:
+            done[n] = True
+            return False
+
+    for n in its:
+        adv(n)
+    while True:
+        if all(done[n] and not buf[n] for n in its):
+            return
+        # frontier = the largest of each source's smallest buffered key, so all
+        # could plausibly carry it
+        mins = [min(buf[n]) for n in its if buf[n]]
+        if len(mins) < sum(not done[n] or bool(buf[n]) for n in its):
+            for n in its:
+                if not done[n] and not buf[n]:
+                    adv(n)
+            continue
+        frontier = max(mins)
+        for n in its:
+            while not done[n] and head[n] < frontier:
+                adv(n)
+        present = [n for n in its if frontier in buf[n]]
+        if present:
+            # emit whatever subset has this key; the stacker decides whether
+            # enough primary-master captures are present, and uses any
+            # alt-master captures only to fill residual master-level dropouts.
+            yield frontier, {n: buf[n][frontier] for n in present}
+        for n in its:  # drop frontier and anything older (can never complete)
+            for k in [k for k in buf[n] if k <= frontier]:
+                del buf[n][k]
+
+
+def _efm_lag(ref, x, maxlag=240):
+    n = min(len(ref), len(x))
+    a = ref[:n] - ref[:n].mean()
+    b = x[:n] - x[:n].mean()
+    L = 1 << int(np.ceil(np.log2(2 * n)))
+    c = np.fft.irfft(np.fft.rfft(a, L) * np.conj(np.fft.rfft(b, L)), L)
+    c = np.concatenate([c[-maxlag:], c[:maxlag + 1]])
+    # peak index j -> correlation lag (j - maxlag); the roll d that produced
+    # x = roll(ref, d) shows up at lag -d, so return d = maxlag - j to make
+    # average_efm's np.roll(x, -lag) undo it.
+    return int(maxlag - np.argmax(c))
+
+
+def average_efm(waves, weights):
+    """Cross-correlate each TBC-locked EFM waveform to the reference, align, and
+    weighted-average.  EFM is continuous (not frame-locked), so a residual phase
+    offset remains after TBC and must be removed before averaging."""
+    ref = np.asarray(waves[0], np.float64)
+    L = len(ref)
+    acc = np.zeros(L)
+    ws = 0.0
+    for w, wt in zip(waves, weights):
+        x = np.asarray(w, np.float64)
+        if len(x) != L:
+            x = np.resize(x, L)
+        lag = _efm_lag(ref, x)
+        if lag:
+            x = np.roll(x, -lag)
+        acc += wt * x
+        ws += wt
+    return (acc / max(ws, 1e-9)) if ws else acc
+
+
+def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
+          cross_fill=True, masters=None, sample=24, analysis_window=None,
+          git_commit="", log=print):
+    aw = analysis_window or max(sample * 2, 40)
+    merged = lockstep(sources)
+
+    # ---- buffer an initial window for the quality / master analysis ----
+    # (live .ldf sources only know their geometry once decoding has started, so
+    # pull frames first, then read videoParameters)
+    head_buf = []
+    for key, fd in merged:
+        head_buf.append((key, fd))
+        if len(head_buf) >= aw:
+            break
+    if not head_buf:
+        raise SystemExit("no frames shared across all captures")
+    vp = next((s.videoParameters for s in sources
+               if s.videoParameters is not None), None)
+    if vp is None:
+        raise SystemExit("could not determine video parameters from any capture")
+    ra, ca = _active(vp)
+    fh, fw = vp["fieldHeight"], vp["fieldWidth"]
+    step = max(1, len(head_buf) // sample)
+    info = analyse([fd for _, fd in head_buf[::step][:sample]], ra, ca)
+    if masters:
+        # explicit master grouping (e.g. from the disc PP/NP/AK marks); group 0
+        # is the primary, the rest are alt-master fill sources.  Tokens are
+        # matched as substrings of the capture name.
+        matched = set()
+        for mid, grp in enumerate(masters):
+            for n in info:
+                if any(tok in n for tok in grp):
+                    info[n]["master"] = mid
+                    info[n]["keep"] = (mid == 0)
+                    info[n]["reason"] = "explicit primary" if mid == 0 else "explicit fill"
+                    matched.add(n)
+        for n in info:
+            if n not in matched:
+                info[n]["master"] = -1
+                info[n]["keep"] = False
+                info[n]["reason"] = "not listed in --masters"
+    primary, fill_sources = [], []
+    for n in sorted(info):
+        i = info[n]
+        role = ("PRIMARY" if i["keep"]
+                else "fill" if i.get("master", -1) >= 1 else "DROP")
+        log(f"  {n:24} noise={i['noise']:.4g} master={i.get('master','-')} "
+            f"{role} ({i['reason']})")
+        if i["keep"]:
+            primary.append(n)
+        elif i.get("master", -1) >= 1:
+            fill_sources.append(n)
+    if not primary:
+        raise SystemExit("no usable captures in the primary master")
+    weights = {n: 1.0 / max(info[n]["noise"], 1e-6) ** 2 for n in info}
+    sig = {n: info[n]["noise"] for n in info}
+    log(f"[stack] primary master: {len(primary)} captures: {', '.join(primary)}")
+    if fill_sources and cross_fill:
+        log(f"[stack] cross-master fill from {len(fill_sources)} alt-master "
+            f"captures: {', '.join(fill_sources)}")
+
+    writer = StackWriter(outbase, vp, system, git_commit)
+    efm_stream = []          # list of averaged int16 EFM waveforms (per field)
+    nwritten = 0
+    filled_total = 0
+    import itertools
+
+    def do_frame(key, fd):
+        nonlocal nwritten, filled_total
+        present_primary = [n for n in primary if n in fd]
+        if not present_primary:
+            return
+        ref_frame = fd[present_primary[0]]
+        present_fill = [n for n in fill_sources if n in fd] if cross_fill else []
+        for fidx, which in enumerate(("f0", "f1")):
+            ref_field = getattr(ref_frame, which).astype(np.float64)
+            do_attr = "do0" if which == "f0" else "do1"
+
+            def combine_set(names):
+                regs, masks, ws, sigs = [], [], [], []
+                for n in names:
+                    fr = fd[n]
+                    reg, _ = register_field(getattr(fr, which).astype(np.float64),
+                                            ref_field, ra, ca, subpixel)
+                    if chroma_align:
+                        reg = chroma_align_field(reg, ref_field, ca)
+                    regs.append(reg)
+                    masks.append(dropout_mask((fh, fw), getattr(fr, do_attr)))
+                    ws.append(weights[n]); sigs.append(sig[n])
+                return combine_fields(regs, masks, ws, sigs)
+
+            out, wsum = combine_set(present_primary)
+            allbad = (wsum == 0)            # dropout present in EVERY primary disc
+            # ---- cross-master fill: patch master-level dropouts from alt master
+            if present_fill and allbad.any():
+                fout, fws = combine_set(present_fill)
+                fillable = allbad & (fws > 0)
+                if fillable.any():
+                    out = out.copy()
+                    out[fillable] = fout[fillable]
+                    filled_total += int(fillable.sum())
+                    allbad = allbad & ~fillable
+            outu = np.clip(np.round(out), 0, 65535).astype(np.uint16)
+            meta = ref_frame.meta0 if which == "f0" else ref_frame.meta1
+            resid_do = []                   # still bad after cross-fill
+            if allbad.any():
+                for ln in np.where(allbad.any(1))[0]:
+                    xs = np.where(allbad[ln])[0]
+                    resid_do.append((int(ln), int(xs.min()), int(xs.max()) + 1))
+            # EFM: pool ALL discs (the digital data is master-independent)
+            efm_src = [n for n in present_primary + present_fill
+                       if fd[n].efm is not None]
+            efm_t = 0
+            if efm_src:
+                av = average_efm([fd[n].efm[fidx] for n in efm_src],
+                                 [weights[n] for n in efm_src])
+                avi = np.clip(np.round(av), -32768, 32767).astype("<i2")
+                efm_stream.append(avi); efm_t = len(avi)
+            writer.write_field(outu, meta, field_vbi(meta), resid_do, efm_t,
+                               0 if which == "f1" else
+                               (ref_frame.audio.shape[0] if ref_frame.audio is not None else 0))
+        # audio: PRIMARY master only (analog audio is master-specific)
+        ref_audio = ref_frame.audio
+        if ref_audio is not None:
+            acc = np.zeros_like(ref_audio, dtype=np.float64); wtot = 0.0
+            refm = ref_audio[:, 0].astype(np.float64)
+            for n in present_primary:
+                fa = fd[n].audio
+                if fa is None or fa.shape != ref_audio.shape:
+                    continue
+                lag = align_audio(refm, fa[:, 0].astype(np.float64))
+                if lag:
+                    fa = np.roll(fa, -lag, axis=0)
+                acc += weights[n] * fa; wtot += weights[n]
+            if wtot:
+                writer.write_audio(acc / wtot)
+        nwritten += 1
+        if nwritten % 50 == 0:
+            log(f"  ... {nwritten} frames")
+
+    for key, fd in itertools.chain(head_buf, merged):
+        do_frame(key, fd)
+
+    efm_bytes = None
+    if efm_stream:
+        from .efm_pll import EFM_PLL
+        tvals = EFM_PLL().process(np.concatenate(efm_stream))
+        efm_bytes = np.asarray(tvals).tobytes()
+    writer.close(efm_bytes)
+    log(f"[stack] wrote {outbase}.tbc (+.tbc.json/.tbc.db), {outbase}.pcm"
+        + (f", {outbase}.efm" if efm_bytes else "")
+        + f" ({nwritten} frames; {filled_total} px cross-master filled)")
+    return info
+
+
+# --------------------------------------------------------------------------- #
+#  CLI
+# --------------------------------------------------------------------------- #
+def _git_commit():
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return ""
+
+
+def open_source(path, system, seek=None, length=None, extra_options=None):
+    if path.endswith(".tbc"):
+        return TBCFrameSource(path[:-4], cav=True)
+    if path.endswith(".tbc.json"):
+        return TBCFrameSource(path[:-9], cav=True)
+    if path.endswith(".ldf") or path.endswith(".lds"):
+        return LDFFrameSource(path, system=system, seek=seek, length=length,
+                              extra_options=extra_options)
+    # bare base name
+    if os.path.exists(path + ".tbc"):
+        return TBCFrameSource(path, cav=True)
+    raise SystemExit(f"unrecognised input: {path}")
+
+
+def main(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="ld-disc-stack",
+        description="Combine multiple captures of the same disc into one "
+                    "improved output (video TBC, audio, EFM).")
+    p.add_argument("inputs", nargs="+", help=".ldf captures (decoded live) or "
+                   "decoded .tbc files of the same disc")
+    p.add_argument("-o", "--output", required=True, help="output base name")
+    sysg = p.add_mutually_exclusive_group()
+    sysg.add_argument("--PAL", "-p", dest="system", action="store_const",
+                      const="PAL", help="PAL source (default)")
+    sysg.add_argument("--NTSC", "-n", dest="system", action="store_const",
+                      const="NTSC", help="NTSC source")
+    p.add_argument("--no-subpixel", action="store_true",
+                   help="integer-only frame registration")
+    p.add_argument("--no-chroma-align", action="store_true",
+                   help="disable per-line chroma subcarrier phase alignment "
+                   "(by default chroma is phase-matched across captures so the "
+                   "PAL pilot-lock wander does not cancel on combine)")
+    p.add_argument("--no-cross-fill", action="store_true",
+                   help="disable cross-master dropout fill (by default, after "
+                   "stacking the primary master, residual master-level dropouts "
+                   "are patched from the registered alt-master stack)")
+    p.add_argument("--masters", type=str, default=None,
+                   help="explicit master grouping instead of auto-clustering; "
+                   "groups separated by ';', captures by ',', first group is the "
+                   "primary, e.g. 'ds1,ds4,ds6;ds3,ds5' (tokens match capture names)")
+    p.add_argument("--clv", action="store_true",
+                   help="align by sequential frame index (CLV / non-CAV)")
+    p.add_argument("--sample", type=int, default=24,
+                   help="frames sampled for quality/master analysis")
+    p.add_argument("--seek", type=int, default=None,
+                   help="(.ldf live decode) start at this CAV picture number")
+    p.add_argument("--length", type=int, default=None,
+                   help="(.ldf live decode) limit to this many frames per input")
+    # decode-time options forwarded to the live .ldf decode (must match what a
+    # normal ld-decode of these discs would use, since the stack inherits them)
+    p.add_argument("--V4300D_coherent_subtract", action="store_true",
+                   help="(.ldf) remove the LD-V4300D ~8.5MHz spur by coherent "
+                   "subtraction (recommended for Domesday/EFM PAL captures)")
+    p.add_argument("--rf_echo", type=str, default=None,
+                   help="(.ldf) RF echo cancellation, e.g. 26:0.035,38:0.018")
+    args = p.parse_args(argv)
+    system = args.system or "PAL"
+
+    decode_opts = {}
+    if system == "PAL" and args.V4300D_coherent_subtract:
+        decode_opts["PAL_V4300D_CoherentSubtract"] = True
+    if args.rf_echo:
+        decode_opts["rf_echo_cancel"] = [
+            (float(p.split(":")[0]), float(p.split(":")[1]))
+            for p in args.rf_echo.split(",") if ":" in p
+        ]
+
+    sources = []
+    for path in args.inputs:
+        s = open_source(path, system, seek=args.seek, length=args.length,
+                        extra_options=decode_opts)
+        if args.clv and isinstance(s, TBCFrameSource):
+            s.cav = False
+        sources.append(s)
+    try:
+        masters = ([[t.strip() for t in g.split(",") if t.strip()]
+                    for g in args.masters.split(";")] if args.masters else None)
+        stack(sources, args.output, system=system,
+              subpixel=not args.no_subpixel,
+              chroma_align=not args.no_chroma_align,
+              cross_fill=not args.no_cross_fill, masters=masters,
+              sample=args.sample, git_commit=_git_commit())
+    finally:
+        for s in sources:
+            s.close()
+
+
+if __name__ == "__main__":
+    main()
