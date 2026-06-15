@@ -142,6 +142,12 @@ int main(int argc, char *argv[])
                                          "main", "Check if frames contain skip or sample drop and discard bad source for specific frame"));
     parser.addOption(integrityOption);
 
+    // Option to disable chroma subcarrier phase alignment (on by default)
+    QCommandLineOption noChromaAlignOption(QStringList() << "no-chroma-align",
+                                        QCoreApplication::translate(
+                                         "main", "Disable per-line chroma subcarrier (fSC) phase alignment. By default each source's chroma phase is aligned to a reference before combining, so averaging does not cancel chroma between sources"));
+    parser.addOption(noChromaAlignOption);
+
     // Positional argument to specify input video file
     parser.addPositionalArgument("inputs", QCoreApplication::translate(
                                      "main", "Specify input TBC files (- as first source for piped input)"));
@@ -190,6 +196,7 @@ int main(int argc, char *argv[])
     bool noMap = parser.isSet(noMapOption);
     bool passThrough = parser.isSet(passthroughOption);
     bool integrityCheck = parser.isSet(integrityOption);
+    bool chromaAlign = !parser.isSet(noChromaAlignOption);
 
     // Get the arguments from the parser
     qint32 mode = -1;
@@ -421,7 +428,7 @@ int main(int argc, char *argv[])
     qInfo() << "Initial source checks are ok and sources are loaded";
     qint32 result = 0;
     StackingPool stackingPool(outputFilename, outputJsonFilename, maxThreads,
-                                ldDecodeMetaData, sourceVideos, mode, smartThreshold, reverse, noDiffDod, passThrough, integrityCheck, verbose);
+                                ldDecodeMetaData, sourceVideos, mode, smartThreshold, reverse, noDiffDod, passThrough, integrityCheck, chromaAlign, verbose);
     if (!stackingPool.process()) result = 1;
 
     // Close open source video files

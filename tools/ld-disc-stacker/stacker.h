@@ -53,7 +53,8 @@ private:
 
     void stackField(const qint32 frameNumber,const QVector<SourceVideo::Data>& inputFields,const LdDecodeMetaData::VideoParameters& videoParameters,
                     const QVector<LdDecodeMetaData::Field>& fieldMetadata,const QVector<qint32> availableSourcesForFrame,const bool& noDiffDod,const bool& passThrough,
-                    SourceVideo::Data &outputField, DropOuts &dropOuts,const qint32& mode,const qint32& smartThreshold,const bool& verbose);
+                    SourceVideo::Data &outputField, DropOuts &dropOuts,const qint32& mode,const qint32& smartThreshold,const bool& chromaAlign,const bool& verbose);
+    void alignChroma(QVector<SourceVideo::Data>& fields, const QVector<qint32>& availableSourcesForFrame, const LdDecodeMetaData::VideoParameters& videoParameters);
     void getProcessedSample(const qint32 x, const qint32 y, const QVector<qint32>& availableSourcesForFrame, const QVector<SourceVideo::Data>& inputFields, QVector<QVector<quint16>>& tmpField, const LdDecodeMetaData::VideoParameters& videoParameters, const QVector<LdDecodeMetaData::Field>& fieldMetadata, QVector<quint16>& sample, QVector<quint16>& sampleN, QVector<quint16>& sampleS, QVector<quint16>& sampleE, QVector<quint16>& sampleW, QVector<bool>& isAllDropout, const bool& noDiffDod, const bool& verbose);
     inline quint16 median(QVector<quint16> v);
     inline qint32 mean(const QVector<quint16>& v);

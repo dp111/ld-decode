@@ -25,6 +25,8 @@
 #include "stacker.h"
 #include "stackingpool.h"
 
+#include <cmath>
+
 Stacker::Stacker(QAtomicInt& _abort, StackingPool& _stackingPool, QObject *parent)
     : QThread(parent), abort(_abort), stackingPool(_stackingPool)
 {
@@ -46,6 +48,7 @@ void Stacker::run()
     bool noDiffDod;
     bool passThrough;
     const bool& verbose = stackingPool.verbose;
+    const bool& chromaAlign = stackingPool.chromaAlign;
     QVector<qint32> availableSourcesForFrame;
 
     while(!abort) {
@@ -64,8 +67,8 @@ void Stacker::run()
         DropOuts outputFirstFieldDropOuts;
         DropOuts outputSecondFieldDropOuts;
 
-        stackField(frameNumber, firstSourceField, videoParameters[0], firstFieldMetadata, availableSourcesForFrame, noDiffDod, passThrough, outputFirstField, outputFirstFieldDropOuts, mode, smartThreshold, verbose);
-        stackField(frameNumber, secondSourceField, videoParameters[0], secondFieldMetadata, availableSourcesForFrame, noDiffDod, passThrough, outputSecondField, outputSecondFieldDropOuts, mode, smartThreshold, verbose);
+        stackField(frameNumber, firstSourceField, videoParameters[0], firstFieldMetadata, availableSourcesForFrame, noDiffDod, passThrough, outputFirstField, outputFirstFieldDropOuts, mode, smartThreshold, chromaAlign, verbose);
+        stackField(frameNumber, secondSourceField, videoParameters[0], secondFieldMetadata, availableSourcesForFrame, noDiffDod, passThrough, outputSecondField, outputSecondFieldDropOuts, mode, smartThreshold, chromaAlign, verbose);
 
         // Return the processed fields
         stackingPool.setOutputFrame(frameNumber, outputFirstField, outputSecondField,
@@ -84,11 +87,26 @@ void Stacker::stackField(const qint32 frameNumber,const QVector<SourceVideo::Dat
                                       DropOuts &dropOuts,
                                       const qint32& mode,
                                       const qint32& smartThreshold,
+                                      const bool& chromaAlign,
                                       const bool& verbose)
 {
     quint16 prevGoodValue = videoParameters.black16bIre;
     bool forceDropout = false;
     QVector<QVector<quint16>> tmpField(videoParameters.fieldHeight * videoParameters.fieldWidth);
+
+    // Optionally phase-align each source's chroma subcarrier to a reference
+    // source (first available) before combining, so that sub-sample subcarrier
+    // phase wander between sources does not cancel chroma on averaging.  Work on
+    // a local copy so dropout metadata (which indexes the original layout) is
+    // unaffected -- only sample VALUES change.
+    QVector<SourceVideo::Data> alignedStorage;
+    const QVector<SourceVideo::Data>* fieldsPtr = &inputFields;
+    if (chromaAlign && availableSourcesForFrame.size() > 1) {
+        alignedStorage = inputFields;
+        alignChroma(alignedStorage, availableSourcesForFrame, videoParameters);
+        fieldsPtr = &alignedStorage;
+    }
+    const QVector<SourceVideo::Data>& inputFieldsV = *fieldsPtr;
 
     if (availableSourcesForFrame.size() > 0) {
         // Sources available - process field
@@ -104,13 +122,13 @@ void Stacker::stackField(const qint32 frameNumber,const QVector<SourceVideo::Dat
                 // Get input values from the input sources (which are not marked as dropouts)
                 if(mode >= 3)//get surrounding pixels
                 {
-                    Stacker::getProcessedSample(x, y, availableSourcesForFrame, inputFields, tmpField, videoParameters, fieldMetadata, inputValues, valuesN, valuesS, valuesE, valuesW, isAllDropout, noDiffDod, verbose);
+                    Stacker::getProcessedSample(x, y, availableSourcesForFrame, inputFieldsV, tmpField, videoParameters, fieldMetadata, inputValues, valuesN, valuesS, valuesE, valuesW, isAllDropout, noDiffDod, verbose);
                 }
                 else// get only pixel 1 by 1
                 {
                     for (qint32 i = 0; i < availableSourcesForFrame.size(); i++){
                         //read pixel
-                        const quint16 pixelValue = inputFields[availableSourcesForFrame[i]][(videoParameters.fieldWidth * y) + x];
+                        const quint16 pixelValue = inputFieldsV[availableSourcesForFrame[i]][(videoParameters.fieldWidth * y) + x];
                         const bool sampleIsDropout = isDropout(fieldMetadata[availableSourcesForFrame[i]].dropOuts, x, y);
 
                         // Include the source's pixel data if it's not marked as a dropout
@@ -201,6 +219,112 @@ void Stacker::stackField(const qint32 frameNumber,const QVector<SourceVideo::Dat
         for (qint32 y = 0; y < videoParameters.fieldHeight; y++) {
             for (qint32 x = videoParameters.colourBurstStart; x < videoParameters.fieldWidth; x++) {
                 outputField[(videoParameters.fieldWidth * y) + x] = videoParameters.black16bIre;
+            }
+        }
+    }
+}
+
+// Phase-align each non-reference source's chroma subcarrier (fSC = fs/4) to the
+// reference source, per line, over the active region.  Composite sources of the
+// same disc carry a slightly different subcarrier phase (sub-sample time-base
+// wander); averaging them sample-by-sample then partially CANCELS chroma.  Here
+// each source's chroma band is demodulated to baseband I/Q (quadrature mix at
+// fs/4 + low-pass), its bulk phase offset to the reference is measured, the I/Q
+// is rotated to match, and the chroma is re-modulated and written back -- luma
+// (outside the band) is left untouched.  Mirrors lddecode/stack.py
+// chroma_align_field, done without an FFT (4xfSC sampling makes the I/Q mix the
+// fixed sequences cos=[1,0,-1,0], sin=[0,1,0,-1]).
+void Stacker::alignChroma(QVector<SourceVideo::Data>& fields,
+                          const QVector<qint32>& availableSourcesForFrame,
+                          const LdDecodeMetaData::VideoParameters& videoParameters)
+{
+    const qint32 nSrc = availableSourcesForFrame.size();
+    if (nSrc < 2) return;
+    const qint32 W = videoParameters.fieldWidth;
+    const qint32 H = videoParameters.fieldHeight;
+    qint32 x0 = videoParameters.activeVideoStart;
+    qint32 x1 = videoParameters.activeVideoEnd;
+    if (x0 < 0) x0 = 0;
+    if (x1 > W) x1 = W;
+    const qint32 n = x1 - x0;
+    if (n < 16) return;
+
+    // fs/4 quadrature carriers, indexed by absolute column x & 3
+    static const double cosv[4] = {1.0, 0.0, -1.0, 0.0};
+    static const double sinv[4] = {0.0, 1.0, 0.0, -1.0};
+
+    // low-pass kernel (Hamming-windowed sinc, cutoff ~0.12) to isolate the
+    // baseband chroma after quadrature mixing (rejects the fs/4 and fs/2 terms)
+    static QVector<double> h;
+    if (h.isEmpty()) {
+        const double PI = 3.14159265358979323846;
+        // narrow baseband cutoff (~0.06) to match the +-0.06 chroma half-band
+        // around fSC: over a narrow band the source-to-reference offset is ~a
+        // constant phase, so a single per-line rotation corrects it well.
+        const int L = 23; const int c = L / 2; const double fc = 0.06;
+        h.resize(L); double s = 0.0;
+        for (int k = 0; k < L; ++k) {
+            const double m = k - c;
+            const double sinc = (m == 0.0) ? (2.0 * fc)
+                                           : std::sin(2.0 * PI * fc * m) / (PI * m);
+            const double win = 0.54 - 0.46 * std::cos(2.0 * PI * k / (L - 1));
+            h[k] = sinc * win; s += h[k];
+        }
+        for (int k = 0; k < L; ++k) h[k] /= s;
+    }
+    const int L = h.size(); const int c = L / 2;
+
+    QVector<double> Iraw(n), Qraw(n), Ir(n), Qr(n), Is(n), Qs(n);
+    auto demod = [&](const SourceVideo::Data& fld, qint32 y,
+                     QVector<double>& I, QVector<double>& Q) {
+        for (qint32 i = 0; i < n; ++i) {
+            const qint32 x = x0 + i;
+            const double v = static_cast<double>(fld[(W * y) + x]);
+            Iraw[i] = v * cosv[x & 3];
+            Qraw[i] = -v * sinv[x & 3];
+        }
+        for (qint32 i = 0; i < n; ++i) {
+            double si = 0.0, sq = 0.0;
+            for (int k = 0; k < L; ++k) {
+                qint32 j = i + k - c;
+                if (j < 0) j = 0; else if (j >= n) j = n - 1;
+                si += h[k] * Iraw[j];
+                sq += h[k] * Qraw[j];
+            }
+            I[i] = 2.0 * si; Q[i] = 2.0 * sq;
+        }
+    };
+
+    const qint32 refSrc = availableSourcesForFrame[0];
+    for (qint32 y = 0; y < H; ++y) {
+        demod(fields[refSrc], y, Ir, Qr);
+        for (qint32 si = 1; si < nSrc; ++si) {
+            const qint32 s = availableSourcesForFrame[si];
+            demod(fields[s], y, Is, Qs);
+            // bulk phase offset of this source's chroma vs the reference's
+            double re = 0.0, im = 0.0, magS = 0.0, magR = 0.0;
+            for (qint32 i = 0; i < n; ++i) {
+                re += Is[i] * Ir[i] + Qs[i] * Qr[i];
+                im += Qs[i] * Ir[i] - Is[i] * Qr[i];
+                magS += Is[i] * Is[i] + Qs[i] * Qs[i];
+                magR += Ir[i] * Ir[i] + Qr[i] * Qr[i];
+            }
+            const double denom = std::sqrt(magS * magR);
+            const double mag = std::sqrt(re * re + im * im);
+            // skip lines with little/no chroma in either source (phase is noise)
+            if (denom < 1e-9 || mag < 0.05 * denom) continue;
+            const double dphi = std::atan2(im, re);
+            const double cd = std::cos(dphi), sd = std::sin(dphi);
+            SourceVideo::Data& line = fields[s];
+            for (qint32 i = 0; i < n; ++i) {
+                const qint32 x = x0 + i;
+                const double Ip = Is[i] * cd + Qs[i] * sd;   // rotate by -dphi
+                const double Qp = -Is[i] * sd + Qs[i] * cd;
+                const double cRecon = Is[i] * cosv[x & 3] - Qs[i] * sinv[x & 3];
+                const double cAlign = Ip * cosv[x & 3]     - Qp * sinv[x & 3];
+                double out = static_cast<double>(line[(W * y) + x]) - cRecon + cAlign;
+                if (out < 0.0) out = 0.0; else if (out > 65535.0) out = 65535.0;
+                line[(W * y) + x] = static_cast<quint16>(out + 0.5);
             }
         }
     }

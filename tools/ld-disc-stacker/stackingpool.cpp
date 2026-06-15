@@ -27,9 +27,9 @@
 
 StackingPool::StackingPool(QString _outputFilename, QString _outputJsonFilename,
                              qint32 _maxThreads, QVector<LdDecodeMetaData *> &_ldDecodeMetaData, QVector<SourceVideo *> &_sourceVideos,
-                             qint32 _mode, qint32 _smartThreshold, bool _reverse, bool _noDiffDod, bool _passThrough, bool _integrityCheck, bool _verbose, QObject *parent)
-    : QObject(parent), outputFilename(_outputFilename), outputJsonFilename(_outputJsonFilename),
-      maxThreads(_maxThreads), mode(_mode), smartThreshold(_smartThreshold), reverse(_reverse), noDiffDod(_noDiffDod), passThrough(_passThrough), integrityCheck(_integrityCheck), verbose(_verbose),
+                             qint32 _mode, qint32 _smartThreshold, bool _reverse, bool _noDiffDod, bool _passThrough, bool _integrityCheck, bool _chromaAlign, bool _verbose, QObject *parent)
+    : QObject(parent), verbose(_verbose), chromaAlign(_chromaAlign), outputFilename(_outputFilename), outputJsonFilename(_outputJsonFilename),
+      maxThreads(_maxThreads), mode(_mode), smartThreshold(_smartThreshold), reverse(_reverse), noDiffDod(_noDiffDod), passThrough(_passThrough), integrityCheck(_integrityCheck),
       abort(false), ldDecodeMetaData(_ldDecodeMetaData), sourceVideos(_sourceVideos)
 {
 }
