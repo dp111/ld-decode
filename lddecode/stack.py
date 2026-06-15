@@ -21,7 +21,8 @@ Pipeline
    the chosen (largest) master group.
 4. For every output frame: sub-pixel + level register each capture's fields to a
    reference, then combine dropout-aware and inverse-variance weighted.
-5. Audio: align (sub-sample lag) and weighted-average the analog audio.
+5. Audio: sub-sample-align each capture and robust (outlier-rejecting)
+   weighted-average the analog audio (primary master only).
 6. EFM: (a) average the TBC-locked pre-PLL EFM waveforms across captures (LDF
    source, --tbc_efm --preEFM; lowers the noise floor into one PLL pass) -> .efm,
    and (b) sector-merge the per-capture decoded .efm, OR-filling sectors no single
@@ -507,23 +508,72 @@ def perframe_weights(regs, masks, global_w, ra, ca, drop=True, drop_mult=3.0,
 
 
 def align_audio(ref, x, maxlag=4000):
-    """Integer-sample lag of x vs ref (mono), via central-segment xcorr."""
+    """Sub-sample lag of x vs ref (mono): the integer central-segment xcorr peak
+    refined by parabolic interpolation of its two neighbours.  Returns a float;
+    a fractional shift removes the +-0.5-sample quantisation that otherwise combs
+    out high audio frequencies when capture waveforms are averaged."""
     n = min(len(ref), len(x))
     if n < 256:
-        return 0
+        return 0.0
     s, L = n // 4, n // 2
     r = ref[s:s + L] - ref[s:s + L].mean()
-    best = (-2.0, 0)
     rn = np.linalg.norm(r) + 1e-9
-    for k in range(-maxlag, maxlag + 1, 1):
-        seg = x[s + k:s + k + L]
-        if len(seg) < L:
+    corr = np.full(2 * maxlag + 1, -2.0)
+    for i, k in enumerate(range(-maxlag, maxlag + 1)):
+        a0 = s + k
+        if a0 < 0 or a0 + L > len(x):     # out of range (avoid negative-index wrap)
             continue
+        seg = x[a0:a0 + L]
         seg = seg - seg.mean()
-        c = float((r * seg).sum() / (rn * (np.linalg.norm(seg) + 1e-9)))
-        if c > best[0]:
-            best = (c, k)
-    return best[1]
+        corr[i] = float((r * seg).sum() / (rn * (np.linalg.norm(seg) + 1e-9)))
+    j = int(np.argmax(corr))
+    lag = float(j - maxlag)
+    if 0 < j < len(corr) - 1:                      # parabolic sub-sample refine
+        a, b, c = corr[j - 1], corr[j], corr[j + 1]
+        denom = a - 2 * b + c
+        if denom != 0 and a > -1.9 and c > -1.9:
+            lag += 0.5 * (a - c) / denom
+    return lag
+
+
+def frac_shift_audio(a, lag):
+    """Shift audio ``a`` (n,2 float-able) by a fractional sample ``lag`` so it
+    aligns to the reference (matches the old integer np.roll(a, -lag) at integer
+    lag).  Cubic (Catmull-Rom) interpolation -- near-lossless for band-limited
+    audio, unlike linear interpolation which low-passes and would comb out the
+    high frequencies the sub-sample alignment is meant to preserve."""
+    if lag == 0:
+        return np.asarray(a, dtype=np.float64)
+    a = np.asarray(a, dtype=np.float64)
+    nlen = len(a)
+    p = np.arange(nlen) + lag
+    ip = np.floor(p).astype(int)
+    f = (p - ip)[:, None]                         # (n,1) broadcasts over channels
+    def tap(off):
+        return a[np.clip(ip + off, 0, nlen - 1)]
+    m1, p0, p1, p2 = tap(-1), tap(0), tap(1), tap(2)
+    return (p0 + 0.5 * f * (p1 - m1 + f * (2 * m1 - 5 * p0 + 4 * p1 - p2
+            + f * (3 * (p0 - p1) + p2 - m1))))
+
+
+def combine_audio(aligned, weights, reject=6.0):
+    """Robust weighted-average of per-capture, already-aligned audio (each n,2).
+
+    Like combine_fields for video: a click/glitch in one capture shows up as a
+    per-sample outlier far from the cross-capture median, so reject samples
+    beyond ``reject`` x the robust inter-capture spread (MAD) and weighted-mean
+    the rest -- the glitch is excluded, not smeared in.  Needs >=3 captures to
+    reject (with 2, median == mean and neither can be called the outlier)."""
+    stack = np.stack([np.asarray(a, dtype=np.float64) for a in aligned], 0)
+    med = np.median(stack, axis=0)
+    good = np.ones(stack.shape, dtype=bool)
+    if stack.shape[0] >= 3:
+        dev = np.abs(stack - med[None])
+        scale = 1.4826 * np.median(dev) + 1e-9
+        good = dev <= reject * scale
+    w = np.asarray(weights, dtype=np.float64).reshape(-1, 1, 1) * good
+    wsum = w.sum(0)
+    return np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
 
 
 # --------------------------------------------------------------------------- #
@@ -986,21 +1036,23 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             writer.write_field(outu, meta, field_vbi(meta), resid_do, efm_t,
                                0 if which == "f1" else
                                (ref_frame.audio.shape[0] if ref_frame.audio is not None else 0))
-        # audio: PRIMARY master only (analog audio is master-specific)
+        # audio: PRIMARY master only (analog audio is master-specific).
+        # Sub-sample align each capture to the reference, then robust
+        # (outlier-rejecting) weighted-average so a click/glitch in one capture
+        # is excluded rather than smeared into the mean.
         ref_audio = ref_frame.audio
         if ref_audio is not None:
-            acc = np.zeros_like(ref_audio, dtype=np.float64); wtot = 0.0
             refm = ref_audio[:, 0].astype(np.float64)
+            aligned, awts = [], []
             for n in present_primary:
                 fa = fd[n].audio
                 if fa is None or fa.shape != ref_audio.shape:
                     continue
                 lag = align_audio(refm, fa[:, 0].astype(np.float64))
-                if lag:
-                    fa = np.roll(fa, -lag, axis=0)
-                acc += weights[n] * fa; wtot += weights[n]
-            if wtot:
-                writer.write_audio(acc / wtot)
+                aligned.append(frac_shift_audio(fa, lag))
+                awts.append(weights[n])
+            if aligned:
+                writer.write_audio(combine_audio(aligned, awts))
         nwritten += 1
         if nwritten % 50 == 0:
             log(f"  ... {nwritten} frames")
