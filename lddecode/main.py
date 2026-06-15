@@ -183,6 +183,15 @@ def main(args=None):
     )
 
     parser.add_argument(
+        "--wideband",
+        dest="wideband",
+        action="store_true",
+        default=False,
+        help="PAL only: wider RF/video settings for clean, low-noise captures "
+        "(more 4.8-5.8mhz luma detail at a small SNR cost)",
+    )
+
+    parser.add_argument(
         "--NTSC_color_notch_filter",
         "-N",
         dest="NTSC_color_notch_filter",
@@ -440,6 +449,15 @@ def main(args=None):
 
     if args.lowband:
         extra_options["lowband"] = True
+
+    if args.wideband:
+        if vid_standard != "PAL":
+            print("ERROR: --wideband is only supported for PAL")
+            sys.exit(1)
+        if args.lowband:
+            print("ERROR: --lowband and --wideband cannot be combined")
+            sys.exit(1)
+        extra_options["wideband"] = True
 
     try:
         loader = make_loader(filename, args.inputfreq)

@@ -260,6 +260,18 @@ FilterParams_PAL_lowband['video_bpf_high']  = 13000000
 FilterParams_PAL_lowband['video_bpf_order'] = 2
 FilterParams_PAL_lowband['video_lpf_freq']  = 4800000
 
+# Settings for clean, low-noise PAL captures: trade a little SNR for more
+# HF luma response.  Measured against the defaults on the GGV multiburst
+# capture: +0.55 dB at 4.8 MHz and +2.4 dB at 5.8 MHz on the decoded
+# multiburst (the 2.1 MHz low edge recovers real lower-sideband energy
+# and the 6.1 MHz LPF keeps more of the recorded detail), for -0.8 dB
+# wSNR / -1.0 dB bPSNR and ~+14% fold-over spur on dark saturated
+# colour.  The group-delay equaliser tracks video_lpf_freq, so the
+# IEC 9.1.6 curve stays correct.
+FilterParams_PAL_wideband = FilterParams_PAL.copy()
+FilterParams_PAL_wideband['video_bpf_low']  = 2100000
+FilterParams_PAL_wideband['video_lpf_freq'] = 6100000
+
 class RFDecode:
     """The core RF decoding code.
 
@@ -318,6 +330,7 @@ class RFDecode:
           - PAL_V4300D_CoherentSubtract - same target, coherent subtraction
           - NTSC_ColorNotchFilter:  notch filter on decoded video to reduce color 'wobble'
           - lowband: Substitute different decode settings for lower-bandwidth disks
+          - wideband: (PAL) wider RF/video settings for clean, low-noise captures
           - AC3: Supports AC3
 
         """
@@ -368,6 +381,7 @@ class RFDecode:
         # time-base so the pre-PLL EFM waveforms can be averaged.
         self.tbc_efm = extra_options.get("tbc_efm", False)
         lowband = extra_options.get("lowband", False)
+        wideband = extra_options.get("wideband", False)
 
         freq = inputfreq
         self.freq = freq
@@ -388,6 +402,8 @@ class RFDecode:
             self.SysParams = copy.deepcopy(SysParams_PAL)
             if lowband:
                 self.DecoderParams = copy.deepcopy(FilterParams_PAL_lowband)
+            elif wideband:
+                self.DecoderParams = copy.deepcopy(FilterParams_PAL_wideband)
             else:
                 self.DecoderParams = copy.deepcopy(FilterParams_PAL)
 
