@@ -22,9 +22,12 @@ Pipeline
 4. For every output frame: sub-pixel + level register each capture's fields to a
    reference, then combine dropout-aware and inverse-variance weighted.
 5. Audio: align (sub-sample lag) and weighted-average the analog audio.
-6. EFM: average the TBC-locked pre-PLL EFM waveforms across captures (LDF source
-   with --tbc_efm), then run the EFM PLL on the average.
-7. Write ``.tbc`` + ``.tbc.json`` + ``.tbc.db`` (sqlite) + ``.pcm`` + ``.efm``.
+6. EFM: (a) average the TBC-locked pre-PLL EFM waveforms across captures (LDF
+   source, --tbc_efm --preEFM; lowers the noise floor into one PLL pass) -> .efm,
+   and (b) sector-merge the per-capture decoded .efm, OR-filling sectors no single
+   disc read -> .data.  (a) and (b) are complementary.
+7. Write ``.tbc`` + ``.tbc.json`` + ``.tbc.db`` (sqlite) + ``.pcm`` + ``.efm`` (+
+   ``.data``).
 
 Works for PAL and NTSC; the engine is system-agnostic and reads geometry/levels
 from the reference capture's videoParameters.
@@ -33,6 +36,7 @@ from the reference capture's videoParameters.
 import json
 import os
 import sqlite3
+import sys
 from textwrap import dedent
 
 import numpy as np
@@ -83,6 +87,15 @@ class FrameSource:
 
     def frames(self):
         raise NotImplementedError
+
+    def efm_path(self):
+        """Path to this capture's decoded EFM (.efm T-value stream), or None.
+        Used for cross-capture sector-level EFM merge."""
+        return None
+
+    def prefm_path(self):
+        """Path to this capture's pre-PLL EFM waveform (.prefm), or None."""
+        return None
 
     def close(self):
         pass
@@ -152,6 +165,16 @@ class TBCFrameSource(FrameSource):
         for key in sorted(self.keys()):
             yield self.get(key)
 
+    def efm_path(self):
+        p = self.base + ".efm"
+        return p if os.path.exists(p) and os.path.getsize(p) > 0 else None
+
+    def prefm_path(self):
+        """Path to the pre-PLL TBC-locked EFM waveform (.prefm, int16), or None.
+        Used for cross-capture EFM-waveform averaging (one PLL pass on the mean)."""
+        p = self.base + ".prefm"
+        return p if os.path.exists(p) and os.path.getsize(p) > 0 else None
+
 
 def _do_pairs(fi):
     do = fi.get("dropOuts") or {}
@@ -160,116 +183,101 @@ def _do_pairs(fi):
                     do.get("endx", []) or []))
 
 
-class LDFFrameSource(FrameSource):
-    """Decode an ``.ldf`` live and yield frames, so no intermediate .tbc is
-    written.  EFM is taken TBC-locked (``--tbc_efm``) so the pre-PLL waveform can
-    be stacked across captures.
+def resolve_scratch(explicit, near, need_gb=3):
+    """Where to put per-capture scratch (window .tbc/.efm, merge .bin).
 
-    Fields are captured by overriding ``LDdecode.writeout`` (which receives
-    ``(field, field_json, picture, audio, efm)``), so ld-decode does all the
-    normal downscale / dropout-detection / VBI work but nothing large is written
-    to disk -- only a tiny throwaway temp base for the (empty) output handles.
+    Default to a RAM-backed tmpfs (/dev/shm) so NOTHING touches a physical disk
+    -- only the final results are written.  Falls back to the directory of
+    `near` if no tmpfs is writable with enough headroom."""
+    import shutil as _sh
+    if explicit:
+        os.makedirs(explicit, exist_ok=True)
+        return explicit
+    for cand in ("/dev/shm", "/run/shm"):
+        if os.path.isdir(cand) and os.access(cand, os.W_OK):
+            try:
+                if _sh.disk_usage(cand).free > need_gb * (1024 ** 3):
+                    return cand
+            except OSError:
+                pass
+    return os.path.dirname(os.path.abspath(near))
+
+
+class LDFFrameSource(FrameSource):
+    """Serve frames from an ``.ldf`` capture by decoding the requested window
+    with the normal ld-decode CLI (subprocess) to a small temporary ``.tbc``,
+    then reading it back via TBCFrameSource (random access).
+
+    Driving ld-decode's readfield() in-process after a programmatic seek is
+    unreliable (field-sync state is left inconsistent and stalls), so we run the
+    proven CLI path instead.  The window is bounded by --seek/--length so no
+    giant .tbc is materialised; a full disc is covered by processing successive
+    windows.  EFM is decoded TBC-locked with --tbc_efm --preEFM, so the pre-PLL
+    EFM waveform (<base>.prefm) is available for cross-capture EFM-waveform
+    stacking (see stack(): average the .prefm waveforms, PLL once).
     """
 
-    def __init__(self, path, system="PAL", seek=None, length=None,
-                 inputfreq=None, analog_audio=44100, extra_options=None):
-        from lddecode import core
-        from lddecode.utils import make_loader
-        from lddecode.utils_logging import init_logging
-        import tempfile
+    def __init__(self, path, system="PAL", seek=None, length=None, cav=True,
+                 inputfreq=None, analog_audio=44100, extra_options=None,
+                 scratch_dir=None):
+        import tempfile, subprocess, sys as _sys
         self.path = path
-        self.name = os.path.basename(path)
-        self.seek = seek
-        self.length = length
-        opts = {"tbc_efm": True}
-        opts.update(extra_options or {})
-        self._captured = []
-        outer = self
-
-        class _CapturingLD(core.LDdecode):
-            def writeout(self, dataset):
-                outer._captured.append(dataset)  # (f, fi, picture, audio, efm)
-
-        # keep scratch next to the input (large media volume), not on /tmp
-        self._tmpdir = tempfile.mkdtemp(prefix="lddstack_",
-                                        dir=os.path.dirname(os.path.abspath(path)))
-        loader = make_loader(path, inputfreq)
-        logger = init_logging(os.path.join(self._tmpdir, "cap.log"))
-        self.ldd = _CapturingLD(
-            path, os.path.join(self._tmpdir, "cap"), loader, logger,
-            analog_audio=analog_audio, digital_audio=True,
-            # synchronous decode (threads=0): driving readfield() in-process
-            # after a programmatic seek leaves the async decode-thread state
-            # inconsistent and stalls; it also lets several captures share one
-            # process safely.
-            system=system, doDOD=True, threads=0, extra_options=opts,
-        )
-        self.videoParameters = None
-
-    def _vp(self):
-        if self.videoParameters is None:
-            self.videoParameters = self.ldd.build_json()["videoParameters"]
-        return self.videoParameters
-
-    def frames(self):
-        ldd = self.ldd
-        # mirror main.py's startup exactly: prime the reader with a roughseek
-        # before any decode, then seek (which does its own roughseek/retries).
-        # Without the initial roughseek the first decodefield never locks and
-        # seek() spins.
-        ldd.roughseek((int(self.seek) if self.seek else 0) * 2)
-        if self.seek:
-            ldd.seek(int(self.seek), int(self.seek))
-        pend = None
-        produced = 0
-        while True:
-            if self.length and produced >= self.length:
-                break
-            self._captured = []
-            f = ldd.readfield()
-            captured = list(self._captured)
-            for (ff, fi, picture, audio, efm) in captured:
-                vp = self._vp()
-                fw = vp["fieldWidth"]
-                arr = np.asarray(picture, dtype=np.float64)
-                h = arr.size // fw
-                field2d = arr[:h * fw].reshape(h, fw)
-                vbi = fi.get("vbi", {}).get("vbiData", []) or []
-                rec = (fi, field2d, _do_pairs(fi), audio, efm, vbi,
-                       bool(fi.get("isFirstField", True)))
-                isfirst = rec[6]
-                if isfirst:
-                    pend = rec          # (re)start a frame on a first field
-                    continue
-                if pend is None:
-                    continue            # orphan second field, skip
-                a, b = pend, rec
-                pend = None
-                key = cav_picture(a[5] + b[5])
-                if key is None:
-                    continue
-                aud = None
-                if a[3] is not None and b[3] is not None:
-                    aud = np.concatenate([np.asarray(a[3]), np.asarray(b[3])])
-                yield Frame(key, a[1], b[1], a[0], b[0], a[2], b[2], aud,
-                            (a[4], b[4]))
-                produced += 1
-            if f is None:
-                break
+        self.name = os.path.splitext(os.path.basename(path))[0]
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._tmpdir = tempfile.mkdtemp(
+            prefix="lddstack_", dir=resolve_scratch(scratch_dir, path))
+        base = os.path.join(self._tmpdir, "cap")
+        # --tbc_efm time-base-corrects the EFM onto the disc-rotation time-base
+        # (cleaner per-capture PLL).  --preEFM also writes the pre-PLL EFM
+        # waveform (<base>.prefm); for CAV-aligned windows (e.g. all captures
+        # --seek'd to the same picture) those waveforms align, so the stacker can
+        # average them and run ONE PLL pass on the lower-noise average (see
+        # stack(): average_efm).  The per-capture .efm is still decoded too, for
+        # the complementary sector-level merge.
+        cmd = [_sys.executable, os.path.join(repo, "ld-decode"),
+               "--NTSC" if system == "NTSC" else "--PAL", "--tbc_efm", "--preEFM"]
+        eo = extra_options or {}
+        if eo.get("PAL_V4300D_CoherentSubtract"):
+            cmd.append("--V4300D_coherent_subtract")
+        rfe = eo.get("rf_echo_cancel")
+        if isinstance(rfe, (list, tuple)) and rfe:
+            cmd += ["--rf_echo", ",".join(f"{d}:{a}" for d, a in rfe)]
+        if seek is not None:
+            cmd += ["--seek", str(int(seek))]
+        if length is not None:
+            cmd += ["--length", str(int(length))]
+        cmd += [path, base]
+        env = dict(os.environ, PYTHONPATH=repo)
+        with open(base + ".decode.log", "wb") as log:
+            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+        if not os.path.exists(base + ".tbc.json"):
+            # decode failed -- clean our scratch dir before bailing so a failed
+            # capture doesn't leak RAM (the caller never gets to call close())
+            import shutil
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            raise SystemExit(
+                f"ld-decode failed on {path} (see {base}.decode.log)")
+        self._inner = TBCFrameSource(base, cav=cav)
+        self.videoParameters = self._inner.videoParameters
 
     def keys(self):
-        raise NotImplementedError(
-            "live .ldf sources are streaming; the stacker buffers them "
-            "(see stack(); use TBC inputs for random access)")
+        return self._inner.keys()
+
+    def get(self, key):
+        return self._inner.get(key)
+
+    def frames(self):
+        return self._inner.frames()
+
+    def efm_path(self):
+        return self._inner.efm_path()
+
+    def prefm_path(self):
+        return self._inner.prefm_path()
 
     def close(self):
-        try:
-            self.ldd.close()
-        except Exception:
-            pass
         import shutil
         shutil.rmtree(getattr(self, "_tmpdir", ""), ignore_errors=True)
-
 
 # --------------------------------------------------------------------------- #
 #  Registration + combine engine
@@ -302,9 +310,64 @@ def fourier_shift(img, dy, dx):
     return np.real(np.fft.ifft2(F * np.exp(-2j * np.pi * (fy * dy + fx * dx))))
 
 
-def register_field(field, ref, ra, ca, subpixel=True):
+def _smooth_axis0(a, sigma):
+    """Gaussian smooth along axis 0 (the line axis)."""
+    if sigma <= 0 or a.shape[0] < 3:
+        return a
+    r = max(1, int(3 * sigma))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    return np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), 0, a)
+
+
+def subpixel_warp_x(img, ref, ra, ca, nblocks=1, max_shift=0.3, line_sigma=4.0):
+    """Align ``img`` to ``ref`` with a per-line (nblocks=1) or within-line
+    (nblocks>1) sub-pixel HORIZONTAL warp, on top of the global registration.
+
+    The global field shift in ``register_field`` is rigid, so it cannot remove
+    the residual per-line / intra-line horizontal misalignment that independent
+    wow/flutter leaves between captures (measured ~0.05px RMS between same-master
+    Domesday captures).  We estimate that residual by 1D Lucas-Kanade per block,
+        dx = sum(g*(ref-img)) / sum(g*g),   g = d ref/dx
+    and resample each line at ``x + dx(x)`` so ``warped(x) ~= ref(x)``.
+
+    Because the residual is near the estimator's noise floor, the shift field is
+    heavily regularised -- smoothed across lines (``line_sigma``) and clamped to
+    +-``max_shift`` -- so the warp tracks genuine slow wow and not pixel noise
+    (warping toward noise would just blur the combine).  Only active rows are
+    warped; blanking is left untouched.
+    """
+    R = ref[ra, ca].astype(np.float64)
+    I = img[ra, ca].astype(np.float64)
+    nlines, w = R.shape
+    bw = max(16, w // max(1, nblocks))
+    nb = max(1, w // bw)
+    centers = ca.start + (np.arange(nb) + 0.5) * bw          # full-field columns
+    # vectorised LK per block (over all lines at once)
+    dxg = np.zeros((nlines, nb))
+    for b in range(nb):
+        sl = slice(b * bw, (b + 1) * bw)
+        Rb, Ib = R[:, sl], I[:, sl]
+        g = np.gradient(Rb, axis=1)
+        den = np.sum(g * g, axis=1)
+        num = np.sum(g * (Rb - Ib), axis=1)
+        dxg[:, b] = np.where(den > 1e-6, num / den, 0.0)
+    dxg = np.clip(_smooth_axis0(dxg, line_sigma), -max_shift, max_shift)
+    # apply the warp to each active row across the full width
+    out = img.astype(np.float64, copy=True)
+    full_x = np.arange(img.shape[1], dtype=np.float64)
+    for k, li in enumerate(range(ra.start, ra.stop)):
+        dxrow = (np.full_like(full_x, dxg[k, 0]) if nb == 1
+                 else np.interp(full_x, centers, dxg[k]))
+        out[li] = np.interp(full_x + dxrow, full_x, out[li])
+    return out
+
+
+def register_field(field, ref, ra, ca, subpixel=True, line_reg=0):
     """Return field resampled to align with ref, plus affine level-matched.
-    ra/ca are the active row/col slices used for measuring the shift."""
+    ra/ca are the active row/col slices used for measuring the shift.
+    line_reg>0 adds a per-line (==1) / within-line (>1, = #blocks) sub-pixel
+    horizontal warp after the global shift, to remove residual intra-line wow."""
     fa = field.astype(np.float64)
     iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
     best = (float(iy), float(ix))
@@ -328,7 +391,10 @@ def register_field(field, ref, ra, ca, subpixel=True):
     y = ref[ra, ca].ravel()
     A = np.vstack([x, np.ones_like(x)]).T
     g, o = np.linalg.lstsq(A, y, rcond=None)[0]
-    return g * shifted + o, best
+    out = g * shifted + o
+    if line_reg:
+        out = subpixel_warp_x(out, ref, ra, ca, nblocks=line_reg)
+    return out, best
 
 
 def chroma_align_field(field, ref, ca, fsc_norm=0.25, halfband=0.06):
@@ -389,6 +455,55 @@ def combine_fields(fields, masks, weights, sigma):
     wsum = w.sum(0)
     out = np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
     return out, wsum
+
+
+def perframe_weights(regs, masks, global_w, ra, ca, drop=True, drop_mult=3.0,
+                     dead_band=1.5):
+    """Per-FRAME inverse-variance weights with a registration-confidence guard.
+
+    The per-capture ``global_w`` (from the quality pass) reflects a capture's
+    *average* noise, but a capture can be fine overall yet bad on one frame
+    (local rot, a mis-registered field).  We measure each registered field's
+    residual against the per-pixel median of the set on this frame and:
+
+    * leave the weight UNCHANGED while the residual is within ``dead_band`` x the
+      median residual -- so equal-quality captures keep equal weight (weighting
+      by 1/residual^2 there would just couple the weights to noise realisations
+      and *raise* the combined noise);
+    * softly down-weight (x (dead_band*med/resid)^2) a field that is clearly
+      noisier than the group but still usable;
+    * DROP a field whose residual is a gross outlier (> ``drop_mult`` x median) --
+      this catches a field that registered to the wrong sub-pixel offset and
+      would otherwise smear the combine without tripping ``combine_fields``'
+      per-pixel 5-sigma test (a smooth mis-registration stays within 5-sigma yet
+      is systematically wrong).
+
+    The drop only fires with >=3 fields (with 2, median == mean and the two are
+    symmetric, so neither can be called the outlier).  Never drops every field.
+    """
+    gw = np.asarray(global_w, dtype=np.float64)
+    if len(regs) < 2:
+        return list(gw)
+    stack = np.stack([r[ra, ca] for r in regs], 0)
+    good = ~np.stack([m[ra, ca] for m in masks], 0)
+    med = np.median(np.where(good, stack, np.nan), axis=0)
+    med = np.where(np.isnan(med), stack.mean(0), med)
+    resid = np.empty(len(regs))
+    for i in range(len(regs)):
+        d = (stack[i] - med)[good[i]]
+        resid[i] = np.sqrt(np.mean(d * d)) if d.size else np.inf
+    finite = resid[np.isfinite(resid)]
+    medr = np.median(finite) if finite.size else 1.0
+    # dead-band: within dead_band*medr -> untouched; worse -> 1/excess^2 penalty
+    excess = np.maximum(resid / (dead_band * max(medr, 1e-9)), 1.0)
+    eff = gw / excess ** 2
+    if drop and len(regs) >= 3 and finite.size:
+        bad = resid > drop_mult * medr
+        if 0 < bad.sum() < len(regs):
+            eff[bad] = 0.0
+    if not np.any(eff > 0):
+        eff = gw
+    return list(eff)
 
 
 def align_audio(ref, x, maxlag=4000):
@@ -652,8 +767,13 @@ def lockstep(sources):
                 del buf[n][k]
 
 
-def _efm_lag(ref, x, maxlag=240):
+def _efm_lag(ref, x, maxlag=240, maxn=4_000_000):
     n = min(len(ref), len(x))
+    # the residual lag is small (<maxlag); correlate a central window rather
+    # than the whole multi-million-sample stream to bound the FFT cost.
+    if n > maxn:
+        s = (n - maxn) // 2
+        ref, x, n = ref[s:s + maxn], x[s:s + maxn], maxn
     a = ref[:n] - ref[:n].mean()
     b = x[:n] - x[:n].mean()
     L = 1 << int(np.ceil(np.log2(2 * n)))
@@ -663,6 +783,60 @@ def _efm_lag(ref, x, maxlag=240):
     # x = roll(ref, d) shows up at lag -d, so return d = maxlag - j to make
     # average_efm's np.roll(x, -lag) undo it.
     return int(maxlag - np.argmax(c))
+
+
+def merge_efm_sectors(efm_paths, out_data, scratch_dir=None, log=print):
+    """Sector-level EFM merge: decode each capture's .efm to its data image with
+    ld-process-efm, then fill the output from whichever disc decoded each byte
+    (sector) cleanly.  EFM data is master-independent and byte-identical where
+    valid, so a byte bad/missing (zero) on one disc is filled from another --
+    recovering sectors no single disc has.  Waveform averaging is NOT used (real
+    captures are not phase-coherent at the EFM bit rate).  Returns (consensus
+    nonzero bytes, best-single nonzero bytes, ndiscs) or None if nothing decoded.
+    """
+    import subprocess, tempfile
+    tmp = tempfile.mkdtemp(prefix="efmmerge_",
+                           dir=resolve_scratch(scratch_dir, out_data))
+    bins = []
+    try:
+        for i, p in enumerate(efm_paths):
+            b = os.path.join(tmp, f"d{i}.bin")
+            r = subprocess.run(["ld-process-efm", "-b", "-q", p, b],
+                               capture_output=True)
+            if os.path.exists(b) and os.path.getsize(b) > 0:
+                bins.append(b)
+        if not bins:
+            return None
+        merged = None; best = 0
+        for b in bins:
+            d = np.fromfile(b, dtype=np.uint8)
+            best = max(best, int(np.count_nonzero(d)))
+            if merged is None:
+                merged = d.copy()
+            else:
+                # captures can decode to slightly different .bin lengths; pad the
+                # shorter of the two so they align before the per-byte OR-fill.
+                n = max(len(merged), len(d))
+                if len(merged) < n:
+                    merged = np.concatenate([merged, np.zeros(n - len(merged), np.uint8)])
+                if len(d) < n:
+                    d = np.concatenate([d, np.zeros(n - len(d), np.uint8)])
+                m = (merged == 0) & (d != 0)
+                merged[m] = d[m]
+        merged.tofile(out_data)
+        return int(np.count_nonzero(merged)), best, len(bins)
+    finally:
+        import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _efm_pll_class():
+    """Import EFM_PLL whether stack.py is run as a module (lddecode.stack) or as
+    a bare script (python lddecode/stack.py), where the relative import fails."""
+    try:
+        from .efm_pll import EFM_PLL
+    except ImportError:
+        from efm_pll import EFM_PLL
+    return EFM_PLL
 
 
 def average_efm(waves, weights):
@@ -687,7 +861,9 @@ def average_efm(waves, weights):
 
 def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
           cross_fill=True, masters=None, sample=24, analysis_window=None,
-          git_commit="", log=print):
+          max_frames=None,
+          scratch_dir=None, git_commit="", reg_confidence=True, reg_drop_mult=3.0,
+          line_reg=0, log=print):
     aw = analysis_window or max(sample * 2, 40)
     merged = lockstep(sources)
 
@@ -768,12 +944,16 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
                 for n in names:
                     fr = fd[n]
                     reg, _ = register_field(getattr(fr, which).astype(np.float64),
-                                            ref_field, ra, ca, subpixel)
+                                            ref_field, ra, ca, subpixel,
+                                            line_reg=line_reg)
                     if chroma_align:
                         reg = chroma_align_field(reg, ref_field, ca)
                     regs.append(reg)
                     masks.append(dropout_mask((fh, fw), getattr(fr, do_attr)))
                     ws.append(weights[n]); sigs.append(sig[n])
+                if reg_confidence:
+                    ws = perframe_weights(regs, masks, ws, ra, ca,
+                                          drop=True, drop_mult=reg_drop_mult)
                 return combine_fields(regs, masks, ws, sigs)
 
             out, wsum = combine_set(present_primary)
@@ -826,16 +1006,65 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             log(f"  ... {nwritten} frames")
 
     for key, fd in itertools.chain(head_buf, merged):
+        if max_frames and nwritten >= max_frames:
+            break
         do_frame(key, fd)
 
     efm_bytes = None
+    efm_merged = False
+    src_by_name = {s.name: s for s in sources}
+    # EFM stacking -- two complementary methods, run whichever inputs exist:
+    #  (1) pre-PLL WAVEFORM averaging: when captures were decoded --tbc_efm
+    #      --preEFM their .prefm waveforms are TBC-locked to disc rotation, so
+    #      (for CAV-aligned windows) they align and average -> lower noise into
+    #      ONE PLL pass -> a cleaner stacked .efm.  Pool primary+fill (the digital
+    #      data is master-independent).
+    #  (2) SECTOR-level merge of the per-capture decoded .efm -> .data, OR-filling
+    #      sectors no single disc read.  (1) lowers the random-noise floor where
+    #      every disc is marginal; (2) recovers localized dropouts.
+    def _src_paths(getter):
+        out = []
+        for n in primary + fill_sources:
+            s = src_by_name.get(n)
+            p = getattr(s, getter)() if s is not None and hasattr(s, getter) else None
+            if p:
+                out.append((n, p))
+        return out
+
     if efm_stream:
-        from .efm_pll import EFM_PLL
+        # legacy in-process per-field path (Frame.efm waveforms), if ever populated
+        EFM_PLL = _efm_pll_class()
         tvals = EFM_PLL().process(np.concatenate(efm_stream))
         efm_bytes = np.asarray(tvals).tobytes()
+    else:
+        prefm = _src_paths("prefm_path")
+        if len(prefm) >= 2:
+            EFM_PLL = _efm_pll_class()
+            streams = [np.fromfile(p, dtype="<i2") for _, p in prefm]
+            L = min(len(s) for s in streams)            # common length (aligned window)
+            streams = [s[:L].astype(np.float64) for s in streams]
+            wts = [weights[n] for n, _ in prefm]
+            log(f"[stack] EFM: averaging {len(streams)} TBC-locked pre-PLL "
+                f"waveforms ({L} samples), then one PLL pass")
+            av = average_efm(streams, wts)
+            avi = np.clip(np.round(av), -32768, 32767).astype(np.int16)
+            efm_bytes = np.asarray(EFM_PLL().process(avi)).tobytes()
+
+    # sector-level merge (independent of the above; recovers dropouts) -> .data
+    efm_paths = [p for _, p in _src_paths("efm_path")]
+    if efm_paths:
+        log(f"[stack] EFM: sector-merging {len(efm_paths)} captures")
+        res = merge_efm_sectors(efm_paths, outbase + ".data",
+                                scratch_dir=scratch_dir, log=log)
+        if res:
+            got, best, nd = res
+            efm_merged = True
+            log(f"[stack] EFM merge: {got} data bytes recovered from {nd} "
+                f"captures (best single: {best}; +{got-best})")
     writer.close(efm_bytes)
     log(f"[stack] wrote {outbase}.tbc (+.tbc.json/.tbc.db), {outbase}.pcm"
         + (f", {outbase}.efm" if efm_bytes else "")
+        + (f", {outbase}.data (merged EFM)" if efm_merged else "")
         + f" ({nwritten} frames; {filled_total} px cross-master filled)")
     return info
 
@@ -854,17 +1083,19 @@ def _git_commit():
         return ""
 
 
-def open_source(path, system, seek=None, length=None, extra_options=None):
+def open_source(path, system, seek=None, length=None, extra_options=None,
+                cav=True, scratch_dir=None):
     if path.endswith(".tbc"):
-        return TBCFrameSource(path[:-4], cav=True)
+        return TBCFrameSource(path[:-4], cav=cav)
     if path.endswith(".tbc.json"):
-        return TBCFrameSource(path[:-9], cav=True)
+        return TBCFrameSource(path[:-9], cav=cav)
     if path.endswith(".ldf") or path.endswith(".lds"):
         return LDFFrameSource(path, system=system, seek=seek, length=length,
-                              extra_options=extra_options)
+                              cav=cav, extra_options=extra_options,
+                              scratch_dir=scratch_dir)
     # bare base name
     if os.path.exists(path + ".tbc"):
-        return TBCFrameSource(path, cav=True)
+        return TBCFrameSource(path, cav=cav)
     raise SystemExit(f"unrecognised input: {path}")
 
 
@@ -896,6 +1127,27 @@ def main(argv=None):
                    help="explicit master grouping instead of auto-clustering; "
                    "groups separated by ';', captures by ',', first group is the "
                    "primary, e.g. 'ds1,ds4,ds6;ds3,ds5' (tokens match capture names)")
+    p.add_argument("--no-reg-confidence", action="store_true",
+                   help="disable per-frame inverse-variance weighting + "
+                   "registration-confidence drop (by default each field is "
+                   "weighted by its residual against the per-frame median, and a "
+                   "field that registered to a gross-outlier offset is dropped)")
+    p.add_argument("--reg-drop-mult", type=float, default=3.0,
+                   help="drop a field whose per-frame registration residual "
+                   "exceeds this multiple of the median residual (needs >=3 "
+                   "captures; default 3.0)")
+    p.add_argument("--line-reg", type=int, default=0, metavar="NBLOCKS",
+                   help="after the global field shift, apply a sub-pixel "
+                   "horizontal warp per capture to remove residual intra-line "
+                   "wow before combining: 1 = one shift per line, N>1 = N blocks "
+                   "across each line (within-line warp). 0 (default) = off. "
+                   "NOTE: on well-TBC'd same-master captures the residual is only "
+                   "~0.05px and the resampling cost slightly outweighs it (combine "
+                   "~0.5%% softer); only worth trying on visibly mis-aligned / "
+                   "poorly-TBC'd captures.")
+    p.add_argument("--max-frames", type=int, default=None,
+                   help="stop after writing this many output frames (bounds a "
+                   ".tbc stack for testing/preview; .ldf uses --length instead)")
     p.add_argument("--clv", action="store_true",
                    help="align by sequential frame index (CLV / non-CAV)")
     p.add_argument("--sample", type=int, default=24,
@@ -911,6 +1163,11 @@ def main(argv=None):
                    "subtraction (recommended for Domesday/EFM PAL captures)")
     p.add_argument("--rf_echo", type=str, default=None,
                    help="(.ldf) RF echo cancellation, e.g. 26:0.035,38:0.018")
+    p.add_argument("--scratch-dir", type=str, default=None,
+                   help="where to put per-capture scratch (window .tbc/.efm, "
+                   "merge .bin).  Default: a RAM tmpfs (/dev/shm) if available "
+                   "so nothing touches a physical disk; only final results are "
+                   "written.  Falls back to the input directory.")
     args = p.parse_args(argv)
     system = args.system or "PAL"
 
@@ -924,20 +1181,32 @@ def main(argv=None):
         ]
 
     sources = []
-    for path in args.inputs:
-        s = open_source(path, system, seek=args.seek, length=args.length,
-                        extra_options=decode_opts)
-        if args.clv and isinstance(s, TBCFrameSource):
-            s.cav = False
-        sources.append(s)
     try:
+        # A capture that fails to decode this window (e.g. a badly-degraded disc
+        # with an unreadable region) must NOT abort the whole window -- skip it
+        # and stack the rest, as long as >=2 usable captures remain.
+        for path in args.inputs:
+            try:
+                sources.append(open_source(
+                    path, system, seek=args.seek, length=args.length,
+                    extra_options=decode_opts, cav=not args.clv,
+                    scratch_dir=args.scratch_dir))
+            except SystemExit as e:
+                print("WARNING: skipping capture (decode failed): %s (%s)"
+                      % (path, e), file=sys.stderr)
+        if len(sources) < 2:
+            raise SystemExit("fewer than 2 usable captures for this window")
         masters = ([[t.strip() for t in g.split(",") if t.strip()]
                     for g in args.masters.split(";")] if args.masters else None)
         stack(sources, args.output, system=system,
               subpixel=not args.no_subpixel,
               chroma_align=not args.no_chroma_align,
               cross_fill=not args.no_cross_fill, masters=masters,
-              sample=args.sample, git_commit=_git_commit())
+              sample=args.sample, scratch_dir=args.scratch_dir,
+              max_frames=args.max_frames,
+              reg_confidence=not args.no_reg_confidence,
+              reg_drop_mult=args.reg_drop_mult, line_reg=args.line_reg,
+              git_commit=_git_commit())
     finally:
         for s in sources:
             s.close()
