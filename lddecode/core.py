@@ -3853,6 +3853,10 @@ class LDdecode:
         if self.pipe_rftbc:
             self.do_rftbc = True
 
+        # Experimental: horizontally co-register the two fields of each frame
+        # (see LDdecode.register_second_field).  Off by default.
+        self.field_reg = extra_options.get("field_reg", False)
+
         self.fname_out = fname_out
 
         self.firstfield = None  # In frame output mode, the first field goes here
@@ -4162,6 +4166,122 @@ class LDdecode:
             self.outfile_ac3.write(np.int8(odata))
 
             blk = self.AC3Collector.get_block()
+
+    def register_second_field(self, pic2, pic1):
+        """Horizontally co-register field 1 (pic2) to field 0 (pic1) of one frame.
+
+        Corrects the small, reproducible field-to-field horizontal offset (left by
+        recording-side wow/flutter) that shows as an interlace comb on sharp and
+        diagonal edges.  A coarse 2D sub-pixel shift map is fit by minimising the
+        interlace-comb (alternate-line) energy on a luma-low-passed interleave (so
+        the chroma subcarrier is ignored), gated per block for confidence, then
+        applied to field 1's composite line data so the correction lands in the
+        .tbc for every downstream tool.
+
+        Only still content benefits: frames whose two fields don't consistently
+        register (e.g. inter-field motion) fail the confidence gate and are left
+        unchanged.  pic1/pic2 are the uint16 field pictures; returns a uint16 array.
+        """
+        W = self.outwidth
+        if pic1 is None or W == 0 or len(pic2) != len(pic1) or (len(pic2) % W):
+            return pic2
+        L = len(pic2) // W
+        f1 = np.asarray(pic1, dtype=np.float32).reshape(L, W)   # field 0 (reference)
+        f2 = np.asarray(pic2, dtype=np.float32).reshape(L, W)   # field 1 (to warp)
+
+        r0, r1 = int(L * 0.10), int(L * 0.92)   # skip VBI / blanking margins
+        c0, c1 = int(W * 0.08), int(W * 0.95)
+        if (r1 - r0) < 24 or (c1 - c0) < 96:
+            return pic2
+
+        def hlp(a):
+            # mild horizontal low-pass: suppress the chroma subcarrier so the comb
+            # metric reflects luma geometry only
+            b = a.astype(np.float32, copy=True)
+            for _ in range(3):
+                b[:, 1:-1] = 0.25 * b[:, :-2] + 0.5 * b[:, 1:-1] + 0.25 * b[:, 2:]
+            return b
+
+        A = hlp(f1[r0:r1, c0:c1])
+        B = hlp(f2[r0:r1, c0:c1])
+        Hb, Wb = A.shape
+
+        def shift_cols(arr, dx):
+            # vectorised sub-pixel horizontal shift (sample at column x - dx)
+            n = arr.shape[1]
+            xs = np.arange(n) - dx
+            i = np.floor(xs).astype(np.int64)
+            frac = (xs - i).astype(np.float32)
+            i0 = np.clip(i, 0, n - 1)
+            i1 = np.clip(i + 1, 0, n - 1)
+            return (1.0 - frac)[None, :] * arr[:, i0] + frac[None, :] * arr[:, i1]
+
+        def comb(a, b):
+            n = min(len(a), len(b))
+            fr = np.empty((2 * n, a.shape[1]), dtype=np.float32)
+            fr[0::2] = a[:n]
+            fr[1::2] = b[:n]
+            nyq = fr[1:-1] - 0.5 * (fr[:-2] + fr[2:])
+            return float(np.mean(nyq * nyq))
+
+        shifts = np.arange(-0.36, 0.361, 0.06)
+        nyb, nxb = 7, 10
+        ybnd = np.linspace(0, Hb, nyb + 1).astype(int)
+        xbnd = np.linspace(0, Wb, nxb + 1).astype(int)
+        smap = np.zeros((nyb, nxb), dtype=np.float32)
+        conf = np.zeros((nyb, nxb), dtype=bool)
+        for iy in range(nyb):
+            for ix in range(nxb):
+                a = A[ybnd[iy]:ybnd[iy + 1], xbnd[ix]:xbnd[ix + 1]]
+                b = B[ybnd[iy]:ybnd[iy + 1], xbnd[ix]:xbnd[ix + 1]]
+                if a.shape[0] < 4 or a.shape[1] < 16:
+                    continue
+                c_zero = comb(a, b)
+                best_c, best_dx = c_zero, 0.0
+                for dx in shifts:
+                    if dx == 0.0:
+                        continue
+                    cv = comb(a, shift_cols(b, dx))
+                    if cv < best_c:
+                        best_c, best_dx = cv, dx
+                # trust a block only when a sub-pixel shift meaningfully reduced the comb
+                if c_zero > 0 and (c_zero - best_c) / c_zero > 0.04 and abs(best_dx) <= 0.34:
+                    smap[iy, ix] = best_dx
+                    conf[iy, ix] = True
+
+        # motion / trust gate: if too few blocks register consistently (e.g. the
+        # fields differ by real motion), leave the frame untouched
+        if conf.mean() < 0.20:
+            return pic2
+
+        # light smoothing of the (confidence-zeroed) shift map for stability
+        sm = smap.copy()
+        for _ in range(2):
+            p = np.pad(sm, 1, mode="edge")
+            sm = (p[:-2, 1:-1] + p[2:, 1:-1] + p[1:-1, :-2] + p[1:-1, 2:] + 4 * sm) / 8.0
+
+        # bilinear-expand the block map to a per-pixel shift over the whole field
+        rc = ((ybnd[:-1] + ybnd[1:]) / 2.0) + r0
+        cc = ((xbnd[:-1] + xbnd[1:]) / 2.0) + c0
+        rows = np.arange(L)
+        cols = np.arange(W)
+        tmp = np.empty((L, nxb), dtype=np.float32)
+        for j in range(nxb):
+            tmp[:, j] = np.interp(rows, rc, sm[:, j])
+        fullmap = np.empty((L, W), dtype=np.float32)
+        for r in range(L):
+            fullmap[r] = np.interp(cols, cc, tmp[r])
+
+        # warp field 1 by the per-pixel shift, round back to uint16
+        out = np.empty_like(f2)
+        for r in range(L):
+            xs = cols - fullmap[r]
+            i = np.floor(xs).astype(np.int64)
+            frac = (xs - i).astype(np.float32)
+            i0 = np.clip(i, 0, W - 1)
+            i1 = np.clip(i + 1, 0, W - 1)
+            out[r] = (1.0 - frac) * f2[r, i0] + frac * f2[r, i1]
+        return np.clip(out + 0.5, 0, 65535).astype(np.uint16).reshape(-1)
 
     def writeout(self, dataset):
         f, fi, picture, audio, efm = dataset
@@ -4478,6 +4598,12 @@ class LDdecode:
 
             # XXX: this routine currently performs a needed sanity check
             fi, needFiller = self.buildmetadata(f)
+
+            # Optionally co-register this second field to its frame's first field
+            # (corrects the field-to-field offset; still content only -- gated).
+            if (self.field_reg and not f.isFirstField
+                    and self.lastvalidfield[True] is not None):
+                picture = self.register_second_field(picture, self.lastvalidfield[True][2])
 
             self.lastvalidfield[f.isFirstField] = (f, fi, picture, audio, efm)
 
