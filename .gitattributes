@@ -1,0 +1,22 @@
+# Normalize line endings. Store and check out all text files as LF so editors
+# and GitHub Desktop on Windows do not rewrite them with CRLF, which otherwise
+# shows up as whole-file "phantom" diffs (every line changed) with no real
+# content change. git auto-detects binary files and leaves them untouched.
+* text=auto eol=lf
+
+# Explicit binary assets (no line-ending handling, no textual diff)
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.bmp  binary
+*.ico  binary
+*.pdf  binary
+*.npz  binary
+
+# ld-decode data formats (binary, should any ever be committed)
+*.tbc  binary
+*.ldf  binary
+*.lds  binary
+*.pcm  binary
+*.efm  binary
