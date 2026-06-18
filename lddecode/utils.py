@@ -849,6 +849,58 @@ def refine_pilot_zcs(demod_pilot, linelocs, n, length_px, freq, linelen, pilot_m
     return zcs, plen
 
 
+@njit(cache=True, nogil=True)
+def refine_hsync_zcs(
+    demod_05, linelocs1, linebad, n, is_pal, freq,
+    vsync_target, neg55, pos30,
+):
+    """ Hot inner loop of Field.refine_linelocs_hsync, lifted to numba.
+
+    Refines each line's hsync start by zero-crossing on the 0.5 MHz demod, with
+    the same level/sanity gating as the Python original.  linebad is updated in
+    place; returns the refined linelocs2.
+    """
+    linelocs2 = linelocs1.copy()
+    for i in range(n):
+        # skip VSYNC lines, since they handle the pulses differently
+        if (3 <= i <= 6) or (is_pal and (1 <= i <= 2)):
+            linebad[i] = True
+            continue
+
+        ll1 = linelocs1[i] - freq
+        zc = calczc_do(demod_05, ll1, vsync_target, 0, freq * 2)
+
+        if zc is not None and not linebad[i]:
+            linelocs2[i] = zc
+
+            # the hsync area, burst, and porches should stay within -50..30 IRE
+            hsync_area = demod_05[int(zc - (freq * 0.75)) : int(zc + (freq * 8))]
+            if np.min(hsync_area) < neg55 or np.max(hsync_area) > pos30:
+                linebad[i] = True
+                linelocs2[i] = linelocs1[i]
+            else:
+                porch_level = np.median(
+                    demod_05[int(zc + (freq * 8)) : int(zc + (freq * 9))]
+                )
+                sync_level = np.median(
+                    demod_05[int(zc + (freq * 1)) : int(zc + (freq * 2.5))]
+                )
+
+                zc2 = calczc_do(demod_05, ll1, (porch_level + sync_level) / 2, 0, 400)
+
+                if zc2 is not None and abs(zc2 - zc) < (freq / 2):
+                    linelocs2[i] = zc2
+                else:
+                    linebad[i] = True
+        else:
+            linebad[i] = True
+
+        if linebad[i]:
+            linelocs2[i] = linelocs1[i]
+
+    return linelocs2
+
+
 # copied from vhs-decode
 
 def gen_bpf_supergauss(freq_low, freq_high, order, nyquist_hz, block_len):
