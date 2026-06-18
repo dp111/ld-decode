@@ -803,6 +803,52 @@ def calczc(data, _start_offset, target, edge=0, count=16, reverse=False):
     return calczc_do(data, _start_offset, target, edge, count)
 
 
+@njit(cache=True, nogil=True)
+def refine_pilot_zcs(demod_pilot, linelocs, n, length_px, freq, linelen, pilot_mhz):
+    """ Hot inner loop of FieldPAL.refine_linelocs_pilot, lifted to numba.
+
+    Reproduces the per-line work exactly (slice -> argmax|abs| -> calczc ->
+    normalised zero-crossing phase) for lineoffset == 0, which is always the
+    case when pilot refinement runs.  Returns (zcs, plen) as float64 arrays.
+    """
+    zcs = np.empty(n, dtype=np.float64)
+    plen = np.empty(n, dtype=np.float64)
+    prev = 0.0
+    for l in range(n):
+        adjfreq = freq
+        if l > 1:
+            adjfreq = freq / ((linelocs[l] - linelocs[l - 1]) / linelen)
+        pl = (adjfreq / pilot_mhz) / 2
+        plen[l] = pl
+
+        begin = linelocs[l]
+        start = int(begin)
+        stop = int(begin + length_px + 1)
+        lsoffset = begin - start
+
+        pilots = demod_pilot[start:stop]
+
+        # np.argmax(np.abs(pilots)) -- first index of the largest magnitude
+        peakloc = 0
+        mx = -1.0
+        for i in range(pilots.shape[0]):
+            v = pilots[i]
+            if v < 0:
+                v = -v
+            if v > mx:
+                mx = v
+                peakloc = i
+
+        zc_base = calczc_do(pilots, peakloc, 0.0, 0, 16)
+        if zc_base is not None:
+            zcs[l] = (zc_base - lsoffset) / pl
+        else:
+            zcs[l] = prev
+        prev = zcs[l]
+
+    return zcs, plen
+
+
 # copied from vhs-decode
 
 def gen_bpf_supergauss(freq_low, freq_high, order, nyquist_hz, block_len):

@@ -28,7 +28,7 @@ from . import efm_pll
 from .utils import ac3_pipe, ldf_pipe, traceback
 from .utils import nb_mean, nb_median, nb_round, nb_min, nb_max, nb_abs, nb_absmax, nb_diff, n_orgt, n_orlt
 from .utils import polar2z, sqsum, genwave, dsa_rescale_and_clip, scale, scale_field, rms
-from .utils import findpeaks, findpulses, calczc, inrange, roundfloat
+from .utils import findpeaks, findpulses, calczc, inrange, roundfloat, refine_pilot_zcs
 from .utils import LRUupdate, clb_findbursts, angular_mean_helper, phase_distance
 from .utils import build_hilbert, unwrap_hilbert, unwrap_hilbert_pll, emphasis_iir, filtfft
 from .utils import fft_do_slice, fft_determine_slices, StridedCollector, hz_to_output_array
@@ -737,6 +737,10 @@ class RFDecode:
         # This high pass filter is intended to detect RF dropouts
         Frfhpf = sps.butter(1, 10 / self.freq_half, btype="highpass")
         self.Filters["Frfhpf"] = filtfft(Frfhpf, self.blocklen)
+        # Frfhpf is a real (conjugate-symmetric) filter and the input RF is real,
+        # so ifft(indata_fft * Frfhpf).real is exactly irfft over the half spectrum
+        # at ~half the transform cost.  Keep the positive-frequency half.
+        self.Filters["Frfhpf_half"] = self.Filters["Frfhpf"][: self.blocklen // 2 + 1]
 
         # First phase FFT filtering
 
@@ -1009,7 +1013,11 @@ class RFDecode:
         if getattr(self, "delays", None) is not None and "video_rot" in self.delays:
             rotdelay = self.delays["video_rot"]
 
-        rv["rfhpf"] = npfft.ifft(indata_fft * self.Filters["Frfhpf"]).real
+        # Real filter + real RF input => half-spectrum irfft is exact (see __init__).
+        nrf = indata_fft.shape[0] // 2 + 1
+        rv["rfhpf"] = npfft.irfft(
+            indata_fft[:nrf] * self.Filters["Frfhpf_half"], n=self.blocklen
+        )
         rv["rfhpf"] = rv["rfhpf"][
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
@@ -3332,38 +3340,55 @@ class FieldPAL(Field):
         else:
             linelocs = linelocs.copy()
 
-        plen = {}
+        n = 323
 
-        zcs = []
-        for l in range(0, 323):
-            adjfreq = self.rf.freq
-            if l > 1:
-                adjfreq /= (linelocs[l] - linelocs[l - 1]) / self.rf.linelen
+        if self.lineoffset == 0:
+            # Fast path: the per-line slice/argmax/calczc work runs in numba.
+            # length_px == lineslice's _length for a 6 us window (constant since
+            # get_linefreq(None) == rf.freq when lineoffset == 0).
+            length_px = self.usectoinpx(6)
+            zcs, plen = refine_pilot_zcs(
+                np.ascontiguousarray(self.data["video"]["demod_pilot"]),
+                np.asarray(linelocs, dtype=np.float64),
+                n,
+                float(length_px),
+                float(self.rf.freq),
+                float(self.rf.linelen),
+                float(self.rf.SysParams["pilot_mhz"]),
+            )
+        else:
+            # Generic fallback (kept for correctness if lineoffset is ever
+            # non-zero at this stage).
+            plen = np.empty(n)
+            zcs = np.empty(n)
+            prev = 0.0
+            for l in range(0, n):
+                adjfreq = self.rf.freq
+                if l > 1:
+                    adjfreq /= (linelocs[l] - linelocs[l - 1]) / self.rf.linelen
 
-            plen[l] = (adjfreq / self.rf.SysParams["pilot_mhz"]) / 2
+                plen[l] = (adjfreq / self.rf.SysParams["pilot_mhz"]) / 2
 
-            ls = self.lineslice(l, 0, 6, linelocs)
-            lsoffset = linelocs[l] - ls.start
+                ls = self.lineslice(l, 0, 6, linelocs)
+                lsoffset = linelocs[l] - ls.start
 
-            pilots = self.data["video"]["demod_pilot"][ls]
+                pilots = self.data["video"]["demod_pilot"][ls]
+                peakloc = np.argmax(np.abs(pilots))
 
-            peakloc = np.argmax(np.abs(pilots))
-
-            zc_base = calczc(pilots, peakloc, 0)
-            if zc_base is not None:
-                zc = (zc_base - lsoffset) / plen[l]
-            else:
-                zc = zcs[-1] if len(zcs) else 0
-
-            zcs.append(zc)
+                zc_base = calczc(pilots, peakloc, 0)
+                zcs[l] = (zc_base - lsoffset) / plen[l] if zc_base is not None else prev
+                prev = zcs[l]
 
         angles = angular_mean_helper(np.array(zcs))
         am = np.angle(np.mean(angles)) / (np.pi * 2)
         if (am < 0):
             am = 1 + am
 
-        for l in range(0, 323):
-            linelocs[l] += (phase_distance(zcs[l], am) * plen[l]) * 1
+        # Vectorised second pass: phase_distance(zcs, am) * plen, added in place.
+        d = (zcs - np.floor(zcs)) - am
+        d[d < -0.5] += 1
+        d[d > 0.5] -= 1
+        linelocs[:n] += d * plen
 
         return np.array(linelocs)
 
