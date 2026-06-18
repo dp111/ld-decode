@@ -528,10 +528,23 @@ class LoadLDF:
         self._close()
 
     def _read_data(self, count):
-        """Read data as bytes from ffmpeg, append it to the rewind buffer, and
-        return it. May return less than count bytes if EOF is reached."""
+        """Read `count` bytes from the reader, append to the rewind buffer, and
+        return them.  Loops over short reads: a pipe read() routinely returns
+        fewer than `count` bytes mid-stream (whenever the producer hasn't filled
+        the buffer yet), so we keep reading and only return short at a GENUINE
+        EOF, i.e. when read() returns b"" (writer closed its end).  Treating a
+        mid-stream short read as EOF was causing intermittent early end-of-file
+        -> the decoder stopping a few frames into the lead-in."""
 
-        data = self.ldfreader.stdout.read(count)
+        chunks = []
+        remaining = count
+        while remaining > 0:
+            chunk = self.ldfreader.stdout.read(remaining)
+            if not chunk:
+                break  # genuine EOF
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
         self.position += len(data)
 
         self.rewind_buf += data
@@ -582,8 +595,13 @@ class LoadLDF:
         else:
             command = [self._find_ldf_reader(), "--quiet", "--start-offset", str(sample), self.filename]
 
+        # Do NOT capture the reader's stderr as a PIPE: nothing here drains it,
+        # so if the reader (libav - especially FFmpeg 8, whose chatter --quiet
+        # does not silence) writes enough to fill the ~64 KB pipe it blocks on
+        # the stderr write, stalls stdout, and the parent gets a short read.
+        # Letting it pass through to our stderr cannot deadlock.
         ldfreader = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command, stdout=subprocess.PIPE,
         )
         self.position = sample * 2
         self.rewind_buf = b""
