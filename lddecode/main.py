@@ -443,6 +443,10 @@ def main(args=None):
 
     if vid_standard == "PAL" and args.V4300D_coherent_subtract:
         extra_options["PAL_V4300D_CoherentSubtract"] = True
+        # Defer the spur filter until sync is acquired: the filter breaks
+        # cold-start sync in the flat lead-in on some captures, so decode the
+        # lead-in plain and switch the filter on for the program content.
+        extra_options["V4300_defer"] = True
 
     if args.fm_pll:
         extra_options["fm_pll"] = True
@@ -500,52 +504,110 @@ def main(args=None):
     if args.vlpf_order >= 1:
         DecoderParamsOverride["video_lpf_order"] = args.vlpf_order
 
-    ldd = LDdecode(
-        filename,
-        outname,
-        loader,
-        logger,
-        est_frames=req_frames,
-        analog_audio=0 if args.daa else args.analog_audio_freq,
-        digital_audio=not args.noefm,
-        system=vid_standard,
-        doDOD=not args.nodod,
-        threads=args.threads,
-        extra_options=extra_options,
-        DecoderParamsOverride=DecoderParamsOverride,
-    )
-
-    signal.signal(signal.SIGINT, original_sigint_handler)
-
-    # Store the starting sample position for --write-input-ldf
-    start_sample_position = None
+    # End-sample tracking for --write-input-ldf (start is returned per attempt).
     end_sample_position = None
 
-    if args.start_fileloc != -1:
-        ldd.roughseek(args.start_fileloc, False)
-    else:
-        ldd.roughseek(firstframe * 2)
+    def run_decode(eo):
+        """Run one full decode pass with the given extra_options dict.  Returns
+        (ldd, jsondumper, start_sample_position)."""
+        # Fresh reader/loader for each attempt.
+        attempt_loader = make_loader(filename, args.inputfreq)
 
-    if vid_standard == "NTSC" and not args.ntscj:
-        ldd.blackIRE = 7.5
+        # Keep SIGINT off the worker threads during construction.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        ldd = LDdecode(
+            filename,
+            outname,
+            attempt_loader,
+            logger,
+            est_frames=req_frames,
+            analog_audio=0 if args.daa else args.analog_audio_freq,
+            digital_audio=not args.noefm,
+            system=vid_standard,
+            doDOD=not args.nodod,
+            threads=args.threads,
+            extra_options=eo,
+            DecoderParamsOverride=DecoderParamsOverride,
+        )
+        signal.signal(signal.SIGINT, original_sigint_handler)
 
-    # print(ldd.blackIRE)
+        start_sample_position = None
 
-    if args.seek != -1:
-        if ldd.seek(args.seek if firstframe == 0 else firstframe, args.seek) is None:
-            print("ERROR: Seeking failed", file=sys.stderr)
-            sys.exit(1)
+        if args.start_fileloc != -1:
+            ldd.roughseek(args.start_fileloc, False)
+        else:
+            ldd.roughseek(firstframe * 2)
 
-    # Capture the start sample position after all seeking
-    if args.write_test_ldf is not None:
-        start_sample_position = int(ldd.fdoffset)
+        if vid_standard == "NTSC" and not args.ntscj:
+            ldd.blackIRE = 7.5
 
-    if args.verboseVITS:
-        ldd.verboseVITS = True
+        if args.seek != -1:
+            if ldd.seek(args.seek if firstframe == 0 else firstframe, args.seek) is None:
+                print("ERROR: Seeking failed", file=sys.stderr)
+                sys.exit(1)
 
-    done = False
+        if args.write_test_ldf is not None:
+            start_sample_position = int(ldd.fdoffset)
 
-    jsondumper = JSONDumper(ldd, outname)
+        if args.verboseVITS:
+            ldd.verboseVITS = True
+
+        jsondumper = JSONDumper(ldd, outname)
+
+        done = False
+        while not done and ldd.fields_written < (req_frames * 2):
+            try:
+                f = ldd.readfield()
+            except KeyboardInterrupt as kbd:
+                print("\nTerminated, saving JSON and exiting", file=sys.stderr)
+                jsondumper.close()
+                ldd.close()
+                if audio_pipe is not None:
+                    audio_pipe.close()
+                sys.exit(1)
+            except Exception as err:
+                print(
+                    "\nERROR - please paste the following into a bug report:",
+                    file=sys.stderr,
+                )
+                print("current sample:", ldd.fdoffset, file=sys.stderr)
+                print("arguments:", args, file=sys.stderr)
+                print("Exception:", err, " Traceback:", file=sys.stderr)
+                traceback.print_tb(err.__traceback__)
+                jsondumper.close()
+                ldd.close()
+                if audio_pipe is not None:
+                    audio_pipe.close()
+                sys.exit(1)
+
+            if f is None or (args.ignoreleadout == False and ldd.leadOut == True):
+                done = True
+
+            if ldd.fields_written < 100 or ((ldd.fields_written % 500) == 0):
+                jsondumper.write()
+
+        return ldd, jsondumper, start_sample_position
+
+    # First pass.  With the V4300D spur filter deferred (PAL), the lead-in is
+    # decoded plain and the filter switches on once sync is acquired -- so a
+    # capture whose lead-in the filter would break still locks, and the program
+    # content still gets the filter.  If that pass never acquires sync (a capture
+    # whose lead-in actually NEEDS the filter), restart once with the filter
+    # active from the very first field.  Either way no frames are skipped.
+    ldd, jsondumper, start_sample_position = run_decode(extra_options)
+
+    if (extra_options.get("V4300_defer")
+            and not ldd._acquired_event.is_set()
+            and ldd.fields_written < (req_frames * 2)):
+        print("\nV4300D: lead-in did not lock plain; restarting with the spur "
+              "filter active from the start", file=sys.stderr)
+        logger.info("V4300D deferred decode did not acquire sync; restarting with "
+                    "the spur filter active from the start")
+        jsondumper.close()
+        ldd.close()
+        extra_options = dict(extra_options)
+        extra_options["V4300_defer"] = False
+        ldd, jsondumper, start_sample_position = run_decode(extra_options)
 
     def cleanup():
         # logger.flush()
@@ -553,31 +615,6 @@ def main(args=None):
         ldd.close()
         if audio_pipe is not None:
             audio_pipe.close()
-
-    while not done and ldd.fields_written < (req_frames * 2):
-        try:
-            f = ldd.readfield()
-        except KeyboardInterrupt as kbd:
-            print("\nTerminated, saving JSON and exiting", file=sys.stderr)
-            cleanup()
-            sys.exit(1)
-        except Exception as err:
-            print(
-                "\nERROR - please paste the following into a bug report:",
-                file=sys.stderr,
-            )
-            print("current sample:", ldd.fdoffset, file=sys.stderr)
-            print("arguments:", args, file=sys.stderr)
-            print("Exception:", err, " Traceback:", file=sys.stderr)
-            traceback.print_tb(err.__traceback__)
-            cleanup()
-            sys.exit(1)
-
-        if f is None or (args.ignoreleadout == False and ldd.leadOut == True):
-            done = True
-
-        if ldd.fields_written < 100 or ((ldd.fields_written % 500) == 0):
-            jsondumper.write()
 
     if ldd.fields_written:
         print(f"\nCompleted: saving JSON and exiting.", file=sys.stderr)

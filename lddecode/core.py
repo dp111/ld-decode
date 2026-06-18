@@ -352,6 +352,17 @@ class RFDecode:
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
         self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
         self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
+
+        # Deferred V4300D filtering.  The spur filter wrecks cold-start sync in
+        # the flat lead-in on some captures (it removes legitimate flat-field
+        # energy there) while being harmless-to-helpful once locked.  In deferred
+        # mode we decode the lead-in WITHOUT the filter (a clean plain decode, so
+        # sync/AGC/VBI are all self-consistent) and switch the filter ON only once
+        # a solid lock is acquired -- so the program content gets the filtered
+        # video while no frames are missed.  The "acquired" signal is a shared
+        # threading.Event so the worker-thread RFDecode copies all see the flip.
+        self.v4300_defer = extra_options.get("V4300_defer", False)
+        self._acquired_event = extra_options.get("_acquired_event", None)
         # RF multi-path echo cancellation.  Removes the *asymmetric* (causal,
         # trailing) reflection from the player/capture chain - NOT the symmetric
         # pre+post ring around edges, which is inherent to the source video and
@@ -1003,7 +1014,13 @@ class RFDecode:
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
 
-        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract:
+        # In deferred mode the spur filter stays off until sync is acquired
+        # (shared event flips for all worker threads); see __init__.
+        v4300_on = (not self.v4300_defer) or (
+            self._acquired_event is not None and self._acquired_event.is_set()
+        )
+
+        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract and v4300_on:
             # Experimental upgrade of the V4300D workaround below: instead of
             # zeroing FFT bins (which leaves the off-bin spectral-leakage
             # skirts of the interfering tone behind), estimate the tone(s)
@@ -1011,7 +1028,7 @@ class RFDecode:
             # suppression on synthetic tests; see commit message for the A/B
             # testing recipe against real LD-V4300D captures.
             indata_fft = self.v4300d_coherent_subtract(indata_fft)
-        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter:
+        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter and v4300_on:
             """ This routine works around an 'interesting' issue seen with LD-V4300D players and
                 some PAL digital audio disks, where there is a signal somewhere between 8.47 and 8.57mhz.
 
@@ -3863,6 +3880,13 @@ class LDdecode:
         self.capture_id = None
 
         self.system = system
+        # Shared "sync acquired" signal for deferred V4300D filtering.  Placed in
+        # extra_options so the main RFDecode and every worker-thread RFDecode (all
+        # built from this same dict) reference the SAME Event; flipping it from
+        # the decode loop switches the spur filter on across all of them at once.
+        self._acquired_event = threading.Event()
+        extra_options["_acquired_event"] = self._acquired_event
+
         self.rf_opts = {
             'inputfreq':inputfreq,
             'system':system,
@@ -4610,6 +4634,19 @@ class LDdecode:
                     if ((f.sync_confidence < 50) and not
                          inrange(fieldlength, self.output_lines - 2, self.output_lines + 2)):
                         logger.warning("WARNING: Possible player skip detected - check output")
+
+                    # Deferred V4300D: a solid lock (correct field length) means we
+                    # are past the unreadable lead-in, so switch the spur filter ON
+                    # for all subsequent demods.  The flip is shared with the worker
+                    # threads via the event, so every block demodded from here on is
+                    # filtered.  (Only the handful of already-prefetched blocks right
+                    # at the seam stay unfiltered, which is immaterial -- filtered
+                    # and unfiltered are equivalent on real content.)  One-shot.
+                    if (self.rf.v4300_defer and not self._acquired_event.is_set()
+                            and inrange(fieldlength, self.output_lines - 2,
+                                        self.output_lines + 2)):
+                        self._acquired_event.set()
+                        logger.info("V4300D: sync acquired -- enabling spur filter for remaining decode")
 
                     self.fieldstack.insert(0, f)
 
