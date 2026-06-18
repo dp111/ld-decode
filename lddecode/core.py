@@ -4474,11 +4474,31 @@ class LDdecode:
                 # Drop existing thread
                 self.decodethread = None
 
-                f, offset = self.decodefield(redo, self.mtf_level, self.fieldstack[0], initphase, redo)
+                redo_pos = redo
+                f, offset = self.decodefield(redo_pos, self.mtf_level, self.fieldstack[0], initphase, redo_pos)
 
-                # Only allow one redo, no matter what
-                done = True
                 redo = None
+                if f and f.valid:
+                    # Re-decode succeeded; only allow the one redo.
+                    done = True
+                    self._pre_redo_params = None
+                elif getattr(self, "_pre_redo_params", None) is not None:
+                    # An AGC redo whose new levels failed (a transient at the
+                    # field fooled detectLevels).  The field decoded fine with
+                    # the PREVIOUS levels, so roll them back and re-decode it once
+                    # more with them -- recovering the frame instead of losing it.
+                    (self.rf.DecoderParams["ire0"],
+                     self.rf.DecoderParams["hz_ire"],
+                     self.rf.DecoderParams["vsync_ire"]) = self._pre_redo_params
+                    self._pre_redo_params = None
+                    f, offset = self.decodefield(redo_pos, self.mtf_level, self.fieldstack[0], initphase, redo_pos)
+                    # Commit the recovered field; if even the rolled-back decode
+                    # fails, don't abort the whole decode -- carry on forward.
+                    done = bool(f and f.valid)
+                else:
+                    # A non-AGC redo (needrerun/checkMTF) that came back invalid.
+                    # Don't abandon the decode; keep going forward past this field.
+                    done = False
             else:
                 if self.decodethread and self.decodethread.ident:
                     self.decodethread.join()
@@ -4532,6 +4552,9 @@ class LDdecode:
                     self.bw_ratios.append(metrics["blackToWhiteRFRatio"])
                     self.bw_ratios = self.bw_ratios[-keep:]
 
+                # Levels to roll back to if a redo's re-decode comes back invalid
+                # (populated only when AGC actually changes them, below).
+                self._pre_redo_params = None
                 redo = f.needrerun or not self.checkMTF(f, self.fieldstack[0])
                 if redo:
                     redo = self.fdoffset - offset
@@ -4563,6 +4586,15 @@ class LDdecode:
                         else:
                             redo = self.fdoffset - offset
 
+                            # Save the levels so that if the AGC re-decode fails
+                            # (e.g. a transient at the field fooled detectLevels),
+                            # the redo handler can roll them back and keep going
+                            # rather than aborting the whole decode.
+                            self._pre_redo_params = (
+                                self.rf.DecoderParams["ire0"],
+                                self.rf.DecoderParams["hz_ire"],
+                                self.rf.DecoderParams["vsync_ire"],
+                            )
                             self.rf.DecoderParams["ire0"] = ire0_hz
                             # Note that vsync_ire is a negative number, so (sync_hz - ire0_hz) is correct
                             self.rf.DecoderParams["hz_ire"] = hz_ire
