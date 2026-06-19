@@ -423,9 +423,9 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         // Only fields specific to Am2 will be decoded
 
         // Get the x3, x4 and x5 parameters
-        quint32 x3 = (statusCode & 0x000F00) >> 8;
-        quint32 x4 = (statusCode & 0x0000F0) >> 4;
-        //quint32 x5 = (statusCode & 0x00000F);
+        quint32 x3 = (statusCodeAm2 & 0x000F00) >> 8;
+        quint32 x4 = (statusCodeAm2 & 0x0000F0) >> 4;
+        //quint32 x5 = (statusCodeAm2 & 0x00000F);
 
         // Get the copy/no copy flag from x34
         if ((x3 & 0x01) == 0x01) {
