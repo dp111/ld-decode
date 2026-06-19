@@ -1378,6 +1378,106 @@ def nb_max(m):
     return np.max(m)
 
 
+@njit(cache=True, nogil=True)
+def compute_linelocs_kernel(
+    p_start, p_type, p_valid, line0loc, lastlineloc, meanlinelen,
+    linecount, proclines, skipdetected, hsync_tolerance, outlinecount, inlinelen,
+):
+    """ Body of Field.compute_linelocs lifted to numba: per-pulse line-number
+    assignment (keep-closest), then gap fill.  Reproduces the dict-based Python
+    original exactly using arrays indexed by rounded line number.
+
+    Returns (status, linelocs0, linelocs_filled, rv_err).  status==1 signals the
+    two early-exit cases (both return the same fdoffset in the Python wrapper).
+    """
+    filled = np.full(proclines, -1.0)
+    has = np.zeros(proclines, dtype=np.bool_)
+    dist = np.zeros(proclines)
+
+    n = p_start.shape[0]
+    for k in range(n):
+        ps = p_start[k]
+        lineloc = (ps - line0loc) / meanlinelen
+        rlineloc = nb_round(lineloc)
+        lineloc_distance = abs(lineloc - rlineloc)
+
+        if skipdetected:
+            lineloc_end = linecount - ((lastlineloc - ps) / meanlinelen)
+            rlineloc_end = nb_round(lineloc_end)
+            lineloc_end_distance = abs(lineloc_end - rlineloc_end)
+
+            if p_type[k] == 0 and rlineloc > 23 and lineloc_end_distance < lineloc_distance:
+                lineloc = lineloc_end
+                rlineloc = rlineloc_end
+                lineloc_distance = lineloc_end_distance
+
+        # rounded line numbers outside [0, proclines) are stored in the original
+        # dict but never read back, so they can't affect the output -- skip them.
+        if rlineloc < 0 or rlineloc >= proclines:
+            continue
+
+        if lineloc_distance > hsync_tolerance or (
+            has[rlineloc] and lineloc_distance > dist[rlineloc]
+        ):
+            continue
+
+        if rlineloc > 0 and not p_valid[k]:
+            if p_type[k] > 0 or (p_type[k] == 0 and rlineloc < 10):
+                continue
+
+        filled[rlineloc] = ps
+        has[rlineloc] = True
+        dist[rlineloc] = lineloc_distance
+
+    linelocs0 = filled.copy()
+    linelocs_filled = filled.copy()
+    rv_err = np.zeros(proclines, dtype=np.bool_)
+
+    # Searches below read the ORIGINAL filled array (matching the Python code,
+    # which searches `linelocs` while writing `linelocs_filled`).
+    if linelocs_filled[0] < 0:
+        next_valid = -1
+        for i in range(0, outlinecount + 1):
+            if filled[i] > 0:
+                next_valid = i
+                break
+
+        if next_valid == -1:
+            return 1, linelocs0, linelocs_filled, rv_err
+
+        linelocs_filled[0] = filled[next_valid] - (next_valid * meanlinelen)
+
+        if linelocs_filled[0] < inlinelen:
+            return 1, linelocs0, linelocs_filled, rv_err
+
+    for l in range(1, proclines):
+        if linelocs_filled[l] < 0:
+            rv_err[l] = True
+
+            prev_valid = -1
+            next_valid = -1
+            for i in range(l, -1, -1):
+                if filled[i] > 0:
+                    prev_valid = i
+                    break
+            for i in range(l, outlinecount + 1):
+                if filled[i] > 0:
+                    next_valid = i
+                    break
+
+            if prev_valid == -1:
+                avglen = inlinelen
+                linelocs_filled[l] = filled[next_valid] - (avglen * (next_valid - l))
+            elif next_valid != -1:
+                avglen = (filled[next_valid] - filled[prev_valid]) / (next_valid - prev_valid)
+                linelocs_filled[l] = filled[prev_valid] + (avglen * (l - prev_valid))
+            else:
+                avglen = inlinelen
+                linelocs_filled[l] = filled[prev_valid] + (avglen * (l - prev_valid))
+
+    return 0, linelocs0, linelocs_filled, rv_err
+
+
 @njit(cache=True,nogil=True)
 def nb_abs(m):
     return np.abs(m)
