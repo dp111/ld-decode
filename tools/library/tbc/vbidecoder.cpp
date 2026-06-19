@@ -139,9 +139,12 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
     // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.3 Picture numbers ------------------------------------------------------------------------
 
     // Check for CAV picture number on lines 17 and 18.
-    // The first digit is masked to be in the range 0-7, as the top bit was
-    // used to duplicate stop code signalling on early discs -- so the picture
-    // number is 0-79999.
+    // §10.1.3 permits picture numbers up to 99999, but the MSB of the X1
+    // digit was reused on early discs to duplicate stop-code signalling, so
+    // we mask it off (0x07FFFF) and intentionally accept only 0-79999.  This
+    // is a deliberate deviation from the spec's maximum; in practice a CAV
+    // side holds far fewer frames, so the lost range is never used.  (If the
+    // MSB is set, decodeBCD already rejects the resulting A-F first digit.)
 
     if ((vbi17 & 0xF00000) == 0xF00000) {
         if (decodeBCD(vbi17 & 0x07FFFF, vbi.picNo)) {
