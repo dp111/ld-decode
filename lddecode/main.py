@@ -253,7 +253,9 @@ def main(args=None):
         action="store_true",
         default=False,
         help="Cancel the capture/player multi-path reflection (faint 'ghost to "
-        "the right'): auto-detect the echo delays from the RF cepstrum.",
+        "the right'): auto-detect the echo from the RF cepstrum, refine its "
+        "amplitude, re-estimate continuously across the disc, and apply the "
+        "correction only when it measurably reduces the echo (no-op otherwise).",
     )
     parser.add_argument(
         "--rf_echo",
