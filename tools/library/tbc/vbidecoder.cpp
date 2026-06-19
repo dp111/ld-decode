@@ -118,7 +118,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
 
     if (vbi16 == -1 && vbi17 == -1 && vbi18 == -1) return vbi;
 
-    // IEC 60857-1986 - 10.1.1 Lead-in --------------------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.1 Lead-in --------------------------------------------------------------------------------
 
     // Check for lead-in on lines 17 and 18
     if ((vbi17 == 0x88FFFF) ||
@@ -127,7 +127,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         vbi.leadIn = true;
     }
 
-    // IEC 60857-1986 - 10.1.2 Lead-out -------------------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.2 Lead-out -------------------------------------------------------------------------------
 
     // Check for lead-out on lines 17 and 18
     if ((vbi17 == 0x80EEEE) ||
@@ -136,7 +136,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         vbi.leadOut = true;
     }
 
-    // IEC 60857-1986 - 10.1.3 Picture numbers ------------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.3 Picture numbers ------------------------------------------------------------------------
 
     // Check for CAV picture number on lines 17 and 18.
     // The first digit is masked to be in the range 0-7, as the top bit was
@@ -159,7 +159,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         }
     }
 
-    // IEC 60857-1986 - 10.1.4 Picture stop code ----------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.4 Picture stop code ----------------------------------------------------------------------
 
     // Check for picture stop code on lines 16 and 17
     if ((vbi16 == 0x82CFFF) ||
@@ -171,7 +171,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         if (verboseDebug) qDebug() << "VbiDecoder::decode(): VBI Picture stop code flagged";
     }
 
-    // IEC 60857-1986 - 10.1.5 Chapter numbers ------------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.5 Chapter numbers ------------------------------------------------------------------------
 
     // Check for chapter number on lines 17 and 18.
     // The first digit is masked to be in the range 0-7, as the top bit is used
@@ -190,7 +190,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         }
     }
 
-    // IEC 60857-1986 - 10.1.6 Programme time code --------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.6 Programme time code --------------------------------------------------------------------
 
     // Check for CLV programme time code on lines 17 and 18.
     // Both hour and minute must be valid for us to trust the code.
@@ -220,14 +220,14 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
                     vbi.clvMin << "minutes";
     }
 
-    // IEC 60857-1986 - 10.1.7 Constant linear velocity code ----------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.7 Constant linear velocity code ----------------------------------------------------------
 
     // Check for CLV code on line 17
     if ( vbi17 == 0x87FFFF ) {
         vbi.type = VbiDecoder::VbiDiscTypes::clv;
     }
 
-    // IEC 60857-1986 - 10.1.8 Programme status code ------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.8 Programme status code ------------------------------------------------------------------
 
     // Check for programme status code on line 16
     qint32 statusCode = 0;
@@ -410,7 +410,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         }
     }
 
-    // IEC 60857-1986 - 10.1.8 Programme status code (IEC Amendment 2) ------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.8 Programme status code (IEC Amendment 2) ------------------------------------------------
 
     // Check for programme status code on line 16
     qint32 statusCodeAm2 = 0;
@@ -534,7 +534,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         }
     }
 
-    // IEC 60857-1986 - 10.1.9 Users code -----------------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.9 Users code -----------------------------------------------------------------------------
 
     // Check for users code on line 16
     qint32 usersCode = 0;
@@ -558,7 +558,7 @@ VbiDecoder::Vbi VbiDecoder::decode(qint32 vbi16, qint32 vbi17, qint32 vbi18)
         }
     }
 
-    // IEC 60857-1986 - 10.1.10 CLV picture number --------------------------------------------------------------------
+    // IEC 60856-1986 (PAL) / 60857-1986 (NTSC) - 10.1.10 CLV picture number --------------------------------------------------------------------
 
     // Check for CLV picture number on line 16.
     // Both second and picture number must be valid for us to trust the code.
