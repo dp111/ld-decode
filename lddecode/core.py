@@ -1600,8 +1600,20 @@ class DemodCache:
                 output = {}
 
                 if "fft" not in block:
-                    output["fft"] = npfft.fft(block["rawinput"])
-                    fftdata = output["fft"]
+                    # The RF input is real, so its DFT is conjugate-symmetric.
+                    # Use rfft (moves ~half the bytes of a full complex fft) and
+                    # mirror it back to the full spectrum demodblock's consumers
+                    # expect.  Byte-identical to npfft.fft(real); helps under the
+                    # memory-bandwidth contention of parallel decodes.
+                    raw = block["rawinput"]
+                    nfft = raw.shape[0]
+                    half = npfft.rfft(raw)
+                    nr = half.shape[0]
+                    full = np.empty(nfft, dtype=half.dtype)
+                    full[:nr] = half
+                    full[nr:] = np.conj(half[1:nfft - nr + 1])[::-1]
+                    output["fft"] = full
+                    fftdata = full
                 else:
                     fftdata = block["fft"]
 
