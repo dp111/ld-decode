@@ -3905,6 +3905,10 @@ class LDdecode:
             if self.digital_audio:
                 # feed EFM stream into ld-ldstoefm
                 self.efm_pll = efm_pll.EFM_PLL()
+                # Opt-in gear-shift / fast-reacquire PLL (LDDECODE_EFM_GEARSHIFT=1).
+                # No effect on the output unless the loop loses lock.
+                if os.environ.get("LDDECODE_EFM_GEARSHIFT", "") == "1":
+                    self.efm_pll.gearshift = 1
                 self.outfile_efm = open(fname_out + ".efm", "wb")
                 if extra_options.get("write_pre_efm", False):
                     self.outfile_pre_efm = open(fname_out + ".prefm", "wb")

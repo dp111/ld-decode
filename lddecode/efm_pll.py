@@ -93,6 +93,14 @@ EFM_PLL_spec = [
     ("refClockTime", numba.float64),
     ("frequencyHysteresis", numba.int32),
     ("tCounter", numba.int8),
+    # Gear-shift / fast-reacquire state (no effect on output unless gearshift == 1)
+    ("gearshift", numba.int8),
+    ("lockCounter", numba.int32),
+    ("lockThreshold", numba.int32),
+    ("phaseGainTrack", numba.float64),
+    ("phaseGainAcq", numba.float64),
+    ("freqStepMul", numba.float64),
+    ("lockErrorFrac", numba.float64),
 ]
 
 
@@ -120,6 +128,23 @@ class EFM_PLL:
         self.refClockTime = 0.0
         self.frequencyHysteresis = 0
         self.tCounter = 1
+
+        # --- Gear-shift / fast-reacquire ---------------------------------
+        # When gearshift == 0 the loop is bit-for-bit identical to the
+        # original (phase gain 0.005, frequency step == periodAdjustBase),
+        # so clean captures are unaffected.  When gearshift == 1 the loop
+        # boosts its phase gain and frequency step *only while it is not
+        # locked* (i.e. while the per-edge phase error stays large).  A
+        # clean signal never leaves the locked state, so its output is
+        # still bit-identical; only cold start, post-dropout re-acquire and
+        # marginal-SNR regions see the faster pull-in.
+        self.gearshift = 0
+        self.phaseGainTrack = 0.005  # original steady-state phase gain
+        self.phaseGainAcq = 0.05  # 10x gain while acquiring
+        self.freqStepMul = 20.0  # 20x frequency step while acquiring
+        self.lockErrorFrac = 0.125  # |phase err| < frac*period == "in lock"
+        self.lockThreshold = 24  # consecutive in-lock edges to declare lock
+        self.lockCounter = 24  # start locked: clean startup stays identical
 
     def process(self, inputBuffer):
         """This method performs interpolated zero-crossing detection and stores
@@ -181,7 +206,30 @@ class EFM_PLL:
                 self.tCounter += 1
             else:
                 edgeDelta = sampleDelta - (nextTime - self.currentPeriod / 2.0)
-                self.phaseAdjust = edgeDelta * 0.005
+
+                # Gear-shift: while not locked, pull in phase/frequency
+                # harder.  acquiring is always False when gearshift == 0 or
+                # when the loop is locked, so steady-state output is unchanged.
+                acquiring = self.gearshift == 1 and self.lockCounter < self.lockThreshold
+                if acquiring:
+                    phaseGain = self.phaseGainAcq
+                    freqStep = self.periodAdjustBase * self.freqStepMul
+                else:
+                    phaseGain = self.phaseGainTrack
+                    freqStep = self.periodAdjustBase
+
+                self.phaseAdjust = edgeDelta * phaseGain
+
+                # Track lock: a run of small phase errors == locked; any
+                # large error (cold start, dropout, marginal SNR) drops us
+                # back to acquiring so the boosted gains re-engage.
+                if (edgeDelta < self.lockErrorFrac * self.currentPeriod) and (
+                    edgeDelta > -self.lockErrorFrac * self.currentPeriod
+                ):
+                    if self.lockCounter < self.lockThreshold:
+                        self.lockCounter += 1
+                else:
+                    self.lockCounter = 0
 
                 # Adjust frequency based on error
                 if edgeDelta < 0:
@@ -199,15 +247,15 @@ class EFM_PLL:
 
                 # Update the reference clock?
                 if self.frequencyHysteresis < -1.0 or self.frequencyHysteresis > 1.0:
-                    aper = self.periodAdjustBase * edgeDelta / self.currentPeriod
+                    aper = freqStep * edgeDelta / self.currentPeriod
 
                     # If there's been a substantial gap since the last edge (e.g.
                     # a dropout), edgeDelta can be very large here, so we need to
                     # limit how much of an adjustment we're willing to make
-                    if aper < -self.periodAdjustBase:
-                        aper = -self.periodAdjustBase
-                    elif aper > self.periodAdjustBase:
-                        aper = self.periodAdjustBase
+                    if aper < -freqStep:
+                        aper = -freqStep
+                    elif aper > freqStep:
+                        aper = freqStep
 
                     self.currentPeriod += aper
 
