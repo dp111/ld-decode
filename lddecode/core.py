@@ -3905,9 +3905,13 @@ class LDdecode:
             if self.digital_audio:
                 # feed EFM stream into ld-ldstoefm
                 self.efm_pll = efm_pll.EFM_PLL()
-                # Opt-in gear-shift / fast-reacquire PLL (LDDECODE_EFM_GEARSHIFT=1).
-                # No effect on the output unless the loop loses lock.
-                if os.environ.get("LDDECODE_EFM_GEARSHIFT", "") == "1":
+                # Gear-shift / fast-reacquire PLL: ON by default.  While the loop
+                # is locked it runs bit-for-bit identical to the original fixed-gain
+                # loop, so clean discs are unchanged; it only speeds pull-in on cold
+                # start, post-dropout re-acquire and marginal-SNR regions (which is
+                # where the original loop drops sectors).
+                # Set LDDECODE_EFM_GEARSHIFT=0 to restore the original loop.
+                if os.environ.get("LDDECODE_EFM_GEARSHIFT", "1") != "0":
                     self.efm_pll.gearshift = 1
                 self.outfile_efm = open(fname_out + ".efm", "wb")
                 if extra_options.get("write_pre_efm", False):
