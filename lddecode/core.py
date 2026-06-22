@@ -3913,6 +3913,16 @@ class LDdecode:
                 # Set LDDECODE_EFM_GEARSHIFT=0 to restore the original loop.
                 if os.environ.get("LDDECODE_EFM_GEARSHIFT", "1") != "0":
                     self.efm_pll.gearshift = 1
+                # Advanced: override individual acquisition-loop parameters (e.g. for
+                # multi-decode ensembles that lock different marginal frames). Unset
+                # -> the tuned defaults above are used.
+                for _ev, _at, _ty in (("LDDECODE_EFM_PHASEGAIN_ACQ", "phaseGainAcq", float),
+                                      ("LDDECODE_EFM_FREQSTEPMUL", "freqStepMul", float),
+                                      ("LDDECODE_EFM_LOCKERRFRAC", "lockErrorFrac", float),
+                                      ("LDDECODE_EFM_LOCKTHRESH", "lockThreshold", int)):
+                    _v = os.environ.get(_ev, "")
+                    if _v:
+                        setattr(self.efm_pll, _at, _ty(float(_v)))
                 self.outfile_efm = open(fname_out + ".efm", "wb")
                 if extra_options.get("write_pre_efm", False):
                     self.outfile_pre_efm = open(fname_out + ".prefm", "wb")
