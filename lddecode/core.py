@@ -399,7 +399,10 @@ class RFDecode:
         # have to track), and - crucially for multi-disc stacking - aligns the
         # EFM of different captures of the same disc to a common disc-position
         # time-base so the pre-PLL EFM waveforms can be averaged.
-        self.tbc_efm = extra_options.get("tbc_efm", False)
+        # Experimental / off by default: it does NOT improve single-capture decode
+        # (output is the same sector set), so it is only useful for aligning the
+        # pre-PLL EFM of multiple captures of the same disc.  LDDECODE_TBC_EFM=1.
+        self.tbc_efm = extra_options.get("tbc_efm", False) or os.environ.get("LDDECODE_TBC_EFM", "") == "1"
         lowband = extra_options.get("lowband", False)
         wideband = extra_options.get("wideband", False)
 
