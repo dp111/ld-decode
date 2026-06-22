@@ -1575,12 +1575,21 @@ class DemodCache:
         if len(self.lru) < self.lrusize:
             return
 
+        keep = []
         with self.lock:
             for k in self.lru[self.lrusize :]:
-                if k in self.blocks:
+                if k not in self.blocks:
+                    continue
+                blk = self.blocks[k]
+                if k in self.waiting or (blk is not None and blk.get("waiting")):
+                    # Block is still in flight (queued for demod / awaited); evicting
+                    # it now makes dequeue() KeyError when its result returns and hangs
+                    # the decode.  Keep it; it is reconsidered on the next prune.
+                    keep.append(k)
+                else:
                     del self.blocks[k]
 
-        self.lru = self.lru[: self.lrusize]
+        self.lru = self.lru[: self.lrusize] + keep
 
     def apply_newparams(self, newparams):
         for k in newparams.keys():
@@ -1741,6 +1750,14 @@ class DemodCache:
 
             with self.lock:
                 blocknum, item = rv
+
+                if blocknum not in self.blocks:
+                    # Block was pruned while its demod result was still in flight;
+                    # the result is stale -- discard it and stop awaiting it.
+                    self.waiting.discard(blocknum)
+                    if not len(self.waiting):
+                        self.q_out_event.set()
+                    continue
 
                 if "MTF" not in item or "demod" not in item:
                     # This shouldn't happen, but was observed by Simon on a decode
