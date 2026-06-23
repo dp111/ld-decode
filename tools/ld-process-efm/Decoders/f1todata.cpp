@@ -23,6 +23,8 @@
 ************************************************************************/
 
 #include "f1todata.h"
+#include <cstdlib>
+#include <QFile>
 
 F1ToData::F1ToData()
 {
@@ -54,6 +56,7 @@ QByteArray F1ToData::process(const std::vector<F1Frame> &f1FramesIn, bool debugS
 
     // Clear the output buffer
     dataOutputBuffer.clear();
+    maskOutputBuffer.clear();
 
     if (f1FramesIn.empty()) return dataOutputBuffer;
 
@@ -125,6 +128,7 @@ void F1ToData::reset()
     f1IsCorruptBuffer.clear();
     f1IsMissingBuffer.clear();
     dataOutputBuffer.clear();
+    maskOutputBuffer.clear();
 
     waitingForData = false;
     currentState = state_initial;
@@ -220,13 +224,21 @@ F1ToData::StateMachine F1ToData::sm_state_processFrame()
     bool sectorValidity = true;
     bool sectorBufferCorrupt = false;
     bool sectorBufferMissing = false;
+    qint32 nCorrupt = 0, nMissing = 0, firstBad = -1, lastBad = -1;
+    // Per-byte erasure mask for the sector P/Q RS decoder (0 = corrupt/missing byte
+    // = erasure, 1 = good).  Lets the sector ECC do erasure correction (2/codeword)
+    // on the exact bad positions instead of all-or-nothing.  See sector.cpp.
+    QByteArray erasureMask(2352, static_cast<char>(1));
     for (qint32 i = 0; i < 2352; i++) {
-        if (f1IsCorruptBuffer[i] == static_cast<char>(0)) sectorBufferCorrupt = true;
-        if (f1IsMissingBuffer[i] == static_cast<char>(0)) sectorBufferMissing = true;
-        if (sectorBufferCorrupt || sectorBufferMissing) break;
+        bool bad = false;
+        if (f1IsCorruptBuffer[i] == static_cast<char>(0)) { sectorBufferCorrupt = true; nCorrupt++; bad = true; }
+        if (f1IsMissingBuffer[i] == static_cast<char>(0)) { sectorBufferMissing = true; nMissing++; bad = true; }
+        if (bad) { if (firstBad < 0) firstBad = i; lastBad = i; erasureMask[i] = static_cast<char>(0); }
     }
     if (sectorBufferCorrupt || sectorBufferMissing) sectorValidity = false;
-    Sector sector(f1DataBuffer.mid(0, 2352), sectorValidity);
+    Sector sector(f1DataBuffer.mid(0, 2352), sectorValidity, erasureMask);
+    QByteArray probeRaw = f1DataBuffer.mid(0, 2352);
+    QByteArray sectorMask = f1IsCorruptBuffer.mid(16, 2048);
 
     // Remove the sector data from the input F1 buffer
     f1DataBuffer.remove(0, 2352);
@@ -239,11 +251,18 @@ F1ToData::StateMachine F1ToData::sm_state_processFrame()
         if (debugOn) qDebug() << "F1ToData::sm_state_processFrame(): Current frame is invalid, setting user data to null";
         lastAddress.addFrames(1);
         statistics.currentAddress = lastAddress;
-        sector.setAsNull(statistics.currentAddress);
+        static int bestEffort = -1;
+        if (bestEffort < 0) { const char *be = getenv("LDDECODE_EFM_BESTEFFORT"); bestEffort = (be && be[0] == '1') ? 1 : 0; }
+        if (bestEffort) sector.setAddressKeepData(statistics.currentAddress);
+        else sector.setAsNull(statistics.currentAddress);
 
         if (debugOn && sectorBufferCorrupt) qDebug() << "F1ToData::sm_state_processFrame(): Sector invalid - Buffer contained corrupt F1 data";
         if (debugOn && sectorBufferMissing) qDebug() << "F1ToData::sm_state_processFrame(): Sector invalid - Buffer contained missing F1 data (padded)";
 
+        qInfo().noquote() << "PROBE INVALID-SECTOR addr" << statistics.currentAddress.getTimeAsQString()
+                          << (sectorBufferCorrupt ? "(corrupt F1)" : "(missing F1/padded)")
+                          << "corruptBytes" << nCorrupt << "missingBytes" << nMissing
+                          << "badspan" << firstBad << ".." << lastBad << "of 2352";
         statistics.invalidSectors++;
         statistics.totalSectors++;
     } else {
@@ -253,10 +272,31 @@ F1ToData::StateMachine F1ToData::sm_state_processFrame()
         statistics.totalSectors++;
     }
 
+    {
+        // Raw-sector dump for stacking: every real sector as
+        // [u32 address-frames][u8 valid][2352 scrambled F1 bytes].
+        // Enabled by env LDDECODE_EFM_RAWDUMP=<path>.
+        static int rawInit = 0;
+        static QFile *rawpf = nullptr;
+        if (rawInit == 0) {
+            rawInit = 1;
+            const char *rd = getenv("LDDECODE_EFM_RAWDUMP");
+            if (rd && rd[0]) { rawpf = new QFile(QString(rd)); rawpf->open(QIODevice::WriteOnly); }
+        }
+        if (rawpf) {
+            qint32 af = statistics.currentAddress.getFrames();
+            quint32 a = static_cast<quint32>(af);
+            char v = sector.isValid() ? 1 : 0;
+            rawpf->write(reinterpret_cast<char*>(&a), 4);
+            rawpf->write(&v, 1);
+            rawpf->write(probeRaw);
+            rawpf->flush();
+        }
+    }
     // Sector will now have a valid address, check for gaps and pad if required, then write the current sector
     qint32 sectorAddressGap = sector.getAddress().getDifference(lastAddress.getTime());
     if (sectorAddressGap > 1) {
-        if (debugOn) qDebug().noquote() << "F1ToData::sm_state_processFrame(): Sector address gap - Adding" <<
+        qInfo().noquote() << "PROBE GAP - Adding" <<
                                            sectorAddressGap - 1 << "sectors(s) of padding - Last sector address was" <<
                                            lastAddress.getTimeAsQString() <<
                                            " - current sector address is" << sector.getAddress().getTimeAsQString();
@@ -273,6 +313,7 @@ F1ToData::StateMachine F1ToData::sm_state_processFrame()
             paddingSector.setAsNull(lastAddress);
 
             dataOutputBuffer.append(paddingSector.getUserData());
+            maskOutputBuffer.append(QByteArray(2048, 0));
             //if (debugOn) qDebug().noquote() << "F1ToData::sm_state_processFrame(): Padding sector with address" << lastAddress.getTimeAsQString();
 
             lastAddress.addFrames(1);
@@ -284,6 +325,7 @@ F1ToData::StateMachine F1ToData::sm_state_processFrame()
 
     // Write out the new sector
     dataOutputBuffer.append(sector.getUserData());
+    maskOutputBuffer.append(sectorMask);
     lastAddress = statistics.currentAddress;
     //if (debugOn) qDebug().noquote() << "F1ToData::sm_state_processFrame(): Writing data sector with address" << statistics.currentAddress.getTimeAsQString();
 

@@ -49,6 +49,7 @@ public:
     };
 
     QByteArray process(const std::vector<F1Frame> &f1FramesIn, bool debugState);
+    const QByteArray &getMaskBuffer() const { return maskOutputBuffer; }
 
     const Statistics &getStatistics() const;
     void reportStatistics() const;
@@ -64,6 +65,7 @@ private:
     QByteArray f1IsMissingBuffer;
 
     QByteArray dataOutputBuffer;
+    QByteArray maskOutputBuffer;
     bool waitingForData;
     QByteArray syncPattern;
     qint32 missingSyncCount;

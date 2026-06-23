@@ -43,13 +43,14 @@ class Sector
 {
 public:
     Sector();
-    Sector(QByteArray _sectorData, bool _isValid);
+    Sector(QByteArray _sectorData, bool _isValid, QByteArray _erasureMask = QByteArray());
 
-    void setData(QByteArray _sectorData, bool _isValid);
+    void setData(QByteArray _sectorData, bool _isValid, QByteArray _erasureMask = QByteArray());
     qint32 getMode() const;
     TrackTime getAddress() const;
     QByteArray getUserData();
     void setAsNull(TrackTime _address);
+    void setAddressKeepData(TrackTime _address);
     bool isValid() const;
     bool isMissing() const;
     bool isCorrected() const;
@@ -60,6 +61,7 @@ private:
     TrackTime address; // 3 bytes
     qint32 mode; // 1 byte
     QByteArray userData;
+    QByteArray rawUserData;
     quint32 edcWord;
 
     bool valid;

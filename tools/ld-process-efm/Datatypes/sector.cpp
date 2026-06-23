@@ -32,13 +32,13 @@ Sector::Sector()
     pCorrected = false;
 }
 
-Sector::Sector(QByteArray _sectorData, bool _isValid)
+Sector::Sector(QByteArray _sectorData, bool _isValid, QByteArray _erasureMask)
 {
-    setData(_sectorData, _isValid);
+    setData(_sectorData, _isValid, _erasureMask);
 }
 
 // Method to set the sector's data from a F1 frame
-void Sector::setData(QByteArray _sectorData, bool _isValid)
+void Sector::setData(QByteArray _sectorData, bool _isValid, QByteArray _erasureMask)
 {
     qint32 missingCount = 0;
 
@@ -62,10 +62,37 @@ void Sector::setData(QByteArray _sectorData, bool _isValid)
         uF1DataOut[i] = uF1DataIn[i] ^ scrambleTable[i];
     }
 
-    // Is data marked as valid?
+    // Always retain the raw descrambled mode-1 payload (2048B at offset 16) so
+    // best-effort recovery can emit it even when the (corrupt) header defeats
+    // mode detection.
+    rawUserData = uF1Data.mid(16, 2048);
+
+    // Erasure flags for the sector-level P/Q Reed-Solomon decoder.
+    //
+    // Legacy behaviour (default): all-or-nothing from the _isValid bool -- an
+    // invalid sector marks EVERY byte as an erasure (uncorrectable: >2/codeword),
+    // a valid-but-EDC-failing sector marks NONE (error-only, 1 error/codeword).
+    // Neither uses the per-byte error positions the C1/C2 stage already computed.
+    //
+    // With LDDECODE_EFM_ERASURES=1 and a per-byte mask (mask byte == 0 -> byte is
+    // corrupt/missing, matching f1todata's convention), mark exactly those bytes as
+    // erasures.  P=RS(26,24)/Q=RS(45,43) then correct up to 2 ERASURES per codeword
+    // (vs 1 error), recovering localised bursts -- e.g. the last sector before a
+    // block/gap boundary whose tail is hit -- that the legacy path cannot.
     uchar uF1Erasures[2352];
-    for (qint32 i = 0; i < 2352; i++) {
-        if (_isValid) uF1Erasures[i] = 0; else uF1Erasures[i] = 1;
+    static int enhanced = -1;
+    if (enhanced < 0) { const char *e = getenv("LDDECODE_EFM_ERASURES"); enhanced = (e && e[0] == '1') ? 1 : 0; }
+    qint32 nEras = 0;
+    if (enhanced && _erasureMask.size() == 2352) {
+        const uchar *m = reinterpret_cast<const uchar*>(_erasureMask.constData());
+        for (qint32 i = 0; i < 2352; i++) { uF1Erasures[i] = (m[i] == static_cast<uchar>(0)) ? 1 : 0; nEras += uF1Erasures[i]; }
+        // At a CIRC/block boundary a few bad F3 frames are spread by the deinterleave
+        // across ALL of a sector's frames, so C2 flags the whole sector (per-frame
+        // granularity) -- useless as erasures.  When (nearly) everything is flagged,
+        // discard the erasures and let the iterated P/Q below do pure error correction.
+        if (nEras > 104) { for (qint32 i = 0; i < 2352; i++) uF1Erasures[i] = 0; nEras = 0; }
+    } else {
+        for (qint32 i = 0; i < 2352; i++) uF1Erasures[i] = _isValid ? 0 : 1;
     }
 
     // Set the sector's address
@@ -109,9 +136,23 @@ void Sector::setData(QByteArray _sectorData, bool _isValid)
         if (edcWord != crc32(uF1DataOut, 2064)) {
             //qDebug() << "Sector::setData(): Initial EDC failed (CRC32 checksum incorrect)";
 
-            // Attempt Q and P error correction on sector
-            performQParityECC(uF1DataOut, uF1Erasures);
-            performPParityECC(uF1DataOut, uF1Erasures);
+            // Attempt Q and P error correction on sector.
+            // Legacy: a single Q+P pass.  Enhanced (LDDECODE_EFM_ERASURES=1): iterate
+            // -- CIRC P/Q is convergent, each Q correction can unblock a P codeword
+            // (and vice versa), so multiple passes recover sectors a single pass can't
+            // (e.g. ~2 errors/codeword at a block boundary).  EDC-gated, so extra
+            // passes can only help, never accept a wrong sector.
+            qint32 maxPass = enhanced ? 8 : 1;
+            for (qint32 pass = 0; pass < maxPass; pass++) {
+                performQParityECC(uF1DataOut, uF1Erasures);
+                performPParityECC(uF1DataOut, uF1Erasures);
+                quint32 e =
+                    ((static_cast<quint32>(uF1DataOut[2064])) <<  0) |
+                    ((static_cast<quint32>(uF1DataOut[2065])) <<  8) |
+                    ((static_cast<quint32>(uF1DataOut[2066])) << 16) |
+                    ((static_cast<quint32>(uF1DataOut[2067])) << 24);
+                if (e == crc32(uF1DataOut, 2064)) break;
+            }
 
             // Get the updated EDC word
             edcWord =
@@ -182,6 +223,16 @@ void Sector::setAsNull(TrackTime _address)
     mode = 1;
     userData.fill(0, 2048);
     valid = false;
+}
+
+// Best-effort: force the address but PRESERVE the (uncertified) user data
+void Sector::setAddressKeepData(TrackTime _address)
+{
+    address = _address;
+    mode = 1;
+    valid = false;
+    // Emit the raw descrambled payload (always 2048B) - no uninitialised memory.
+    userData = rawUserData;
 }
 
 // Method to get the sector's validity
