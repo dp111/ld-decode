@@ -177,8 +177,9 @@ void C2Deinterleave::deinterleave()
     outputC2Errors[23] = c2DelayBuffer[prev].c2Error[27];
 
     // Check that both required C2 symbols contain valid data
+    // (all 24 deinterleaved symbols, not 0..22 -- the last byte was skipped)
     bool outputC2Valid = true;
-    for (qint32 i = 0; i < 23; i++) {
+    for (qint32 i = 0; i < 24; i++) {
         if (outputC2Errors[i] == static_cast<uchar>(1)) outputC2Valid = false;
     }
 
