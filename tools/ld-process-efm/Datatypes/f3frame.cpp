@@ -24,6 +24,7 @@
 ************************************************************************/
 
 #include "f3frame.h"
+#include <cstdlib>
 
 // Note: Class for storing 'F3 frames' as defined by clause 18 of ECMA-130
 //
@@ -61,8 +62,22 @@ F3Frame::F3Frame(const uchar *tValuesIn, qint32 tLength, bool audioIsDts)
     setTValues(tValuesIn, tLength, audioIsDts);
 }
 
+// Soft-decision constructor: confValuesIn carries one confidence byte per T-value.
+F3Frame::F3Frame(const uchar *tValuesIn, const uchar *confValuesIn, qint32 tLength, bool audioIsDts)
+{
+    validEfmSymbols = 0;
+    invalidEfmSymbols = 0;
+    correctedEfmSymbols = 0;
+
+    isSync0 = false;
+    isSync1 = false;
+    subcodeSymbol = 0;
+
+    setTValues(tValuesIn, tLength, audioIsDts, confValuesIn);
+}
+
 // This method sets the T-values for the F3 Frame
-void F3Frame::setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts)
+void F3Frame::setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts, const uchar *confValuesIn)
 {
     // Does tValuesIn contain values?
     if (tLength == 0) {
@@ -91,6 +106,11 @@ void F3Frame::setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts
     qint16 efmValues[33];
     for (qint32 i = 0; i < 33; i++) efmValues[i] = 0;
 
+    // Per-symbol minimum edge confidence (255 = best).  Each T-value (edge) that
+    // falls within an EFM symbol lowers that symbol's confidence to the worst edge.
+    uchar symbolMinConf[33];
+    for (qint32 i = 0; i < 33; i++) symbolMinConf[i] = 255;
+
     // Iterate through the T-values, keeping track of the bit position within the frame.
     // The loop executes an extra time at the end to write the final 1 bit.
     qint32 frameBits = 0;
@@ -106,6 +126,11 @@ void F3Frame::setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts
             const qint32 efmBit = efmBits % (14 + 3);
             if (efmIndex < 33 && efmBit < 14) {
                 efmValues[efmIndex] |= (1 << (13 - efmBit));
+            }
+            // Track the worst (minimum) edge confidence for this symbol
+            if (confValuesIn != nullptr && tPosition < tLength && efmIndex < 33) {
+                const uchar c = confValuesIn[tPosition];
+                if (c < symbolMinConf[efmIndex]) symbolMinConf[efmIndex] = c;
             }
         }
 
@@ -142,6 +167,21 @@ void F3Frame::setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts
             // Translation was invalid, mark as error
             dataSymbols[i] = 0;
             errorSymbols[i] = 1;
+        }
+    }
+
+    // Soft-decision erasures: a symbol that translated cleanly but whose worst edge
+    // confidence is below LDDECODE_EFM_ERASE_CONF is flagged as a C1/C2 RS erasure
+    // (data symbol i corresponds to efm symbol i+1; symbol 0 is the subcode).
+    // confValuesIn == nullptr or threshold 0 -> no change (default byte-identical).
+    static int f3EraseConfThreshold = -1;
+    if (f3EraseConfThreshold < 0) {
+        const char *e = getenv("LDDECODE_EFM_ERASE_CONF");
+        f3EraseConfThreshold = e ? atoi(e) : 0;
+    }
+    if (confValuesIn != nullptr && f3EraseConfThreshold > 0) {
+        for (qint32 i = 0; i < 32; i++) {
+            if (errorSymbols[i] == 0 && symbolMinConf[i + 1] < f3EraseConfThreshold) errorSymbols[i] = 1;
         }
     }
 }

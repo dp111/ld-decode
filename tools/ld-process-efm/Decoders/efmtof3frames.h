@@ -55,7 +55,7 @@ public:
         qint64 correctedEfmSymbols;
     };
 
-    std::vector<F3Frame> process(QByteArray efmDataIn, bool debugState, bool _audioIsDts);
+    std::vector<F3Frame> process(QByteArray efmDataIn, QByteArray confDataIn, bool debugState, bool _audioIsDts);
     const Statistics &getStatistics() const;
     void reportStatistics() const;
     void reset();
@@ -65,6 +65,7 @@ private:
     bool audioIsDts;
     Statistics statistics;
     QByteArray efmDataBuffer;
+    QByteArray efmConfBuffer;
     std::vector<F3Frame> f3FramesOut;
 
     // State machine state definitions

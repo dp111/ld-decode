@@ -23,6 +23,7 @@
 ************************************************************************/
 
 #include "efmprocess.h"
+#include <cstdlib>
 
 #include <vector>
 
@@ -142,6 +143,14 @@ bool EfmProcess::process(QString inputFilename, QString outputFilename)
     reset();
 
     // Variables for processing progress reporting
+    QFile inputConfHandle(inputFilename + "c");
+    bool haveConf = inputConfHandle.open(QIODevice::ReadOnly);
+    if (haveConf) qInfo() << "Using EFM confidence sidecar:" << (inputFilename + "c");
+    const char *beEnv = getenv("LDDECODE_EFM_BESTEFFORT");
+    bool haveMask = beEnv && beEnv[0] == '1';
+    QFile maskFileHandle(outputFilename + ".mask");
+    if (haveMask) { maskFileHandle.open(QIODevice::WriteOnly); qInfo() << "Writing corrupt-mask sidecar:" << (outputFilename + ".mask"); }
+
     qint64 initialInputFileSize = inputFileHandle.bytesAvailable();
     qint32 lastPercent = 0;
 
@@ -156,8 +165,14 @@ bool EfmProcess::process(QString inputFilename, QString outputFilename)
         qint64 bytesRead = inputFileHandle.read(inputEfmBuffer.data(), inputEfmBuffer.size());
         if (bytesRead != bufferSize) inputEfmBuffer.resize(static_cast<qint32>(bytesRead));
 
+        QByteArray inputConfBuffer;
+        if (haveConf) {
+            inputConfBuffer.resize(static_cast<qint32>(bytesRead));
+            inputConfHandle.read(inputConfBuffer.data(), bytesRead);
+        }
+
         // Perform EFM processing
-        const std::vector<F3Frame> &initialF3Frames = efmToF3Frames.process(inputEfmBuffer, debug_efmToF3Frames, audioIsDts);
+        const std::vector<F3Frame> &initialF3Frames = efmToF3Frames.process(inputEfmBuffer, inputConfBuffer, debug_efmToF3Frames, audioIsDts);
         const std::vector<F3Frame> &syncedF3Frames = syncF3Frames.process(initialF3Frames, debug_syncF3Frames);
         const std::vector<F2Frame> &f2Frames = f3ToF2Frames.process(syncedF3Frames, debug_f3ToF2Frames, noTimeStamp);
         const std::vector<F1Frame> &f1Frames = f2ToF1Frames.process(f2Frames, debug_f2ToF1Frame, noTimeStamp);
@@ -167,7 +182,11 @@ bool EfmProcess::process(QString inputFilename, QString outputFilename)
             outputFileHandle.write(f1ToAudio.process(f1Frames, padInitialDiscTime, errorTreatment, concealType, debug_f1ToAudio));
         } else {
             outputFileHandle.write(f1ToData.process(f1Frames, debug_f1ToData));
+            if (haveMask) maskFileHandle.write(f1ToData.getMaskBuffer());
         }
+        // PROBE: efm byte position vs current data address (256K granularity)
+        if (!decodeAsAudio) qInfo().noquote() << "POS" << (initialInputFileSize - inputFileHandle.bytesAvailable())
+                          << "addr" << f1ToData.getStatistics().currentAddress.getTimeAsQString();
 
         // Report progress to user
         double percent = 100 - (100.0 / static_cast<double>(initialInputFileSize)) * static_cast<double>(inputFileHandle.bytesAvailable());
@@ -184,6 +203,7 @@ bool EfmProcess::process(QString inputFilename, QString outputFilename)
     // Close all files
     inputFileHandle.close();
     outputFileHandle.close();
+    if (haveMask) maskFileHandle.close();
 
     // Report the final decode statistics to qInfo
     reportStatistics();

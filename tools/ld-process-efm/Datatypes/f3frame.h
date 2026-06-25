@@ -34,8 +34,11 @@ class F3Frame
 public:
     F3Frame();
     F3Frame(const uchar *tValuesIn, qint32 tLength, bool audioIsDts);
+    // Soft-decision variant: confValuesIn carries one confidence byte per T-value
+    // (255 = best); low-confidence symbols become RS erasures (LDDECODE_EFM_ERASE_CONF).
+    F3Frame(const uchar *tValuesIn, const uchar *confValuesIn, qint32 tLength, bool audioIsDts);
 
-    void setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts);
+    void setTValues(const uchar *tValuesIn, qint32 tLength, bool audioIsDts, const uchar *confValuesIn = nullptr);
     const uchar *getDataSymbols() const;
     const uchar *getErrorSymbols() const;
     uchar getSubcodeSymbol() const;

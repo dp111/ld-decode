@@ -23,6 +23,7 @@
 ************************************************************************/
 
 #include "efmtof3frames.h"
+#include <cstdlib>
 
 EfmToF3Frames::EfmToF3Frames()
 {
@@ -33,7 +34,7 @@ EfmToF3Frames::EfmToF3Frames()
 // Public methods -----------------------------------------------------------------------------------------------------
 
 // Main processing method
-std::vector<F3Frame> EfmToF3Frames::process(QByteArray efmDataIn, bool debugState, bool _audioIsDts)
+std::vector<F3Frame> EfmToF3Frames::process(QByteArray efmDataIn, QByteArray confDataIn, bool debugState, bool _audioIsDts)
 {
     debugOn = debugState;
     audioIsDts = _audioIsDts;
@@ -43,6 +44,7 @@ std::vector<F3Frame> EfmToF3Frames::process(QByteArray efmDataIn, bool debugStat
 
     // Append input data to the processing buffer
     efmDataBuffer.append(efmDataIn);
+    efmConfBuffer.append(confDataIn);
 
     waitingForData = false;
     while (!waitingForData) {
@@ -115,6 +117,7 @@ void EfmToF3Frames::reset()
 
     // Initialise the state-machine
     efmDataBuffer.clear();
+    efmConfBuffer.clear();
     currentState = state_initial;
     nextState = currentState;
     waitingForData = false;
@@ -172,6 +175,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findInitialSyncStage1()
         if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findInitialSyncStage1(): No initial F3 sync found in EFM buffer - discarding" << efmDataBuffer.size() - 1 << "EFM values";
 
         // Discard the EFM already tested and try again
+        if (!efmConfBuffer.isEmpty()) efmConfBuffer.remove(0, efmConfBuffer.size() - 1);
         efmDataBuffer.remove(0, efmDataBuffer.size() - 1);
 
         waitingForData = true;
@@ -181,6 +185,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findInitialSyncStage1()
     if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findInitialSyncStage1(): Initial F3 sync found at buffer position" << startSyncTransition << "- discarding" << startSyncTransition << "EFM values";
 
     // Discard all EFM data up to the sync start
+    if (!efmConfBuffer.isEmpty()) efmConfBuffer.remove(0, startSyncTransition);
     efmDataBuffer.remove(0, startSyncTransition);
 
     // Move to find initial sync stage 2
@@ -215,6 +220,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findInitialSyncStage2()
     if (tTotal > searchLength) {
         if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findInitialSyncStage2(): No second F3 sync found within a reasonable length, going back to look for new initial sync.  T =" << tTotal;
         if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findInitialSyncStage2(): Discarding" << endSyncTransition << "EFM values";
+        if (!efmConfBuffer.isEmpty()) efmConfBuffer.remove(0, endSyncTransition);
         efmDataBuffer.remove(0, endSyncTransition);
         return state_findInitialSyncStage1;
     }
@@ -228,6 +234,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findInitialSyncStage2()
     if (tTotal < 587 || tTotal > 589) {
         // Discard the transitions already tested and try again
         if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findInitialSyncStage2(): Discarding" << endSyncTransition << "EFM values";
+        if (!efmConfBuffer.isEmpty()) efmConfBuffer.remove(0, endSyncTransition);
         efmDataBuffer.remove(0, endSyncTransition);
         return state_findInitialSyncStage2;
     }
@@ -241,6 +248,8 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findInitialSyncStage2()
 // Find the next T11+T11 sync pattern in the EFM input buffer
 EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findSecondSync()
 {
+    static int f3Flywheel = -1;
+    if (f3Flywheel < 0) { const char *e = getenv("LDDECODE_EFM_F3_FLYWHEEL"); f3Flywheel = (e && e[0]=='1') ? 1 : 0; }
     //if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findSecondSync(): Called";
 
     // Get at least 588 bits of data
@@ -316,7 +325,8 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findSecondSync()
             }
 
             // If there is a failure when there are no previous good syncs, try to resync
-            if (sequentialGoodSyncCounter == 0 && sequentialBadSyncCounter !=0) {
+            // (flywheel: coast through instead of discarding the marginal region)
+            if (sequentialGoodSyncCounter == 0 && sequentialBadSyncCounter !=0 && !f3Flywheel) {
                 if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findSecondSync(): F3 Sync failing with no previous good frames - attempting to reset sync";
                 return state_findInitialSyncStage1;
             }
@@ -329,7 +339,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_findSecondSync()
     //if (tTotal != 588) if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findSecondSync(): F3 Frame length incorrect at" << tTotal << "bytes (expected 588)";
 
     // Hit limit of poor sync detections?
-    if (sequentialBadSyncCounter > 16) {
+    if (sequentialBadSyncCounter > (f3Flywheel ? 96 : 16)) {
         sequentialBadSyncCounter = 0;
         if (debugOn) qDebug() << "EfmToF3Frames::sm_state_findSecondSync(): Too many F3 sequential poor sync detections (>16) - sync lost";
         return state_syncLost;
@@ -358,6 +368,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_processFrame()
     // The theoretical maximum number of T-values is (588 - T11 - T11) / T3 = 189
     qint32 tTotal = 0;
     uchar frameT[190];
+    uchar frameC[190];
     qint32 tPointer = 0;
     qint32 tLength = endSyncTransition;
     if (tLength > 189) {
@@ -373,6 +384,7 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_processFrame()
         // Keep track of the total T and append to the F3 frame to be processed
         tTotal += value;
 
+        frameC[tPointer] = (delta < efmConfBuffer.size()) ? static_cast<uchar>(efmConfBuffer[delta]) : static_cast<uchar>(255);
         frameT[tPointer++] = value;
     }
 
@@ -383,14 +395,15 @@ EfmToF3Frames::StateMachine EfmToF3Frames::sm_state_processFrame()
 
     // Now we hand the data over to the F3 frame class which converts the data
     // into a F3 frame and save the F3 frame to our output data buffer
-    f3FramesOut.emplace_back(frameT, tLength, audioIsDts);
+    f3FramesOut.emplace_back(frameT, frameC, tLength, audioIsDts);
 
     statistics.validEfmSymbols += f3FramesOut.back().getNumberOfValidEfmSymbols();
     statistics.invalidEfmSymbols += f3FramesOut.back().getNumberOfInvalidEfmSymbols();
     statistics.correctedEfmSymbols += f3FramesOut.back().getNumberOfCorrectedEfmSymbols();
 
     // Discard all transitions up to the sync end
-    efmDataBuffer.remove(0, endSyncTransition);
+    if (!efmConfBuffer.isEmpty()) efmConfBuffer.remove(0, endSyncTransition);
+        efmDataBuffer.remove(0, endSyncTransition);
 
     // Find the next sync position
     return state_findSecondSync;
