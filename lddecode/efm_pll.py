@@ -83,6 +83,7 @@ EFM_PLL_spec = [
     ("zcPreviousInput", numba.int16),
     ("delta", numba.float64),
     ("pllResult", numba.int8[:]),
+    ("pllConf", numba.uint8[:]),
     ("pllResultCount", numba.uintp),
     ("basePeriod", numba.float64),
     ("minimumPeriod", numba.float64),
@@ -113,6 +114,9 @@ class EFM_PLL:
 
         # PLL output buffer
         self.pllResult = np.empty(1 << 16, np.int8)
+        # Per-T-value soft-decision confidence (255 = best), parallel to pllResult.
+        # Derived from the loop's residual phase error at each emitted edge.
+        self.pllConf = np.empty(1 << 16, np.uint8)
         self.pllResultCount = 0
 
         # PLL state
@@ -166,6 +170,7 @@ class EFM_PLL:
         # Ensure the PLL result buffer is big enough, and clear it
         if len(self.pllResult) < len(inputBuffer):
             self.pllResult = np.empty(len(inputBuffer), np.int8)
+            self.pllConf = np.empty(len(inputBuffer), np.uint8)
         self.pllResultCount = 0
 
         for curr in inputBuffer:
@@ -265,6 +270,13 @@ class EFM_PLL:
                         self.currentPeriod = self.maximumPeriod
 
                 self.pllResult[self.pllResultCount] = self.tCounter
+                # Soft-decision confidence: how close this edge fell to the loop's
+                # predicted clock grid.  |edgeDelta| ~0 -> 255 (trust); approaching
+                # half a bit-period -> 0 (likely mis-timed -> RS erasure candidate).
+                norm = abs(edgeDelta) / (self.currentPeriod * 0.5)
+                if norm > 1.0:
+                    norm = 1.0
+                self.pllConf[self.pllResultCount] = np.uint8(255.0 * (1.0 - norm))
                 self.pllResultCount += 1
 
                 self.tCounter = 1

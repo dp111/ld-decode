@@ -3951,6 +3951,7 @@ class LDdecode:
         self.outfile_video = None
         self.outfile_audio = None
         self.outfile_efm = None
+        self.outfile_efmc = None
         self.outfile_pre_efm = None
         self.outfile_ac3 = None
         self.ffmpeg_rftbc, self.outfile_rftbc = None, None
@@ -3982,6 +3983,11 @@ class LDdecode:
                     if _v:
                         setattr(self.efm_pll, _at, _ty(float(_v)))
                 self.outfile_efm = open(fname_out + ".efm", "wb")
+                # Soft-decision: emit a per-T-value confidence sidecar (.efmc) that
+                # ld-process-efm turns into RS erasures (LDDECODE_EFM_ERASE_CONF).
+                # Opt-in so default decodes are unchanged.
+                if os.environ.get("LDDECODE_EFM_EMITCONF", "") == "1":
+                    self.outfile_efmc = open(fname_out + ".efmc", "wb")
                 if extra_options.get("write_pre_efm", False):
                     self.outfile_pre_efm = open(fname_out + ".prefm", "wb")
             if self.write_rf_tbc:
@@ -4097,6 +4103,7 @@ class LDdecode:
             "outfile_audio",
             "outfile_json",
             "outfile_efm",
+            "outfile_efmc",
             "outfile_rftbc",
             "outfile_ac3",
         ]:
@@ -4446,6 +4453,11 @@ class LDdecode:
 
             efm_out = self.efm_pll.process(efm)
             self.outfile_efm.write(efm_out.tobytes())
+            if self.outfile_efmc is not None:
+                # Per-T-value confidence, aligned 1:1 with the .efm T-values just written
+                self.outfile_efmc.write(
+                    self.efm_pll.pllConf[: self.efm_pll.pllResultCount].tobytes()
+                )
 
         fi["audioSamples"] = 0 if audio is None else int(len(audio) / 2)
         fi["efmTValues"] = len(efm_out) if self.digital_audio else 0
