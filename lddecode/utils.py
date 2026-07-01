@@ -517,7 +517,10 @@ class LoadLDF:
         self.filename = filename
 
         self.position = 0
-        self.rewind_size = 2 * 1024 * 1024
+        # 16 MiB backward-seek buffer (matches upstream 8a42fec2, which enlarged
+        # the equivalent LoadFFmpeg buffer): a backward seek within this range is
+        # served from RAM instead of forcing an expensive container re-seek.
+        self.rewind_size = 16 * 1024 * 1024
         self.rewind_buf = b""
 
         # Forward seeks farther than this (in bytes) restart the decoder with a
