@@ -243,6 +243,18 @@ def main(args=None):
     )
 
     parser.add_argument(
+        "--field_reg",
+        dest="field_reg",
+        action="store_true",
+        default=False,
+        help="Experimental (still content): horizontally co-register the two "
+        "fields of each frame, correcting the small reproducible field-to-field "
+        "offset (recording-side wow) that shows as an interlace comb on sharp/"
+        "diagonal edges. Estimated per-frame on a luma-low-passed interleave; "
+        "auto-skips frames with inter-field motion. Off by default.",
+    )
+
+    parser.add_argument(
         "--NTSC_color_notch_filter",
         "-N",
         dest="NTSC_color_notch_filter",
@@ -452,6 +464,7 @@ def main(args=None):
         "pipe_RF_TBC": audio_pipe,
         "write_pre_efm": args.prefm,
         "tbc_efm": args.tbc_efm,
+        "field_reg": args.field_reg,
         "deemp_coeff": (args.deemp_low, args.deemp_high),
         "deemp_str": args.deemp_strength if args.deemp_strength is not None else (1.0 if args.pal else 0.96),
         "auto_deemp": args.deemp_strength is None,
