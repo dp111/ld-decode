@@ -238,6 +238,18 @@ FilterParams_PAL_lowband['video_bpf_high']  = 13000000
 FilterParams_PAL_lowband['video_bpf_order'] = 2
 FilterParams_PAL_lowband['video_lpf_freq']  = 4800000
 
+# Settings for clean, low-noise PAL captures: trade a little SNR for more
+# HF luma response.  Measured against the defaults on the GGV multiburst
+# capture: +0.55 dB at 4.8 MHz and +2.4 dB at 5.8 MHz on the decoded
+# multiburst (the 2.1 MHz low edge recovers real lower-sideband energy
+# and the 6.1 MHz LPF keeps more of the recorded detail), for -0.8 dB
+# wSNR / -1.0 dB bPSNR and ~+14% fold-over spur on dark saturated colour.
+# The group-delay equaliser tracks video_lpf_freq, so the IEC 9.1.6 curve
+# stays correct.
+FilterParams_PAL_wideband = FilterParams_PAL.copy()
+FilterParams_PAL_wideband['video_bpf_low']  = 2100000
+FilterParams_PAL_wideband['video_lpf_freq'] = 6100000
+
 
 # ---------------------------------------------------------------------------
 # CVBS 4fsc output constants (see cvbs-file-format-specification/)

@@ -20,6 +20,7 @@ from .params import (
     FilterParams_NTSC_lowband,
     FilterParams_PAL,
     FilterParams_PAL_lowband,
+    FilterParams_PAL_wideband,
     SysParams_NTSC,
     SysParams_PAL,
 )
@@ -137,6 +138,7 @@ class RFDecode:
 
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
         self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
+        self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
         # Time-base-correct the EFM waveform onto the video line time-base before
         # the EFM PLL.  This makes the EFM bit clock follow the disc rotation as
         # measured from sync (removing wow/flutter drift the PLL would otherwise
@@ -163,6 +165,7 @@ class RFDecode:
         if self._echo_manual:
             self._echo_inv = self._build_echo_inverse(self.rf_echo_cancel)
         lowband = extra_options.get("lowband", False)
+        wideband = extra_options.get("wideband", False)
 
         freq = inputfreq
         self.freq = freq
@@ -180,7 +183,12 @@ class RFDecode:
 
         sys_params, filt_params, filt_params_lb = SYSTEM_PARAMS[system]
         self.SysParams = copy.deepcopy(sys_params)
-        self.DecoderParams = copy.deepcopy(filt_params_lb if lowband else filt_params)
+        if lowband:
+            self.DecoderParams = copy.deepcopy(filt_params_lb)
+        elif wideband and system == "PAL":
+            self.DecoderParams = copy.deepcopy(FilterParams_PAL_wideband)
+        else:
+            self.DecoderParams = copy.deepcopy(filt_params)
 
         # Make (intentionally) mutable copies of HZ<->IRE levels
         for irekey in ['ire0', 'hz_ire', 'vsync_ire']:
@@ -372,6 +380,85 @@ class RFDecode:
                 return False
 
         return True
+
+    def v4300d_coherent_subtract(self, indata_fft, maxlines=10):
+        """Coherent (PLL-style, but stateless per block) removal of the
+        spurious ~8.47-8.57 MHz tone emitted by LD-V4300D players on some PAL
+        digital audio discs.
+
+        For each sufficiently prominent spectral line in the window (see
+        gating below): refine its frequency to the value that maximises the
+        captured single-tone energy, least-squares fit the complex amplitude
+        over the block, and subtract the reconstructed sinusoid in the time
+        domain.  Unlike bin zeroing this also removes the off-bin spectral
+        leakage skirts, and removes nothing else (no holes in the underlying
+        video sidebands).  Self-disabling: with no anomalous line present the
+        gate never trips and the input FFT is returned unchanged.  Stateless
+        per block, so it fits the out-of-order block-cache architecture where a
+        tracking PLL would not.
+
+        Gating: static video content puts a comb of legitimate FM sideband
+        lines (line-rate spacing) in this window, measuring up to ~27x the
+        window's median power on the test captures, so a new line is only
+        accepted at >40x median; follow-up cleanup of fit residuals is allowed
+        within +-30 kHz of a confirmed line at a relaxed >5x gate.  maxlines
+        bounds the loop; blocks without a spur pay only the detection cost."""
+        sl = slice(
+            int(self.blocklen * (8.42 / self.freq)),
+            int(1 + (self.blocklen * (8.6 / self.freq))),
+        )
+        fpb = self.freq_hz / self.blocklen
+
+        X = indata_fft
+        x = None
+        lines = []
+        for _ in range(maxlines):
+            sq_sl = sqsum(X[sl])
+            med = np.median(sq_sl)
+            if med <= 0:
+                break
+            k = int(np.argmax(sq_sl))
+            ratio = sq_sl[k] / med
+            fpeak = (k + sl.start) * fpb
+            near_known = any(abs(fpeak - f) < 30e3 for f in lines)
+            if not (ratio > 40 or (near_known and ratio > 5)):
+                break
+
+            if x is None:
+                # enter the time domain on first detection only
+                x = npfft.ifft(indata_fft).real.copy()
+                n = np.arange(self.blocklen)
+                # per-sample phase ramp, so exp(ph * f_hz) is the tone at f_hz
+                ph = (-2j * np.pi / self.freq_hz) * n
+
+            # Refine the peak frequency to the value that maximises the captured
+            # single-tone energy |P(f)|^2.  Three-point parabolic interpolation
+            # of the rectangular-window magnitude is biased ~0.1-0.2 bin, and a
+            # 0.2-bin error alone leaves sinc^2(0.2) ~ -9 dB of the tone behind.
+            # The true peak lies within +-0.5 bin of the argmax bin, so search a
+            # fine grid bracketing it and parabolically interpolate the energy
+            # maximum; this pins the frequency to <0.01 bin.
+            i = k + sl.start
+            grid = i + np.linspace(-0.6, 0.6, 9)
+            P = np.exp(np.outer(grid * fpb, ph)) @ x
+            mag = P.real ** 2 + P.imag ** 2
+            g = int(np.argmax(mag))
+            if 0 < g < len(grid) - 1:
+                d2 = mag[g - 1] - (2 * mag[g]) + mag[g + 1]
+                frac = np.clip(0.5 * (mag[g - 1] - mag[g + 1]) / d2, -1.0, 1.0) if d2 else 0.0
+            else:
+                frac = 0.0
+            fhat = (grid[g] + frac * (grid[1] - grid[0])) * fpb
+
+            # least-squares complex amplitude of the tone at fhat, then subtract
+            e = np.exp(ph * fhat)
+            amp = np.dot(x, e) / (self.blocklen / 2)
+            x -= np.real(amp * np.conj(e))
+            lines.append(fhat)
+
+            X = npfft.fft(x)
+
+        return X
 
     def _build_echo_inverse(self, taps):
         """Stable exact inverse 1/H of the echo channel h = 1 + sum a_i z^-d_i
@@ -971,7 +1058,13 @@ class RFDecode:
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
 
-        if self.system == "PAL" and self.PAL_V4300D_NotchFilter:
+        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract:
+            # Experimental upgrade of the V4300D workaround below: instead of
+            # zeroing FFT bins (which leaves the off-bin spectral-leakage skirts
+            # of the interfering tone behind), estimate the tone(s) coherently
+            # and subtract them in the time domain.  See v4300d_coherent_subtract.
+            indata_fft = self.v4300d_coherent_subtract(indata_fft)
+        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter:
             # This routine works around an 'interesting' issue seen with LD-V4300D
             # players and some PAL digital audio disks, where there is a signal
             # somewhere between 8.47 and 8.57mhz.

@@ -234,6 +234,15 @@ def main(args=None):
     )
 
     parser.add_argument(
+        "--wideband",
+        dest="wideband",
+        action="store_true",
+        default=False,
+        help="PAL only: wider RF/video settings for clean, low-noise captures "
+        "(more 4.8-5.8mhz luma detail at a small SNR cost)",
+    )
+
+    parser.add_argument(
         "--NTSC_color_notch_filter",
         "-N",
         dest="NTSC_color_notch_filter",
@@ -248,6 +257,16 @@ def main(args=None):
         action="store_true",
         default=False,
         help="LD-V4300D PAL/digital audio captures: remove spurious ~8.5mhz signal",
+    )
+
+    parser.add_argument(
+        "--V4300D_coherent_subtract",
+        dest="V4300D_coherent_subtract",
+        action="store_true",
+        default=False,
+        help="Experimental alternative to --V4300D_notch_filter: coherently "
+        "estimate and time-domain subtract the ~8.5mhz LD-V4300D spur "
+        "(also removes its spectral-leakage skirts). PAL only.",
     )
 
     parser.add_argument(
@@ -451,8 +470,8 @@ def main(args=None):
     if vid_standard == "PAL" and args.V4300D_notch_filter:
         extra_options["PAL_V4300D_NotchFilter"] = True
 
-    if vid_standard == "PAL" and args.V4300D_notch_filter:
-        extra_options["PAL_V4300D_NotchFilter"] = True
+    if vid_standard == "PAL" and args.V4300D_coherent_subtract:
+        extra_options["PAL_V4300D_CoherentSubtract"] = True
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")
@@ -460,6 +479,15 @@ def main(args=None):
 
     if args.lowband:
         extra_options["lowband"] = True
+
+    if args.wideband:
+        if vid_standard != "PAL":
+            print("ERROR: --wideband is only supported for PAL")
+            sys.exit(1)
+        if args.lowband:
+            print("ERROR: --lowband and --wideband cannot be combined")
+            sys.exit(1)
+        extra_options["wideband"] = True
 
     if args.rf_echo:
         extra_options["rf_echo_cancel"] = [
