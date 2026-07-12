@@ -706,6 +706,10 @@ class RFDecode:
         # This high pass filter is intended to detect RF dropouts
         Frfhpf = sps.butter(1, 10 / self.freq_half, btype="highpass")
         self.Filters["Frfhpf"] = filtfft(Frfhpf, self.blocklen)
+        # Frfhpf is a real (conjugate-symmetric) filter and the input RF is real,
+        # so ifft(indata_fft * Frfhpf).real is exactly irfft over the half spectrum
+        # at ~half the transform cost.  Keep the positive-frequency half.
+        self.Filters["Frfhpf_half"] = self.Filters["Frfhpf"][: self.blocklen // 2 + 1]
 
         # First phase FFT filtering
 
@@ -1053,7 +1057,11 @@ class RFDecode:
         if getattr(self, "delays", None) is not None and "video_rot" in self.delays:
             rotdelay = self.delays["video_rot"]
 
-        rv["rfhpf"] = npfft.ifft(indata_fft * self.Filters["Frfhpf"]).real
+        # Real filter + real RF input => half-spectrum irfft is exact (see __init__).
+        nrf = indata_fft.shape[0] // 2 + 1
+        rv["rfhpf"] = npfft.irfft(
+            indata_fft[:nrf] * self.Filters["Frfhpf_half"], n=self.blocklen
+        )
         rv["rfhpf"] = rv["rfhpf"][
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
