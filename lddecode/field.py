@@ -12,7 +12,7 @@ from scipy import interpolate
 from . import utils_logging as logs
 from .profiling import profile
 from .audio import downscale_audio
-from .filters import calczc, inrange
+from .filters import calczc, inrange, refine_hsync_zcs, refine_pilot_zcs
 from .pulses import Pulse, _dropout_unflag_sync, clb_findbursts, findpulses
 from .dsp import (
     angular_mean_helper,
@@ -1003,72 +1003,28 @@ class Field:
 
     @profile
     def refine_linelocs_hsync(self):
-        linelocs2 = self.linelocs1.copy()
+        # The whole per-line refine loop (zero-crossing + level gating) runs in
+        # a nogil numba kernel; calczc/median/min/max were already numba, so the
+        # only cost here was Python per-line overhead.  linebad is updated in
+        # place.  Byte-identical to the previous Python implementation.
+        linelocs1 = np.asarray(self.linelocs1, dtype=np.float64)
+        linebad = np.asarray(self.linebad)
+        if linebad.dtype != np.bool_:
+            linebad = linebad.astype(np.bool_)
 
-        for i in range(len(self.linelocs1)):
-            # skip VSYNC lines, since they handle the pulses differently
-            if inrange(i, 3, 6) or (self.rf.system == "PAL" and inrange(i, 1, 2)):
-                self.linebad[i] = True
-                continue
+        linelocs2 = refine_hsync_zcs(
+            np.ascontiguousarray(self.data["video"]["demod_05"]),
+            linelocs1,
+            linebad,
+            len(linelocs1),
+            self.rf.system == "PAL",
+            float(self.rf.freq),
+            float(self.rf.iretohz(self.rf.DecoderParams["vsync_ire"] / 2)),
+            float(self.rf.iretohz(-55)),
+            float(self.rf.iretohz(30)),
+        )
 
-            # refine beginning of hsync
-            ll1 = self.linelocs1[i] - self.rf.freq
-            zc = calczc(
-                self.data["video"]["demod_05"],
-                ll1,
-                self.rf.iretohz(self.rf.DecoderParams["vsync_ire"] / 2),
-                reverse=False,
-                count=self.rf.freq * 2,
-            )
-
-            if zc is not None and not self.linebad[i]:
-                linelocs2[i] = zc
-
-                # The hsync area, burst, and porches should not leave -50 to 30 IRE (on PAL or NTSC)
-                hsync_area = self.data["video"]["demod_05"][
-                    int(zc - (self.rf.freq * 0.75)) : int(zc + (self.rf.freq * 8))
-                ]
-                if nb_min(hsync_area) < self.rf.iretohz(-55) or nb_max(
-                    hsync_area
-                ) > self.rf.iretohz(30):
-                    # don't use the computed value here if it's bad
-                    self.linebad[i] = True
-                    linelocs2[i] = self.linelocs1[i]
-                else:
-                    porch_level = nb_median(
-                        self.data["video"]["demod_05"][
-                            int(zc + (self.rf.freq * 8)) : int(zc + (self.rf.freq * 9))
-                        ]
-                    )
-                    sync_level = nb_median(
-                        self.data["video"]["demod_05"][
-                            int(zc + (self.rf.freq * 1)) : int(
-                                zc + (self.rf.freq * 2.5)
-                            )
-                        ]
-                    )
-
-                    zc2 = calczc(
-                        self.data["video"]["demod_05"],
-                        ll1,
-                        (porch_level + sync_level) / 2,
-                        reverse=False,
-                        count=400,
-                    )
-
-                    # any wild variation here indicates a failure
-                    if zc2 is not None and np.abs(zc2 - zc) < (self.rf.freq / 2):
-                        linelocs2[i] = zc2
-                    else:
-                        self.linebad[i] = True
-            else:
-                self.linebad[i] = True
-
-            if self.linebad[i]:
-                linelocs2[i] = self.linelocs1[
-                    i
-                ]  # don't use the computed value here if it's bad
-
+        self.linebad = linebad
         return linelocs2
 
     def compute_deriv_error(self, linelocs, baserr):
@@ -1683,38 +1639,55 @@ class FieldPAL(Field):
         else:
             linelocs = linelocs.copy()
 
-        plen = {}
+        n = 323
 
-        zcs = []
-        for line in range(0, 323):
-            adjfreq = self.rf.freq
-            if line > 1:
-                adjfreq /= (linelocs[line] - linelocs[line - 1]) / self.rf.linelen
+        if self.lineoffset == 0:
+            # Fast path: the per-line slice/argmax/calczc work runs in numba.
+            # length_px == lineslice's _length for a 6 us window (constant since
+            # get_linefreq(None) == rf.freq when lineoffset == 0).
+            length_px = self.usectoinpx(6)
+            zcs, plen = refine_pilot_zcs(
+                np.ascontiguousarray(self.data["video"]["demod_pilot"]),
+                np.asarray(linelocs, dtype=np.float64),
+                n,
+                float(length_px),
+                float(self.rf.freq),
+                float(self.rf.linelen),
+                float(self.rf.SysParams["pilot_mhz"]),
+            )
+        else:
+            # Generic fallback (kept for correctness if lineoffset is ever
+            # non-zero at this stage).
+            plen = np.empty(n)
+            zcs = np.empty(n)
+            prev = 0.0
+            for l in range(0, n):
+                adjfreq = self.rf.freq
+                if l > 1:
+                    adjfreq /= (linelocs[l] - linelocs[l - 1]) / self.rf.linelen
 
-            plen[line] = (adjfreq / self.rf.SysParams["pilot_mhz"]) / 2
+                plen[l] = (adjfreq / self.rf.SysParams["pilot_mhz"]) / 2
 
-            ls = self.lineslice(line, 0, 6, linelocs)
-            lsoffset = linelocs[line] - ls.start
+                ls = self.lineslice(l, 0, 6, linelocs)
+                lsoffset = linelocs[l] - ls.start
 
-            pilots = self.data["video"]["demod_pilot"][ls]
+                pilots = self.data["video"]["demod_pilot"][ls]
+                peakloc = np.argmax(np.abs(pilots))
 
-            peakloc = np.argmax(np.abs(pilots))
-
-            zc_base = calczc(pilots, peakloc, 0)
-            if zc_base is not None:
-                zc = (zc_base - lsoffset) / plen[line]
-            else:
-                zc = zcs[-1] if len(zcs) else 0
-
-            zcs.append(zc)
+                zc_base = calczc(pilots, peakloc, 0)
+                zcs[l] = (zc_base - lsoffset) / plen[l] if zc_base is not None else prev
+                prev = zcs[l]
 
         angles = angular_mean_helper(np.array(zcs))
         am = np.angle(np.mean(angles)) / (np.pi * 2)
         if (am < 0):
             am = 1 + am
 
-        for line in range(0, 323):
-            linelocs[line] += (phase_distance(zcs[line], am) * plen[line]) * 1
+        # Vectorised second pass: phase_distance(zcs, am) * plen, added in place.
+        d = (zcs - np.floor(zcs)) - am
+        d[d < -0.5] += 1
+        d[d > 0.5] -= 1
+        linelocs[:n] += d * plen
 
         return np.array(linelocs)
 

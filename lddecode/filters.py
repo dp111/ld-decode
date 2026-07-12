@@ -113,6 +113,104 @@ def calczc(data, _start_offset, target, edge=0, count=16, reverse=False):
     return calczc_do(data, _start_offset, target, edge, count)
 
 
+@njit(cache=True, nogil=True)
+def refine_pilot_zcs(demod_pilot, linelocs, n, length_px, freq, linelen, pilot_mhz):
+    """ Hot inner loop of FieldPAL.refine_linelocs_pilot, lifted to numba.
+
+    Reproduces the per-line work exactly (slice -> argmax|abs| -> calczc ->
+    normalised zero-crossing phase) for lineoffset == 0, which is always the
+    case when pilot refinement runs.  Returns (zcs, plen) as float64 arrays.
+    """
+    zcs = np.empty(n, dtype=np.float64)
+    plen = np.empty(n, dtype=np.float64)
+    prev = 0.0
+    for l in range(n):
+        adjfreq = freq
+        if l > 1:
+            adjfreq = freq / ((linelocs[l] - linelocs[l - 1]) / linelen)
+        pl = (adjfreq / pilot_mhz) / 2
+        plen[l] = pl
+
+        begin = linelocs[l]
+        start = int(begin)
+        stop = int(begin + length_px + 1)
+        lsoffset = begin - start
+
+        pilots = demod_pilot[start:stop]
+
+        # np.argmax(np.abs(pilots)) -- first index of the largest magnitude
+        peakloc = 0
+        mx = -1.0
+        for i in range(pilots.shape[0]):
+            v = pilots[i]
+            if v < 0:
+                v = -v
+            if v > mx:
+                mx = v
+                peakloc = i
+
+        zc_base = calczc_do(pilots, peakloc, 0.0, 0, 16)
+        if zc_base is not None:
+            zcs[l] = (zc_base - lsoffset) / pl
+        else:
+            zcs[l] = prev
+        prev = zcs[l]
+
+    return zcs, plen
+
+
+@njit(cache=True, nogil=True)
+def refine_hsync_zcs(
+    demod_05, linelocs1, linebad, n, is_pal, freq,
+    vsync_target, neg55, pos30,
+):
+    """ Hot inner loop of Field.refine_linelocs_hsync, lifted to numba.
+
+    Refines each line's hsync start by zero-crossing on the 0.5 MHz demod, with
+    the same level/sanity gating as the Python original.  linebad is updated in
+    place; returns the refined linelocs2.
+    """
+    linelocs2 = linelocs1.copy()
+    for i in range(n):
+        # skip VSYNC lines, since they handle the pulses differently
+        if (3 <= i <= 6) or (is_pal and (1 <= i <= 2)):
+            linebad[i] = True
+            continue
+
+        ll1 = linelocs1[i] - freq
+        zc = calczc_do(demod_05, ll1, vsync_target, 0, freq * 2)
+
+        if zc is not None and not linebad[i]:
+            linelocs2[i] = zc
+
+            # the hsync area, burst, and porches should stay within -50..30 IRE
+            hsync_area = demod_05[int(zc - (freq * 0.75)) : int(zc + (freq * 8))]
+            if np.min(hsync_area) < neg55 or np.max(hsync_area) > pos30:
+                linebad[i] = True
+                linelocs2[i] = linelocs1[i]
+            else:
+                porch_level = np.median(
+                    demod_05[int(zc + (freq * 8)) : int(zc + (freq * 9))]
+                )
+                sync_level = np.median(
+                    demod_05[int(zc + (freq * 1)) : int(zc + (freq * 2.5))]
+                )
+
+                zc2 = calczc_do(demod_05, ll1, (porch_level + sync_level) / 2, 0, 400)
+
+                if zc2 is not None and abs(zc2 - zc) < (freq / 2):
+                    linelocs2[i] = zc2
+                else:
+                    linebad[i] = True
+        else:
+            linebad[i] = True
+
+        if linebad[i]:
+            linelocs2[i] = linelocs1[i]
+
+    return linelocs2
+
+
 # copied from vhs-decode
 
 def gen_bpf_supergauss(freq_low, freq_high, order, nyquist_hz, block_len):
