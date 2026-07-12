@@ -6,6 +6,7 @@ Split verbatim out of core.py.
 import os
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 from collections import deque
@@ -206,6 +207,17 @@ class LDdecode:
         self.capture_id = None
 
         self.system = system
+
+        # Deferred V4300D spur filtering: decode the flat lead-in WITHOUT the
+        # spur filter (it removes legitimate flat-field energy there and wrecks
+        # cold-start sync on some captures), then switch it on once a solid lock
+        # lands.  The "acquired" signal is a shared threading.Event referenced by
+        # the RFDecode; only created when deferring, since deferring also forces
+        # serial demod (a threading.Event cannot cross the process-worker pool).
+        if extra_options.get("V4300_defer", False):
+            self._acquired_event = threading.Event()
+            extra_options["_acquired_event"] = self._acquired_event
+
         self.rf_opts = {
             'inputfreq':inputfreq,
             'system':system,
@@ -298,8 +310,12 @@ class LDdecode:
             getattr(self.rf, "rf_echo_cancel", False)
             and not getattr(self.rf, "_echo_manual", False)
         )
+        # Deferred V4300D filtering flips a threading.Event mid-decode to switch
+        # the spur filter on; that event cannot propagate to spawned worker
+        # processes, so force serial demod while it is active.
+        self._v4300_defer = bool(extra_options.get("V4300_defer", False))
         self.block_cache = None
-        if self.numthreads > 1 and not self._auto_echo:
+        if self.numthreads > 1 and not self._auto_echo and not self._v4300_defer:
             from .parallel import DemodBlockCache
 
             self.block_cache = DemodBlockCache(
@@ -319,6 +335,7 @@ class LDdecode:
             and not self.output_cvbs
             and not self.do_rftbc
             and not self._auto_echo
+            and not self._v4300_defer
         )
         self._job_engine = None
         self._job_eof = False
@@ -1525,6 +1542,15 @@ class LDdecode:
         if ((f.sync_confidence < 50) and not
              inrange(fieldlength, self.output_lines - 2, self.output_lines + 2)):
             logs.logger.warning("WARNING: Possible player skip detected - check output")
+
+        # Deferred V4300D: a solid lock (correct field length) means we are past
+        # the unreadable lead-in, so switch the spur filter ON for all subsequent
+        # demods (shared with any pipeline threads via the event).  One-shot.
+        if (self._v4300_defer and not self._acquired_event.is_set()
+                and inrange(fieldlength, self.output_lines - 2,
+                            self.output_lines + 2)):
+            self._acquired_event.set()
+            logs.logger.info("V4300D: sync acquired -- enabling spur filter for remaining decode")
 
         if len(self.fieldstack) >= 4:
             # Fields no longer hold a reference to their predecessor (they

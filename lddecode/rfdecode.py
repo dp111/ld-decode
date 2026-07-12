@@ -139,6 +139,12 @@ class RFDecode:
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
         self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
         self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
+        # Deferred V4300D filtering: keep the spur filter off until sync is
+        # acquired (the flat lead-in loses legitimate energy to it and can fail
+        # to lock).  The "acquired" signal is a shared threading.Event flipped
+        # from the decode loop; the decoder forces serial demod when this is set.
+        self.v4300_defer = extra_options.get("V4300_defer", False)
+        self._acquired_event = extra_options.get("_acquired_event", None)
         # Time-base-correct the EFM waveform onto the video line time-base before
         # the EFM PLL.  This makes the EFM bit clock follow the disc rotation as
         # measured from sync (removing wow/flutter drift the PLL would otherwise
@@ -1066,13 +1072,19 @@ class RFDecode:
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
 
-        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract:
+        # In deferred mode the spur filter stays off until sync is acquired
+        # (shared event flips for all pipeline threads); see __init__.
+        v4300_on = (not self.v4300_defer) or (
+            self._acquired_event is not None and self._acquired_event.is_set()
+        )
+
+        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract and v4300_on:
             # Experimental upgrade of the V4300D workaround below: instead of
             # zeroing FFT bins (which leaves the off-bin spectral-leakage skirts
             # of the interfering tone behind), estimate the tone(s) coherently
             # and subtract them in the time domain.  See v4300d_coherent_subtract.
             indata_fft = self.v4300d_coherent_subtract(indata_fft)
-        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter:
+        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter and v4300_on:
             # This routine works around an 'interesting' issue seen with LD-V4300D
             # players and some PAL digital audio disks, where there is a signal
             # somewhere between 8.47 and 8.57mhz.
