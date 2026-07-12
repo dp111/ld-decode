@@ -1005,7 +1005,10 @@ class LDdecode:
         actualwhiteIRE = f.rf.hztoire(ire100_hz)
 
         sync_ire_diff = nb_abs(self.rf.hztoire(sync_hz) - self.rf.DecoderParams["vsync_ire"])
-        whitediff = nb_abs(self.rf.hztoire(ire100_hz) - actualwhiteIRE)
+        # measured white should sit at 100 IRE under the current calibration
+        # (comparing it against itself made this 0, so a pure white-gain drift
+        # could never retrigger the AGC)
+        whitediff = nb_abs(actualwhiteIRE - 100)
         ire0_diff = nb_abs(self.rf.hztoire(ire0_hz))
 
         acceptable_diff = 2 if self.fields_written else 0.5
