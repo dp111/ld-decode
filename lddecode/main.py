@@ -207,6 +207,25 @@ def main(args=None):
     )
 
     parser.add_argument(
+        "--rf_echo_cancel",
+        dest="rf_echo_cancel",
+        action="store_true",
+        default=False,
+        help="Cancel the capture/player multi-path reflection (faint 'ghost to "
+        "the right'): auto-detect the echo from the RF cepstrum, refine its "
+        "amplitude, re-estimate continuously across the disc, and apply the "
+        "correction only when it measurably reduces the echo (no-op otherwise).",
+    )
+    parser.add_argument(
+        "--rf_echo",
+        dest="rf_echo",
+        type=str,
+        default="",
+        help="Manual echo taps for --rf_echo_cancel as comma-separated "
+        "delay_samples:amplitude pairs (e.g. 17:0.11,28:0.05); overrides auto.",
+    )
+
+    parser.add_argument(
         "--lowband",
         dest="lowband",
         action="store_true",
@@ -441,6 +460,14 @@ def main(args=None):
 
     if args.lowband:
         extra_options["lowband"] = True
+
+    if args.rf_echo:
+        extra_options["rf_echo_cancel"] = [
+            (float(p.split(":")[0]), float(p.split(":")[1]))
+            for p in args.rf_echo.split(",") if ":" in p
+        ]
+    elif args.rf_echo_cancel:
+        extra_options["rf_echo_cancel"] = True
 
     if args.cvbs:
         extra_options["output_cvbs"] = True

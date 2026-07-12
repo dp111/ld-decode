@@ -284,8 +284,18 @@ class LDdecode:
         # warm-up transition, once calibration is final) so its Python
         # glue stays off the GIL; the thread pool then just feeds them.
         self.process_demod = extra_options.get("process_demod", True)
+        # Auto RF echo cancellation keeps a per-block magnitude EMA inside
+        # RFDecode, so its demod is stateful (not a pure function of block
+        # index) and is incompatible with the out-of-order block cache and the
+        # worker-process field jobs, both of which assume a pure demod.  Force
+        # serial demod when it is active.  Manual echo taps are a fixed inverse
+        # filter (pure), so they keep full parallelism.
+        self._auto_echo = bool(
+            getattr(self.rf, "rf_echo_cancel", False)
+            and not getattr(self.rf, "_echo_manual", False)
+        )
         self.block_cache = None
-        if self.numthreads > 1:
+        if self.numthreads > 1 and not self._auto_echo:
             from .parallel import DemodBlockCache
 
             self.block_cache = DemodBlockCache(
@@ -304,6 +314,7 @@ class LDdecode:
             and self.process_demod
             and not self.output_cvbs
             and not self.do_rftbc
+            and not self._auto_echo
         )
         self._job_engine = None
         self._job_eof = False
