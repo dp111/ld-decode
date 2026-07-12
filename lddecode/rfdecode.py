@@ -35,6 +35,7 @@ from .filters import (
     polar2z,
     sqsum,
     unwrap_hilbert,
+    unwrap_hilbert_pll,
 )
 from .dsp import compute_mtf, genwave
 
@@ -145,6 +146,14 @@ class RFDecode:
         # from the decode loop; the decoder forces serial demod when this is set.
         self.v4300_defer = extra_options.get("V4300_defer", False)
         self._acquired_event = extra_options.get("_acquired_event", None)
+        # Optional PLL FM discriminator (unwrap_hilbert_pll) in place of the
+        # default conjugate-product one.  Experimental / negative result: LD's
+        # low modulation index gives a PLL no threshold extension, so it measures
+        # worse; kept behind --fm_pll for reference.  fm_pll_fn is the loop
+        # natural frequency (Hz).
+        self.fm_pll = extra_options.get("fm_pll", False)
+        self.fm_pll_fn = extra_options.get("fm_pll_fn", 4800000)
+        self.fm_pll_zeta = extra_options.get("fm_pll_zeta", 0.707)
         # Time-base-correct the EFM waveform onto the video line time-base before
         # the EFM PLL.  This makes the EFM bit clock follow the disc rotation as
         # measured from sync (removing wow/flutter drift the PLL would otherwise
@@ -1121,7 +1130,13 @@ class RFDecode:
             indata_fft_filt *= self.Filters["MTF"] ** mtf_level
 
         hilbert = npfft.ifft(indata_fft_filt)
-        demod = unwrap_hilbert(hilbert, self.freq_hz)
+        if self.fm_pll:
+            demod = unwrap_hilbert_pll(
+                hilbert, self.freq_hz, self.DecoderParams["ire0"],
+                self.fm_pll_fn, self.fm_pll_zeta,
+            )
+        else:
+            demod = unwrap_hilbert(hilbert, self.freq_hz)
 
         # use a clipped demod for video output processing to reduce speckling impact.
         # demod is real and these video outputs are real, so the half-spectrum
