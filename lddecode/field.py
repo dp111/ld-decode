@@ -16,6 +16,7 @@ from .filters import calczc, inrange, refine_hsync_zcs, refine_pilot_zcs
 from .pulses import Pulse, _dropout_unflag_sync, clb_findbursts, findpulses
 from .dsp import (
     angular_mean_helper,
+    compute_linelocs_kernel,
     hz_to_output_array,
     n_orgt,
     n_ornotrange_scalar,
@@ -872,9 +873,6 @@ class Field:
         else:
             self.skipdetected = False
 
-        linelocs_dict = {}
-        linelocs_dist = {}
-
         if line0loc is None:
             if not self.initphase:
                 logs.logger.error("Unable to determine start of field - dropping field")
@@ -886,106 +884,29 @@ class Field:
         if lastline < proclines:
             return None, None, line0loc - (meanlinelen * 20)
 
-        for p in validpulses:
-            lineloc = (p[1].start - line0loc) / meanlinelen
-            rlineloc = nb_round(lineloc)
-            lineloc_distance = np.abs(lineloc - rlineloc)
+        # Per-pulse line-number assignment (keep-closest) + gap fill, in numba.
+        # Byte-identical to the previous dict-based Python implementation.
+        n = len(validpulses)
+        p_start = np.fromiter((p[1].start for p in validpulses), dtype=np.float64, count=n)
+        p_type = np.fromiter((p[0] for p in validpulses), dtype=np.int64, count=n)
+        p_valid = np.fromiter((p[2] for p in validpulses), dtype=np.bool_, count=n)
 
-            if self.skipdetected:
-                lineloc_end = self.linecount - (
-                    (lastlineloc - p[1].start) / meanlinelen
-                )
-                rlineloc_end = nb_round(lineloc_end)
-                lineloc_end_distance = np.abs(lineloc_end - rlineloc_end)
+        status, self.linelocs0, linelocs_filled, rv_err = compute_linelocs_kernel(
+            p_start, p_type, p_valid,
+            float(line0loc),
+            float(lastlineloc) if lastlineloc is not None else 0.0,
+            float(meanlinelen),
+            self.linecount,
+            proclines,
+            bool(self.skipdetected),
+            float(self.rf.hsync_tolerance),
+            self.outlinecount,
+            float(self.inlinelen),
+        )
 
-                if (
-                    p[0] == 0
-                    and rlineloc > 23
-                    and lineloc_end_distance < lineloc_distance
-                ):
-                    lineloc = lineloc_end
-                    rlineloc = rlineloc_end
-                    lineloc_distance = lineloc_end_distance
-
-            # only record if it's closer to the (probable) beginning of the line
-            if lineloc_distance > self.rf.hsync_tolerance or (
-                rlineloc in linelocs_dict and lineloc_distance > linelocs_dist[rlineloc]
-            ):
-
-                continue
-
-            # also skip non-regular lines (non-hsync) that don't seem to be in valid order (p[2])
-            # (or hsync lines in the vblank area)
-            if rlineloc > 0 and not p[2]:
-                if p[0] > 0 or (p[0] == 0 and rlineloc < 10):
-                    continue
-
-            linelocs_dict[rlineloc] = p[1].start
-            linelocs_dist[rlineloc] = lineloc_distance
-
-        rv_err = np.full(proclines, False)
-
-        # Convert dictionary into list, then fill in gaps
-        linelocs = [
-            linelocs_dict[line] if line in linelocs_dict else -1 for line in range(0, proclines)
-        ]
-        linelocs_filled = linelocs.copy()
-
-        self.linelocs0 = linelocs.copy()
-
-        if linelocs_filled[0] < 0:
-            next_valid = None
-            for i in range(0, self.outlinecount + 1):
-                if linelocs[i] > 0:
-                    next_valid = i
-                    break
-
-            if next_valid is None:
-                return None, None, line0loc + (self.inlinelen * self.outlinecount - 7)
-
-            linelocs_filled[0] = linelocs_filled[next_valid] - (
-                next_valid * meanlinelen
-            )
-
-            if linelocs_filled[0] < self.inlinelen:
-                return None, None, line0loc + (self.inlinelen * self.outlinecount - 7)
-
-        # Pre-compute nearest valid line after each position (single forward pass)
-        scan_end = min(proclines, self.outlinecount + 1)
-        next_valid_arr = [None] * proclines
-        last_seen = None
-        for i in range(scan_end - 1, -1, -1):
-            if linelocs[i] > 0:
-                last_seen = i
-            next_valid_arr[i] = last_seen
-
-        prev_valid = 0 if linelocs[0] > 0 else None
-
-        for line in range(1, proclines):
-            if linelocs_filled[line] < 0:
-                rv_err[line] = True
-
-                next_valid = next_valid_arr[line] if line < scan_end else None
-
-                if prev_valid is None:
-                    avglen = self.inlinelen
-                    linelocs_filled[line] = linelocs[next_valid] - (
-                        avglen * (next_valid - line)
-                    )
-                elif next_valid is not None:
-                    avglen = (linelocs[next_valid] - linelocs[prev_valid]) / (
-                        next_valid - prev_valid
-                    )
-                    linelocs_filled[line] = linelocs[prev_valid] + (
-                        avglen * (line - prev_valid)
-                    )
-                else:
-                    avglen = self.inlinelen
-                    linelocs_filled[line] = linelocs[prev_valid] + (
-                        avglen * (line - prev_valid)
-                    )
-            else:
-                prev_valid = line
+        # Both early-exit cases in the original return the same fdoffset.
+        if status == 1:
+            return None, None, line0loc + (self.inlinelen * self.outlinecount - 7)
 
         # *finally* done :)
 
