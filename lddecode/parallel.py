@@ -33,6 +33,7 @@ import multiprocessing
 import signal
 import threading
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 
 import numpy as np
 
@@ -88,11 +89,8 @@ def _demod_worker_init(rf_opts, decoder_params, field_cfg=None):
 
 
 def _demod_worker_block(rawinput, mtf_level):
-    import scipy.fft as npfft
-
     return _worker_rf.demodblock(
         data=rawinput,
-        fftdata=npfft.fft(rawinput),
         mtf_level=mtf_level,
         cut=True,
     )
@@ -112,7 +110,6 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
     sample buffers (prepare_transport) plus the downscaled outputs.
     """
     import numpy as np
-    import scipy.fft as npfft
 
     from .field import FieldNTSC, FieldPAL
     from .metrics import computeMetrics, detect_levels
@@ -141,8 +138,7 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
                 return {"seq": seq, "eof": True}
 
             demod = rf.demodblock(
-                data=rawinput, fftdata=npfft.fft(rawinput),
-                mtf_level=mtf_level, cut=True,
+                data=rawinput, mtf_level=mtf_level, cut=True,
             )
             t["input"].append(rawinput[rf.blockcut : -rf.blockcut_end])
             for k in ("video", "audio", "efm", "rfhpf"):
@@ -482,6 +478,7 @@ class DemodBlockCache:
             max_workers=nthreads, thread_name_prefix="demod"
         )
         self._procs = None
+        self._proc_inflight = set()         # submitted-to-pool, not yet done
         self._lock = threading.Lock()       # protects _cache/_eof_block
         self._read_lock = threading.Lock()  # serializes the raw reader
         self._cache = {}                    # (block, mtf) -> Future
@@ -505,11 +502,16 @@ class DemodBlockCache:
         whole-field decode jobs (FieldJobEngine) on the same pool.
         """
         rf_opts = dict(rf_opts)
-        # drop values demod does not need and that may not pickle
+        # Drop values demod does not need and that may not pickle.
+        # _acquired_event is a threading.Event (unpicklable): defer mode
+        # forces serial demod so this path is never taken while deferring,
+        # but if it ever were, a worker must not receive the event - it
+        # would see defer=True with event=None and deterministically keep
+        # the spur filter off.
         rf_opts["extra_options"] = {
             k: v
             for k, v in rf_opts.get("extra_options", {}).items()
-            if k not in ("pipe_RF_TBC",)
+            if k not in ("pipe_RF_TBC", "_acquired_event")
         }
 
         self._procs = ProcessPoolExecutor(
@@ -519,9 +521,15 @@ class DemodBlockCache:
             initargs=(rf_opts, copy.deepcopy(decoder_params), field_cfg),
         )
         procs = self._procs
+        inflight = self._proc_inflight
 
         def demod_in_process(rawinput, mtf_level):
-            return procs.submit(_demod_worker_block, rawinput, mtf_level).result()
+            # Track the in-flight future so close() can drain the pool
+            # before touching the worker processes (see close()).
+            fut = procs.submit(_demod_worker_block, rawinput, mtf_level)
+            inflight.add(fut)
+            fut.add_done_callback(inflight.discard)
+            return fut.result()
 
         self.demod_fn = demod_in_process
 
@@ -579,16 +587,34 @@ class DemodBlockCache:
         self.flush()
         self._pool.shutdown(wait=False, cancel_futures=True)
         if self._procs is not None:
-            # shutdown(wait=False) leaves the interpreter's atexit handler
-            # to join the workers (wait=True); one still in a long compiled
-            # demod would block that join.  Their results are no longer
-            # needed, so terminate them outright for a prompt exit.
-            for p in list(getattr(self._procs, "_processes", {}).values()):
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
-            self._procs.shutdown(wait=False, cancel_futures=True)
+            procs = self._procs
+            # Cancel queued work and refuse new submissions; blocks already
+            # running in a worker keep going.
+            procs.shutdown(wait=False, cancel_futures=True)
+
+            # Let those in-flight demods drain before touching the worker
+            # processes.  terminate()ing a worker mid-result-write leaves the
+            # executor's manager thread blocked forever on a truncated pickle,
+            # the .result() waiters in the demod threads never wake, and the
+            # interpreter then hangs joining them at exit: the decode prints
+            # its summary and never exits (hit reliably by decode-pal-cvbs on
+            # a starved 4-vCPU CI runner, where prefetch is still busy at
+            # close time).  A block demod is a few seconds at worst, so the
+            # drain is short whenever the pool is healthy.
+            futures_wait(list(self._proc_inflight), timeout=10)
+
+            # Anything still running now is genuinely wedged (e.g. a worker
+            # stuck in futex_wait after a group SIGINT, the case the
+            # Ctrl-C fix targets).  Its result is no longer needed, and the
+            # interpreter's atexit join would block on it: terminate for a
+            # prompt exit.  An idle worker is not mid-write, so this cannot
+            # truncate a result.
+            if any(not f.done() for f in list(self._proc_inflight)):
+                for p in list(getattr(procs, "_processes", {}).values()):
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
             self._procs = None
 
     # internal - callers hold self._lock

@@ -154,16 +154,6 @@ class RFDecode:
         self.fm_pll = extra_options.get("fm_pll", False)
         self.fm_pll_fn = extra_options.get("fm_pll_fn", 4800000)
         self.fm_pll_zeta = extra_options.get("fm_pll_zeta", 0.707)
-        # Time-base-correct the EFM waveform onto the video line time-base before
-        # the EFM PLL.  This makes the EFM bit clock follow the disc rotation as
-        # measured from sync (removing wow/flutter drift the PLL would otherwise
-        # have to track), and - crucially for multi-disc stacking - aligns the
-        # EFM of different captures of the same disc to a common disc-position
-        # time-base so the pre-PLL EFM waveforms can be averaged.
-        # Experimental / off by default: it does NOT improve single-capture decode
-        # (output is the same sector set), so it is only useful for aligning the
-        # pre-PLL EFM of multiple captures of the same disc.  LDDECODE_TBC_EFM=1.
-        self.tbc_efm = extra_options.get("tbc_efm", False) or os.environ.get("LDDECODE_TBC_EFM", "") == "1"
         # Cancel the capture/player multi-path reflection ("ghost").  Opt-in via
         # --rf_echo_cancel (auto-detect from the RF cepstrum, re-estimated across
         # the disc) or --rf_echo (manual taps); applies the correction only when
@@ -179,6 +169,14 @@ class RFDecode:
         )
         if self._echo_manual:
             self._echo_inv = self._build_echo_inverse(self.rf_echo_cancel)
+        # Time-base-correct the EFM waveform onto the video line time-base before
+        # the PLL: removes wow/flutter drift and - crucially for multi-disc
+        # stacking - aligns the EFM of different captures of the same disc to a
+        # common disc-position time-base so the pre-PLL EFM waveforms can be
+        # averaged.  Experimental / off by default: it does NOT improve
+        # single-capture decode (output is the same sector set), so it is only
+        # useful for aligning captures.  LDDECODE_TBC_EFM=1 or --tbc_efm.
+        self.tbc_efm = extra_options.get("tbc_efm", False) or os.environ.get("LDDECODE_TBC_EFM", "") == "1"
         lowband = extra_options.get("lowband", False)
         wideband = extra_options.get("wideband", False)
 
@@ -271,26 +269,6 @@ class RFDecode:
         if self.decode_digital_audio:
             self.computeefmfilter()
 
-        if self.SysParams['AC3']:
-            ac3_center = self.SysParams['audio_rfreq_AC3']
-            ac3_half_bw = 144000  # 288000 * 0.5
-
-            ac3_range = [(ac3_center - ac3_half_bw) / self.freq_hz_half,
-                         (ac3_center + ac3_half_bw) / self.freq_hz_half]
-
-            # This analog audio bandpass filter is an approximation of
-            # http://sim.okawa-denshi.jp/en/RLCtool.php with resistor 2200ohm,
-            # inductor 180uH, and cap 27pF (taken from Pioneer service manuals)
-            # However, the above didn't work, and we wound up with two IIR filters
-            # self.Filters['AC3_iir'] = sps.butter(5, [1.48/20, 3.45/20], btype='bandpass')
-            self.Filters['AC3_bp1'] = sps.butter(3, [(2.88-.5)/20, (2.88+.5)/20], btype='bandpass')
-            self.Filters['AC3_bp2'] = sps.butter(3, ac3_range, btype='bandpass')
-
-            filt1 = filtfft(self.Filters['AC3_bp1'], self.blocklen)
-            filt2 = filtfft(self.Filters['AC3_bp2'], self.blocklen)
-
-            self.Filters['AC3'] = filt1 * filt2
-
         self.computedelays()
 
 
@@ -373,28 +351,395 @@ class RFDecode:
             (f + notchwidth) / (self.freq_hz_half if hz else self.freq_half)
         ]
 
-    def pal_audio_carriers_present(self, indata_fft, threshold=5.0):
-        """Detect whether the PAL analog audio FM carriers are present in this
-        block, by comparing the mean RF power around each carrier (+-40 kHz,
-        covering their FM deviation) against the spectrum flanking it
-        (+-100..250 kHz).  Discs with analog audio measure >15x on both
-        carriers; discs without (EFM/digital-only) measure ~1x or less, so a
-        threshold of 5 separates them cleanly."""
-        fpb = self.freq_hz / self.blocklen
+    def build_groupdelay_equalizer(self, lpf_fft):
+        """All-pass equaliser matching the IEC video group-delay pre-distortion.
 
-        def bandpower(f0, width):
-            lo, hi = int((f0 - width) / fpb), int((f0 + width) / fpb) + 1
-            return np.mean(sqsum(indata_fft[lo:hi]) ** 2)
+        PAL:  IEC 60856 sub-clause 9.1.6
+        NTSC: IEC 60857 sub-clause 9.1.7
 
-        for fcarrier in (self.SysParams["audio_lfreq"], self.SysParams["audio_rfreq"]):
-            carrier = bandpower(fcarrier, 40e3)
-            flank = (
-                bandpower(fcarrier - 175e3, 75e3) + bandpower(fcarrier + 175e3, 75e3)
-            ) / 2
-            if carrier < threshold * flank:
-                return False
+        The disc is recorded with its video group delay pre-distorted so that
+        the playback low-pass filter brings the overall group delay flat across
+        the chroma band.  ld-decode's Butterworth video LPF undershoots the
+        target, leaving the chroma sidebands sloped, which smears colour and
+        contributes to differential phase.
 
-        return True
+        This returns a unit-magnitude (all-pass) FFT-domain filter whose group
+        delay equals target - LPF, so that LPF * equaliser reproduces the spec
+        curve.  De-emphasis is deliberately left out of the basis: its group
+        delay is cancelled end-to-end by the disc's (inverse) pre-emphasis, so
+        only the LPF's deviation needs correcting.
+        """
+        blocklen = self.blocklen
+        fs = self.freq_hz
+        binfreq = np.abs(np.fft.fftfreq(blocklen, 1.0 / fs))
+
+        if self.system == "PAL":
+            # IEC 60856 9.1.6 target group delay relative to 0.5 MHz, in seconds
+            # (the spec tabulates pre-distortion of -10/-35/-85/-135/-200 ns; the
+            # playback chain must supply the inverse, held flat above 4.8 MHz).
+            gd_f = np.array([0.0, 0.5e6, 2.0e6, 3.0e6, 4.0e6, 4.4336e6, 4.8e6, 5.5e6])
+            gd_t = np.array([0.0, 0.0, 10e-9, 35e-9, 85e-9, 135e-9, 200e-9, 200e-9])
+        else:
+            # IEC 60857 9.1.7 target group delay relative to 0.5 MHz, in seconds
+            # (the spec tabulates pre-distortion of -15/-45/-80/-135/-200 ns; the
+            # playback chain must supply the inverse, held flat above 4.2 MHz).
+            gd_f = np.array([0.0, 0.5e6, 2.0e6, 3.0e6, 3.58e6, 4.0e6, 4.2e6, 4.8e6])
+            gd_t = np.array([0.0, 0.0, 15e-9, 45e-9, 80e-9, 135e-9, 200e-9, 200e-9])
+        target = np.interp(binfreq, gd_f, gd_t)
+
+        # actual LPF group delay = -d(phase)/d(omega)
+        phase = np.unwrap(np.angle(lpf_fft))
+        lpf_gd = -np.gradient(phase) / (2 * np.pi * (fs / blocklen))
+        i05 = np.argmin(np.abs(binfreq - 0.5e6))
+        residual = target - (lpf_gd - lpf_gd[i05])
+
+        # only act across the chroma band; taper to zero ~1.3 MHz past the LPF
+        # cut-off (where the LPF has removed the signal) so the equaliser's
+        # impulse response stays compact (well inside blockcut).  Tracking the
+        # cut-off keeps this correct if video_lpf_freq changes.
+        lpf_freq = self.DecoderParams["video_lpf_freq"]
+        t0, t1 = lpf_freq + 0.3e6, lpf_freq + 1.3e6
+        taper = np.clip((t1 - binfreq) / (t1 - t0), 0.0, 1.0)
+        residual = residual * taper
+        residual[binfreq < 0.4e6] = 0.0
+
+        # integrate group delay -> phase over the positive half, then mirror for
+        # a conjugate-symmetric (real impulse response) all-pass
+        half = blocklen // 2
+        dphi = -2 * np.pi * np.cumsum(residual[: half + 1]) * (fs / blocklen)
+        eq = np.ones(blocklen, dtype=complex)
+        eq[: half + 1] = np.exp(1j * dphi)
+        eq[half + 1 :] = np.conj(eq[1:half][::-1])
+        eq[0] = 1.0
+        eq[half] = 1.0  # Nyquist (dead band past the LPF): keep unit-magnitude
+
+        return eq
+
+    def computevideofilters(self):
+        self.Filters = {}
+
+        # Use some shorthand to compact the code.
+        SF = self.Filters
+        SP = self.SysParams
+        DP = self.DecoderParams
+
+        # This high pass filter is intended to detect RF dropouts
+        Frfhpf = sps.butter(1, 10 / self.freq_half, btype="highpass")
+        self.Filters["Frfhpf"] = filtfft(Frfhpf, self.blocklen)
+        # Frfhpf is a real (conjugate-symmetric) filter and the input RF is real,
+        # so ifft(indata_fft * Frfhpf).real is exactly irfft over the half spectrum
+        # at ~half the transform cost.  Keep the positive-frequency half.
+        self.Filters["Frfhpf_half"] = self.Filters["Frfhpf"][: self.blocklen // 2 + 1]
+
+        # First phase FFT filtering
+
+        # MTF filter section
+        # compute the pole locations symmetric to freq_half (i.e. 12.2 and 27.8)
+        MTF_polef_lo = DP["MTF_freq"] / self.freq_half
+        MTF_polef_hi = (
+            self.freq_half + (self.freq_half - DP["MTF_freq"])
+        ) / self.freq_half
+
+        def to_z(pole):
+            return polar2z(DP["MTF_poledist"], np.pi * pole)
+
+        MTF = sps.zpk2tf([], [to_z(MTF_polef_lo), to_z(MTF_polef_hi)], 1)
+        SF["MTF"] = filtfft(MTF, self.blocklen)
+
+        # The BPF filter, defined for each system in DecoderParams.
+        # When split skirt parameters are available, build as independent
+        # high-pass (low edge) + low-pass (high edge) so each can be ordered
+        # separately — gentler low edge protects the lower chroma sideband and
+        # its group delay, sharper high edge rejects HF noise.
+        if "video_bpf_low_order" in DP:
+            filt_rfvideo_hp = sps.butter(
+                DP["video_bpf_low_order"],
+                DP["video_bpf_low"] / self.freq_hz_half,
+                btype="highpass",
+            )
+            filt_rfvideo_lp = sps.butter(
+                DP["video_bpf_high_order"],
+                DP["video_bpf_high"] / self.freq_hz_half,
+                btype="lowpass",
+            )
+            SF["RFVideo"] = filtfft(filt_rfvideo_hp, self.blocklen) * filtfft(
+                filt_rfvideo_lp, self.blocklen
+            )
+        else:
+            filt_rfvideo = sps.butter(
+                DP["video_bpf_order"],
+                self.freqrange(DP["video_bpf_low"], DP["video_bpf_high"]),
+                btype="bandpass",
+            )
+            SF["RFVideo"] = filtfft(filt_rfvideo, self.blocklen)
+
+        # Notch filters for analog audio RF.  DdD captures on NTSC need this.
+        if SP["analog_audio"]:
+            cut_left = sps.butter(
+                DP["audio_notchorder"],
+                self.notchrange(SP["audio_lfreq"], DP['audio_notchwidth'], True),
+                btype="bandstop",
+            )
+            SF["Fcutl"] = filtfft(cut_left, self.blocklen)
+
+            cut_right = sps.butter(
+                DP["audio_notchorder"],
+                self.notchrange(SP["audio_rfreq"], DP['audio_notchwidth'], True),
+                btype="bandstop",
+            )
+            SF["Fcutr"] = filtfft(cut_right, self.blocklen)
+
+            if self.system == "NTSC":
+                SF["RFVideo"] *= SF["Fcutl"] * SF["Fcutr"]
+            else:
+                # PAL: the carriers sit inside the video FM lower sideband, so
+                # the notch is not folded into RFVideo unconditionally; it is
+                # applied per block in demodblock, only when the carriers are
+                # actually on the disc (pal_audio_carriers_present) - EFM-only
+                # discs keep the full sideband.
+                SF["FcutPAL"] = SF["Fcutl"] * SF["Fcutr"]
+
+        if DP.get("video_rf_zero_phase", False):
+            # Discard the phase response of the pre-demod RF chain (BPF,
+            # audio notches, MTF), keeping only its amplitude.  Skirt/notch/
+            # pole phase differs at the two chroma sideband locations, and
+            # that asymmetry moves with the FM carrier (i.e. with luma),
+            # which demodulates as differential phase.  The MTF correction
+            # is an amplitude compensation by design, and the FFT
+            # overlap-save pipeline makes acausal zero-phase filters free.
+            SF["RFVideo"] = np.abs(SF["RFVideo"])
+            SF["MTF"] = np.abs(SF["MTF"])
+            if "FcutPAL" in SF:
+                # The per-block audio-carrier notch multiplies into the same
+                # pre-demod chain, so it must be amplitude-only too: its
+                # Butterworth phase alone measures +8/+7 deg of DP on
+                # ggv-mb-1khz (deviation from the dp11 original, which only
+                # ever exercised the notch on EFM discs where it is a no-op).
+                SF["FcutPAL"] = np.abs(SF["FcutPAL"])
+
+        SF["hilbert"] = build_hilbert(self.blocklen)
+        SF["RFVideo"] *= SF["hilbert"]
+
+        # Second phase FFT filtering, which is performed after the signal is demodulated
+
+        video_lpf = sps.butter(
+            DP["video_lpf_order"], DP["video_lpf_freq"] / self.freq_hz_half, "low"
+        )
+        SF["Fvideo_lpf"] = filtfft(video_lpf, self.blocklen)
+
+        if self.system == "NTSC" and self.NTSC_ColorNotchFilter:
+            video_notch = sps.butter(
+                3,
+                [DP["video_lpf_freq"] / 1000000 / self.freq_half, 5.0 / self.freq_half],
+                "bandstop",
+            )
+            SF["Fvideo_lpf"] *= filtfft(video_notch, self.blocklen)
+
+        # The deemphasis filter
+        deemp1, deemp2 = DP["video_deemp"]
+        SF["Fdeemp"] = filtfft(
+            emphasis_iir(deemp1, deemp2, self.freq_hz), self.blocklen
+        )
+
+        # The direct opposite of the above, used in test signal generation
+        SF["Femp"] = filtfft(emphasis_iir(deemp2, deemp1, self.freq_hz), self.blocklen)
+
+        fsc_hz = SP["fsc_mhz"] * 1e6
+
+        # Inverse-MTF chroma correction: a zero-phase (real-valued) filter
+        # whose shape comes from the disc's optical MTF.  Frequencies below
+        # ~2 MHz are unity; above, the filter boosts proportionally to the
+        # inverse of the MTF, raised to `inverse_mtf_strength`.  At strength 0
+        # there is no boost; auto-calibration sets the strength from burst
+        # amplitude measurements so that chroma recovers to spec level with
+        # zero differential-phase cost (unlike de-emphasis adjustment).
+        freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
+        crossover = 2.0e6
+        mtf_at_crossover = compute_mtf(crossover, cavframe=0)
+        mtf_vals = compute_mtf(freq_array.copy(), cavframe=0)
+        mtf_norm = np.clip(mtf_vals / mtf_at_crossover, 0.05, 1.0)
+        SF["Finverse_mtf_base"] = 1.0 / mtf_norm
+
+        fsc_bin = int(round(fsc_hz * self.blocklen / self.freq_hz))
+        self.inverse_mtf_log_at_fsc = np.log(SF["Finverse_mtf_base"][fsc_bin])
+
+        # Zero-phase magnitude EQ from (freq_hz, dB) anchor points.  Real
+        # valued, so it cannot move phase; applied to both the output and
+        # burst reference paths so burst-based auto-calibration measures the
+        # corrected signal.
+        SF["Fvideo_eq"] = self.build_video_eq(DP.get("video_eq"))
+
+        # Post processing: lowpass filter + full de-emphasis + inverse MTF
+        # chroma correction + group-delay equaliser.  De-emphasis stays at
+        # full strength (1.0) for correct phase; the inverse MTF handles
+        # chroma amplitude separately with zero phase contribution.
+        SF["FVideo"] = SF["Fvideo_lpf"] * (SF["Fdeemp"] ** DP["video_deemp_strength"])
+        #SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq"]
+
+        imtf_strength = DP.get("inverse_mtf_strength", 0.0)
+        if imtf_strength > 0:
+            SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
+
+        # Correct the post-demod video group delay to the IEC spec curve the
+        # disc was pre-distorted against (PAL: IEC 60856 9.1.6, NTSC: IEC 60857
+        # 9.1.7).  The Butterworth LPF alone undershoots the target across the
+        # chroma band, smearing colour and contributing to differential phase.
+        # This is a pure all-pass, so |FVideo| is unchanged; only the output
+        # video path is equalised (the burst/pilot/sync reference paths are
+        # left as-is).
+        SF["FVideoGD"] = self.build_groupdelay_equalizer(SF["Fvideo_lpf"])
+        SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
+
+        # additional filters:  0.5mhz and color burst
+        # Using an FIR filter here to get a known delay
+
+        F0_5 = sps.firwin(65, [0.5 / self.freq_half], pass_zero=True)
+        SF["F05_offset"] = 32 # Reduced because filtfft is half-strength on FIR
+
+        F0_5_fft = filtfft((F0_5, [1.0]), self.blocklen)
+        SF["FVideo05"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * F0_5_fft
+
+        Fburst = sps.firwin(81, self.notchrange(SP["fsc_mhz"], 0.2), pass_zero=False)
+        SF["FVideoBurst_offset"] = 40
+
+        SF["Fburst"] = filtfft((Fburst, [1.0]), self.blocklen)
+        SF["FVideoBurst"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * SF["Fburst"] * SF["Fvideo_eq"]
+
+        # Fold delay compensation into the frequency-domain filters so demodblock
+        # doesn't need np.roll (which copies the entire array).  A circular shift
+        # of d samples equals multiplying the DFT by exp(j·2π·d·k/N).
+        bins = np.arange(self.blocklen)
+        SF["FVideo05"] *= np.exp(1j * 2 * np.pi * SF["F05_offset"] * bins / self.blocklen)
+        SF["FVideoBurst"] *= np.exp(1j * 2 * np.pi * SF["FVideoBurst_offset"] * bins / self.blocklen)
+
+        if self.system == "PAL":
+            SF["Fpilot"] = filtfft(
+                sps.butter(
+                    1,
+                    self.notchrange(SP["pilot_mhz"], 0.1),
+                    btype="bandpass",
+                ),
+                self.blocklen,
+            )
+            SF["FVideoPilot"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * SF["Fpilot"]
+
+    def recompute_fvideo(self):
+        """Rebuild only FVideo after an inverse MTF strength change.
+
+        Much cheaper than computefilters() — doesn't touch audio, EFM,
+        delays, or any other filter.  Only the main video output path
+        is affected (burst/sync/pilot reference paths are unchanged).
+        """
+        SF = self.Filters
+        DP = self.DecoderParams
+
+        SF["FVideo"] = SF["Fvideo_lpf"] * (SF["Fdeemp"] ** DP["video_deemp_strength"])
+        # post-equalizer disabled (bd7281e1) — must match computefilters()
+        # exactly, or worker processes (which rebuild via computefilters)
+        # produce different output than the parent after a recompute here
+        #SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq"]
+
+        imtf_strength = DP.get("inverse_mtf_strength", 0.0)
+        if imtf_strength > 0:
+            SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
+
+        SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
+
+    def build_video_eq(self, points):
+        """Zero-phase magnitude EQ from (freq_hz, gain_db) anchor points.
+
+        Monotone-cubic interpolation in dB vs frequency, pinned to 0 dB at
+        DC and held at 0 dB beyond the last anchor + 0.5 MHz.  Returns a
+        real-valued array over the FFT bins, so applying it cannot change
+        the phase of anything.
+        """
+        if not points:
+            return np.ones(self.blocklen)
+        freqs = np.array([0.0] + [p[0] for p in points]
+                         + [points[-1][0] + 0.5e6, self.freq_hz_half])
+        gains = np.array([0.0] + [p[1] for p in points] + [0.0, 0.0])
+        interp = spi.PchipInterpolator(freqs, gains, extrapolate=False)
+        freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
+        db = interp(np.clip(freq_array, 0, self.freq_hz_half))
+        db = np.nan_to_num(db, nan=0.0)
+        return 10.0 ** (db / 20.0)
+
+    def computeaudiofilters(self):
+        SP = self.SysParams
+        DP = self.DecoderParams
+
+        apass      = DP["audio_filterwidth"]
+        afilt_len  = DP["audio_filterorder"]
+
+        self.audio = {}
+
+        for channel, center_freq in zip(['left', 'right'], [SP['audio_lfreq'], SP['audio_rfreq']]):
+            self.audio[channel] = types.SimpleNamespace()
+
+            # Build an FIR filter for each channel's RF
+            audio1_fir = filtfft(
+                [
+                    sps.firwin(
+                        afilt_len,
+                        self.notchrange(center_freq, apass, True),
+                        pass_zero=False,
+                    ),
+                    1.0,
+                ],
+                self.blocklen,
+            )
+
+            # Determine the frequency offset (a1_freq) and bins (lowbin+nbin) that cover the
+            # audio RF frequencies for this channel
+            self.audio[channel].lowbin, self.audio[channel].nbins, self.audio[channel].a1_freq = (
+                fft_determine_slices(center_freq, 200000, self.freq_hz, self.blocklen)
+            )
+            # Make a lambda to slice the regular block FFT into what we're demodulating
+            # note, "ch=channel" is necessary to bind the channel ID to the lambda
+            self.audio[channel].slicer = (
+                lambda x, ch=channel: fft_do_slice(
+                    x, self.audio[ch].lowbin, self.audio[ch].nbins, self.blocklen
+                )
+            )
+
+            # Build a 'short' hilbert transform around the sliced FFT
+            sliced_hilbert = build_hilbert(self.audio[channel].nbins)
+
+            # Add the demodulated output to this to get the actual audio wave frequency
+            self.audio[channel].low_freq = (
+                self.freq_hz * (self.audio[channel].lowbin / self.blocklen)
+            )
+            # Finally create the stage 1 demodulation filter (including hilbert transform)
+            self.audio[channel].filt1 = self.audio[channel].slicer(audio1_fir) * sliced_hilbert
+
+            # Compute stage 2 audio filters: 20k-ish LPF and deemphasis.
+            N, Wn = sps.buttord(
+                20000 / (self.audio[channel].a1_freq / 2),
+                24000 / (self.audio[channel].a1_freq / 2),
+                1,
+                9,
+            )
+            audio2_lpf = filtfft(sps.butter(N, Wn), self.blocklen)
+            # 75e-6 is 75usec/2133khz (matching American FM emphasis) and 5.3e-6 is approx.
+            # a 30khz break frequency
+            audio2_deemp = filtfft(
+                emphasis_iir(5.3e-6, 75e-6, self.audio[channel].a1_freq), self.blocklen
+            )
+            self.audio[channel].audio2_filter = audio2_lpf * audio2_deemp
+
+            # Compute the sample rate decimation caused by stage 1 binning
+            self.Filters['audio_fdiv'] = self.blocklen // self.audio[channel].nbins
+
+    def _params(self, spec):
+        return self.SysParams if spec else self.DecoderParams
+
+    def iretohz(self, ire, spec=False):
+        p = self._params(spec)
+        return p["ire0"] + (p["hz_ire"] * ire)
+
+    def hztoire(self, hz, spec=False):
+        p = self._params(spec)
+        return (hz - p["ire0"]) / p["hz_ire"]
 
     def v4300d_coherent_subtract(self, indata_fft, maxlines=10):
         """Coherent (PLL-style, but stateless per block) removal of the
@@ -624,7 +969,17 @@ class RFDecode:
         mag = self._echo_despur(self._echo_magacc)
         self._echo_accum = npfft.ifft(np.log(mag + 1e-9)).real
         taps = self._refine_taps(self._echo_accum, self._estimate_echo())
+        was_off = self._echo_inv is None
         self._echo_inv = self._verify_and_build(taps)
+        if was_off and self._echo_inv is not None:
+            # Auto mode runs serial in the main process, so logging is safe
+            # here (addition over the dp11 original, which corrects silently).
+            from . import utils_logging as logs
+            if logs.logger is not None:
+                logs.logger.info(
+                    "RF echo detected - cancelling taps %s",
+                    ", ".join(f"{d}:{a:.3f}" for d, a in taps),
+                )
 
     def _echo_update(self, indata_fft):
         """Observe one block (auto mode), keeping the magnitude spectrum as an
@@ -646,393 +1001,28 @@ class RFDecode:
         if n >= self._ECHO_WARMUP and (n == self._ECHO_WARMUP or (n % self._ECHO_REEST) == 0):
             self._echo_reestimate()
 
-    def build_groupdelay_equalizer(self, lpf_fft):
-        """All-pass equaliser matching the IEC video group-delay pre-distortion.
+    def pal_audio_carriers_present(self, indata_fft, threshold=5.0):
+        """Detect whether the PAL analog audio FM carriers are present in this
+        block, by comparing the mean RF power around each carrier (+-40 kHz,
+        covering their FM deviation) against the spectrum flanking it
+        (+-100..250 kHz).  Discs with analog audio measure >15x on both
+        carriers; discs without (EFM/digital-only) measure ~1x or less, so a
+        threshold of 5 separates them cleanly."""
+        fpb = self.freq_hz / self.blocklen
 
-        PAL:  IEC 60856 sub-clause 9.1.6
-        NTSC: IEC 60857 sub-clause 9.1.7
+        def bandpower(f0, width):
+            lo, hi = int((f0 - width) / fpb), int((f0 + width) / fpb) + 1
+            return np.mean(sqsum(indata_fft[lo:hi]) ** 2)
 
-        The disc is recorded with its video group delay pre-distorted so that
-        the playback low-pass filter brings the overall group delay flat across
-        the chroma band.  ld-decode's Butterworth video LPF undershoots the
-        target, leaving the chroma sidebands sloped, which smears colour and
-        contributes to differential phase.
+        for fcarrier in (self.SysParams["audio_lfreq"], self.SysParams["audio_rfreq"]):
+            carrier = bandpower(fcarrier, 40e3)
+            flank = (
+                bandpower(fcarrier - 175e3, 75e3) + bandpower(fcarrier + 175e3, 75e3)
+            ) / 2
+            if carrier < threshold * flank:
+                return False
 
-        This returns a unit-magnitude (all-pass) FFT-domain filter whose group
-        delay equals target - LPF, so that LPF * equaliser reproduces the spec
-        curve.  De-emphasis is deliberately left out of the basis: its group
-        delay is cancelled end-to-end by the disc's (inverse) pre-emphasis, so
-        only the LPF's deviation needs correcting.
-        """
-        blocklen = self.blocklen
-        fs = self.freq_hz
-        binfreq = np.abs(np.fft.fftfreq(blocklen, 1.0 / fs))
-
-        if self.system == "PAL":
-            # IEC 60856 9.1.6 target group delay relative to 0.5 MHz, in seconds
-            # (the spec tabulates pre-distortion of -10/-35/-85/-135/-200 ns; the
-            # playback chain must supply the inverse, held flat above 4.8 MHz).
-            gd_f = np.array([0.0, 0.5e6, 2.0e6, 3.0e6, 4.0e6, 4.4336e6, 4.8e6, 5.5e6])
-            gd_t = np.array([0.0, 0.0, 10e-9, 35e-9, 85e-9, 135e-9, 200e-9, 200e-9])
-        else:
-            # IEC 60857 9.1.7 target group delay relative to 0.5 MHz, in seconds
-            # (the spec tabulates pre-distortion of -15/-45/-80/-135/-200 ns; the
-            # playback chain must supply the inverse, held flat above 4.2 MHz).
-            gd_f = np.array([0.0, 0.5e6, 2.0e6, 3.0e6, 3.58e6, 4.0e6, 4.2e6, 4.8e6])
-            gd_t = np.array([0.0, 0.0, 15e-9, 45e-9, 80e-9, 135e-9, 200e-9, 200e-9])
-        target = np.interp(binfreq, gd_f, gd_t)
-
-        # actual LPF group delay = -d(phase)/d(omega)
-        phase = np.unwrap(np.angle(lpf_fft))
-        lpf_gd = -np.gradient(phase) / (2 * np.pi * (fs / blocklen))
-        i05 = np.argmin(np.abs(binfreq - 0.5e6))
-        residual = target - (lpf_gd - lpf_gd[i05])
-
-        # only act across the chroma band; taper to zero ~1.3 MHz past the LPF
-        # cut-off (where the LPF has removed the signal) so the equaliser's
-        # impulse response stays compact (well inside blockcut).  Tracking the
-        # cut-off keeps this correct if video_lpf_freq changes.
-        lpf_freq = self.DecoderParams["video_lpf_freq"]
-        t0, t1 = lpf_freq + 0.3e6, lpf_freq + 1.3e6
-        taper = np.clip((t1 - binfreq) / (t1 - t0), 0.0, 1.0)
-        residual = residual * taper
-        residual[binfreq < 0.4e6] = 0.0
-
-        # integrate group delay -> phase over the positive half, then mirror for
-        # a conjugate-symmetric (real impulse response) all-pass
-        half = blocklen // 2
-        dphi = -2 * np.pi * np.cumsum(residual[: half + 1]) * (fs / blocklen)
-        eq = np.ones(blocklen, dtype=complex)
-        eq[: half + 1] = np.exp(1j * dphi)
-        eq[half + 1 :] = np.conj(eq[1:half][::-1])
-        eq[0] = 1.0
-        eq[half] = 1.0  # Nyquist (dead band past the LPF): keep unit-magnitude
-
-        return eq
-
-    def computevideofilters(self):
-        self.Filters = {}
-
-        # Use some shorthand to compact the code.
-        SF = self.Filters
-        SP = self.SysParams
-        DP = self.DecoderParams
-
-        # This high pass filter is intended to detect RF dropouts
-        Frfhpf = sps.butter(1, 10 / self.freq_half, btype="highpass")
-        self.Filters["Frfhpf"] = filtfft(Frfhpf, self.blocklen)
-        # Frfhpf is a real (conjugate-symmetric) filter and the input RF is real,
-        # so ifft(indata_fft * Frfhpf).real is exactly irfft over the half spectrum
-        # at ~half the transform cost.  Keep the positive-frequency half.
-        self.Filters["Frfhpf_half"] = self.Filters["Frfhpf"][: self.blocklen // 2 + 1]
-
-        # First phase FFT filtering
-
-        # MTF filter section
-        # compute the pole locations symmetric to freq_half (i.e. 12.2 and 27.8)
-        MTF_polef_lo = DP["MTF_freq"] / self.freq_half
-        MTF_polef_hi = (
-            self.freq_half + (self.freq_half - DP["MTF_freq"])
-        ) / self.freq_half
-
-        def to_z(pole):
-            return polar2z(DP["MTF_poledist"], np.pi * pole)
-
-        MTF = sps.zpk2tf([], [to_z(MTF_polef_lo), to_z(MTF_polef_hi)], 1)
-        SF["MTF"] = filtfft(MTF, self.blocklen)
-
-        # The BPF filter, defined for each system in DecoderParams.
-        # When split skirt parameters are available, build as independent
-        # high-pass (low edge) + low-pass (high edge) so each can be ordered
-        # separately — gentler low edge protects the lower chroma sideband and
-        # its group delay, sharper high edge rejects HF noise.
-        if "video_bpf_low_order" in DP:
-            filt_rfvideo_hp = sps.butter(
-                DP["video_bpf_low_order"],
-                DP["video_bpf_low"] / self.freq_hz_half,
-                btype="highpass",
-            )
-            filt_rfvideo_lp = sps.butter(
-                DP["video_bpf_high_order"],
-                DP["video_bpf_high"] / self.freq_hz_half,
-                btype="lowpass",
-            )
-            SF["RFVideo"] = filtfft(filt_rfvideo_hp, self.blocklen) * filtfft(
-                filt_rfvideo_lp, self.blocklen
-            )
-        else:
-            filt_rfvideo = sps.butter(
-                DP["video_bpf_order"],
-                self.freqrange(DP["video_bpf_low"], DP["video_bpf_high"]),
-                btype="bandpass",
-            )
-            SF["RFVideo"] = filtfft(filt_rfvideo, self.blocklen)
-
-        # Notch filters for analog audio RF.  DdD captures on NTSC need this.
-        # On PAL the carriers (683.59/1066.41 kHz, -26 dBc per IEC 60856) only
-        # get ~13 dB from the band-pass low skirt, and their beats against the
-        # video carrier land at |fv - fa| ~ 5.7-6.4 MHz - inside the 5.8 MHz
-        # video LPF - showing up as ~0.9 IRE of audio-correlated shimmer.  The
-        # notches cut that by ~15 dB.  They do also remove a sliver of the
-        # video FM lower sidebands (costing ~0.2 dB at 4.43 MHz / ~1.4 dB at
-        # 5.5 MHz in dark areas), so on PAL they are applied per block in
-        # demodblock, only when the carriers are actually present (PAL discs
-        # carry either analog audio or EFM, never both).  EFM and the audio
-        # decode paths tap indata_fft directly and are unaffected.
-        if SP["analog_audio"]:
-            cut_left = sps.butter(
-                DP["audio_notchorder"],
-                self.notchrange(SP["audio_lfreq"], DP['audio_notchwidth'], True),
-                btype="bandstop",
-            )
-            SF["Fcutl"] = filtfft(cut_left, self.blocklen)
-
-            cut_right = sps.butter(
-                DP["audio_notchorder"],
-                self.notchrange(SP["audio_rfreq"], DP['audio_notchwidth'], True),
-                btype="bandstop",
-            )
-            SF["Fcutr"] = filtfft(cut_right, self.blocklen)
-
-            if self.system == "NTSC":
-                SF["RFVideo"] *= SF["Fcutl"] * SF["Fcutr"]
-            else:
-                SF["FcutPAL"] = SF["Fcutl"] * SF["Fcutr"]
-
-        if DP.get("video_rf_zero_phase", False):
-            # Discard the phase response of the pre-demod RF chain (BPF,
-            # audio notches, MTF), keeping only its amplitude.  Skirt/notch/
-            # pole phase differs at the two chroma sideband locations, and
-            # that asymmetry moves with the FM carrier (i.e. with luma),
-            # which demodulates as differential phase.  The MTF correction
-            # is an amplitude compensation by design, and the FFT
-            # overlap-save pipeline makes acausal zero-phase filters free.
-            SF["RFVideo"] = np.abs(SF["RFVideo"])
-            SF["MTF"] = np.abs(SF["MTF"])
-
-        SF["hilbert"] = build_hilbert(self.blocklen)
-        SF["RFVideo"] *= SF["hilbert"]
-
-        # Second phase FFT filtering, which is performed after the signal is demodulated
-
-        video_lpf = sps.butter(
-            DP["video_lpf_order"], DP["video_lpf_freq"] / self.freq_hz_half, "low"
-        )
-        SF["Fvideo_lpf"] = filtfft(video_lpf, self.blocklen)
-
-        if self.system == "NTSC" and self.NTSC_ColorNotchFilter:
-            video_notch = sps.butter(
-                3,
-                [DP["video_lpf_freq"] / 1000000 / self.freq_half, 5.0 / self.freq_half],
-                "bandstop",
-            )
-            SF["Fvideo_lpf"] *= filtfft(video_notch, self.blocklen)
-
-        # The deemphasis filter
-        deemp1, deemp2 = DP["video_deemp"]
-        SF["Fdeemp"] = filtfft(
-            emphasis_iir(deemp1, deemp2, self.freq_hz), self.blocklen
-        )
-
-        # The direct opposite of the above, used in test signal generation
-        SF["Femp"] = filtfft(emphasis_iir(deemp2, deemp1, self.freq_hz), self.blocklen)
-
-        fsc_hz = SP["fsc_mhz"] * 1e6
-
-        # Inverse-MTF chroma correction: a zero-phase (real-valued) filter
-        # whose shape comes from the disc's optical MTF.  Frequencies below
-        # ~2 MHz are unity; above, the filter boosts proportionally to the
-        # inverse of the MTF, raised to `inverse_mtf_strength`.  At strength 0
-        # there is no boost; auto-calibration sets the strength from burst
-        # amplitude measurements so that chroma recovers to spec level with
-        # zero differential-phase cost (unlike de-emphasis adjustment).
-        freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
-        crossover = 2.0e6
-        mtf_at_crossover = compute_mtf(crossover, cavframe=0)
-        mtf_vals = compute_mtf(freq_array.copy(), cavframe=0)
-        mtf_norm = np.clip(mtf_vals / mtf_at_crossover, 0.05, 1.0)
-        SF["Finverse_mtf_base"] = 1.0 / mtf_norm
-
-        fsc_bin = int(round(fsc_hz * self.blocklen / self.freq_hz))
-        self.inverse_mtf_log_at_fsc = np.log(SF["Finverse_mtf_base"][fsc_bin])
-
-        # Zero-phase magnitude EQ from (freq_hz, dB) anchor points.  Real
-        # valued, so it cannot move phase; applied to both the output and
-        # burst reference paths so burst-based auto-calibration measures the
-        # corrected signal.
-        SF["Fvideo_eq"] = self.build_video_eq(DP.get("video_eq"))
-
-        # Post processing: lowpass filter + full de-emphasis + inverse MTF
-        # chroma correction + group-delay equaliser.  De-emphasis stays at
-        # full strength (1.0) for correct phase; the inverse MTF handles
-        # chroma amplitude separately with zero phase contribution.
-        SF["FVideo"] = SF["Fvideo_lpf"] * (SF["Fdeemp"] ** DP["video_deemp_strength"])
-        #SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq"]
-
-        imtf_strength = DP.get("inverse_mtf_strength", 0.0)
-        if imtf_strength > 0:
-            SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
-
-        # Correct the post-demod video group delay to the IEC spec curve the
-        # disc was pre-distorted against (PAL: IEC 60856 9.1.6, NTSC: IEC 60857
-        # 9.1.7).  The Butterworth LPF alone undershoots the target across the
-        # chroma band, smearing colour and contributing to differential phase.
-        # This is a pure all-pass, so |FVideo| is unchanged; only the output
-        # video path is equalised (the burst/pilot/sync reference paths are
-        # left as-is).
-        SF["FVideoGD"] = self.build_groupdelay_equalizer(SF["Fvideo_lpf"])
-        SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
-
-        # additional filters:  0.5mhz and color burst
-        # Using an FIR filter here to get a known delay
-
-        F0_5 = sps.firwin(65, [0.5 / self.freq_half], pass_zero=True)
-        SF["F05_offset"] = 32 # Reduced because filtfft is half-strength on FIR
-
-        F0_5_fft = filtfft((F0_5, [1.0]), self.blocklen)
-        SF["FVideo05"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * F0_5_fft
-
-        Fburst = sps.firwin(81, self.notchrange(SP["fsc_mhz"], 0.2), pass_zero=False)
-        SF["FVideoBurst_offset"] = 40
-
-        SF["Fburst"] = filtfft((Fburst, [1.0]), self.blocklen)
-        SF["FVideoBurst"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * SF["Fburst"] * SF["Fvideo_eq"]
-
-        # Fold delay compensation into the frequency-domain filters so demodblock
-        # doesn't need np.roll (which copies the entire array).  A circular shift
-        # of d samples equals multiplying the DFT by exp(j·2π·d·k/N).
-        bins = np.arange(self.blocklen)
-        SF["FVideo05"] *= np.exp(1j * 2 * np.pi * SF["F05_offset"] * bins / self.blocklen)
-        SF["FVideoBurst"] *= np.exp(1j * 2 * np.pi * SF["FVideoBurst_offset"] * bins / self.blocklen)
-
-        if self.system == "PAL":
-            SF["Fpilot"] = filtfft(
-                sps.butter(
-                    1,
-                    self.notchrange(SP["pilot_mhz"], 0.1),
-                    btype="bandpass",
-                ),
-                self.blocklen,
-            )
-            SF["FVideoPilot"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * SF["Fpilot"]
-
-    def recompute_fvideo(self):
-        """Rebuild only FVideo after an inverse MTF strength change.
-
-        Much cheaper than computefilters() — doesn't touch audio, EFM,
-        delays, or any other filter.  Only the main video output path
-        is affected (burst/sync/pilot reference paths are unchanged).
-        """
-        SF = self.Filters
-        DP = self.DecoderParams
-
-        SF["FVideo"] = SF["Fvideo_lpf"] * (SF["Fdeemp"] ** DP["video_deemp_strength"])
-        # post-equalizer disabled (bd7281e1) — must match computefilters()
-        # exactly, or worker processes (which rebuild via computefilters)
-        # produce different output than the parent after a recompute here
-        #SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq"]
-
-        imtf_strength = DP.get("inverse_mtf_strength", 0.0)
-        if imtf_strength > 0:
-            SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
-
-        SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
-
-    def build_video_eq(self, points):
-        """Zero-phase magnitude EQ from (freq_hz, gain_db) anchor points.
-
-        Monotone-cubic interpolation in dB vs frequency, pinned to 0 dB at
-        DC and held at 0 dB beyond the last anchor + 0.5 MHz.  Returns a
-        real-valued array over the FFT bins, so applying it cannot change
-        the phase of anything.
-        """
-        if not points:
-            return np.ones(self.blocklen)
-        freqs = np.array([0.0] + [p[0] for p in points]
-                         + [points[-1][0] + 0.5e6, self.freq_hz_half])
-        gains = np.array([0.0] + [p[1] for p in points] + [0.0, 0.0])
-        interp = spi.PchipInterpolator(freqs, gains, extrapolate=False)
-        freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
-        db = interp(np.clip(freq_array, 0, self.freq_hz_half))
-        db = np.nan_to_num(db, nan=0.0)
-        return 10.0 ** (db / 20.0)
-
-    def computeaudiofilters(self):
-        SP = self.SysParams
-        DP = self.DecoderParams
-
-        apass      = DP["audio_filterwidth"]
-        afilt_len  = DP["audio_filterorder"]
-
-        self.audio = {}
-
-        for channel, center_freq in zip(['left', 'right'], [SP['audio_lfreq'], SP['audio_rfreq']]):
-            self.audio[channel] = types.SimpleNamespace()
-
-            # Build an FIR filter for each channel's RF
-            audio1_fir = filtfft(
-                [
-                    sps.firwin(
-                        afilt_len,
-                        self.notchrange(center_freq, apass, True),
-                        pass_zero=False,
-                    ),
-                    1.0,
-                ],
-                self.blocklen,
-            )
-
-            # Determine the frequency offset (a1_freq) and bins (lowbin+nbin) that cover the
-            # audio RF frequencies for this channel
-            self.audio[channel].lowbin, self.audio[channel].nbins, self.audio[channel].a1_freq = (
-                fft_determine_slices(center_freq, 200000, self.freq_hz, self.blocklen)
-            )
-            # Make a lambda to slice the regular block FFT into what we're demodulating
-            # note, "ch=channel" is necessary to bind the channel ID to the lambda
-            self.audio[channel].slicer = (
-                lambda x, ch=channel: fft_do_slice(
-                    x, self.audio[ch].lowbin, self.audio[ch].nbins, self.blocklen
-                )
-            )
-
-            # Build a 'short' hilbert transform around the sliced FFT
-            sliced_hilbert = build_hilbert(self.audio[channel].nbins)
-
-            # Add the demodulated output to this to get the actual audio wave frequency
-            self.audio[channel].low_freq = (
-                self.freq_hz * (self.audio[channel].lowbin / self.blocklen)
-            )
-            # Finally create the stage 1 demodulation filter (including hilbert transform)
-            self.audio[channel].filt1 = self.audio[channel].slicer(audio1_fir) * sliced_hilbert
-
-            # Compute stage 2 audio filters: 20k-ish LPF and deemphasis.
-            N, Wn = sps.buttord(
-                20000 / (self.audio[channel].a1_freq / 2),
-                24000 / (self.audio[channel].a1_freq / 2),
-                1,
-                9,
-            )
-            audio2_lpf = filtfft(sps.butter(N, Wn), self.blocklen)
-            # 75e-6 is 75usec/2133khz (matching American FM emphasis) and 5.3e-6 is approx.
-            # a 30khz break frequency
-            audio2_deemp = filtfft(
-                emphasis_iir(5.3e-6, 75e-6, self.audio[channel].a1_freq), self.blocklen
-            )
-            self.audio[channel].audio2_filter = audio2_lpf * audio2_deemp
-
-            # Compute the sample rate decimation caused by stage 1 binning
-            self.Filters['audio_fdiv'] = self.blocklen // self.audio[channel].nbins
-
-    def _params(self, spec):
-        return self.SysParams if spec else self.DecoderParams
-
-    def iretohz(self, ire, spec=False):
-        p = self._params(spec)
-        return p["ire0"] + (p["hz_ire"] * ire)
-
-    def hztoire(self, hz, spec=False):
-        p = self._params(spec)
-        return (hz - p["ire0"]) / p["hz_ire"]
+        return True
 
     def demodblock(self, data=None, mtf_level=0, fftdata=None, cut=False,
                    raw_mtf=False):
@@ -1072,7 +1062,8 @@ class RFDecode:
         if getattr(self, "delays", None) is not None and "video_rot" in self.delays:
             rotdelay = self.delays["video_rot"]
 
-        # Real filter + real RF input => half-spectrum irfft is exact (see __init__).
+        # Real filter + real RF input => half-spectrum irfft is exact (see
+        # computevideofilters).
         nrf = indata_fft.shape[0] // 2 + 1
         rv["rfhpf"] = npfft.irfft(
             indata_fft[:nrf] * self.Filters["Frfhpf_half"], n=self.blocklen
@@ -1191,7 +1182,8 @@ class RFDecode:
                 efm_out = efm_out[self.blockcut : -self.blockcut_end]
             rv["efm"] = np.int16(np.clip(efm_out.real, -32768, 32767))
 
-        # NOTE: ac3 audio is filtered after RF TBC
+        # NOTE: AC3 RF is demodulated from the raw input samples at write time
+        # (see LDdecode.AC3demodulate), not from the demod outputs here.
         if self.decode_analog_audio:
             stage1_out = []
             for channel in ['left', 'right']:
@@ -1387,9 +1379,24 @@ class RFDecode:
         rf.delays["video_white"] = (
             calczc(vdemod, 3000, rf.iretohz(50), count=512) - 3000
         )
-        rf.delays["video_rot"] = int(
-            np.round(calczc(vdemod, 6000, rf.iretohz(-10), count=512) - 6000)
-        )
+        # A rot (the 5 zeroed samples above) demodulates as a phase glitch
+        # whose shape depends chaotically on the exact carrier phases at
+        # the cut - i.e. on the calibrated decode parameters.  It can
+        # swing far below baseline, barely below it, or mostly ABOVE it:
+        # one disc's post-AGC snapshot (hz_ire +1.5%, vsync_ire -37.59)
+        # produced a dip bottoming at 7.99 MHz - above the fixed -10 IRE
+        # threshold this code used to look for, so calczc() found no
+        # crossing and worker spawns crashed - while spiking up to
+        # 10.9 MHz.  Detect the glitch onset against its own amplitude
+        # instead: the first sample deviating from the local baseline by
+        # more than 20% of the peak deviation, in either direction.  (20%
+        # sits early on the glitch's rise: across AGC-range parameter
+        # sweeps the onset stays within a few samples, where a half-peak
+        # threshold latches onto whichever ringing lobe happens to
+        # dominate and jitters by 10+.)
+        rot_base = np.median(vdemod[5900:5990])
+        rot_dev = np.abs(vdemod[6000:6512] - rot_base)
+        rf.delays["video_rot"] = int(np.argmax(rot_dev > 0.2 * rot_dev.max()))
 
         rf.limits = {}
         rf.limits["sync"] = (

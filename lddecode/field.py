@@ -1182,6 +1182,32 @@ class Field:
             if hasattr(self, attr):
                 setattr(self, attr, None)
 
+    def efm_tbc(self, linelocs=None):
+        """ Time-base-correct the filtered EFM waveform onto the video line
+            time-base, the same way rf_tbc() does for the raw RF.  The EFM rides
+            the same disc rotation as the video, so resampling each line onto a
+            constant length removes the wow/flutter drift before the EFM PLL and
+            puts the EFM of every capture of the disc on a common disc-position
+            time-base (enabling pre-PLL waveform stacking across discs).
+
+            A constant group-delay offset relative to sync is harmless: the PLL
+            re-locks bit phase, and the offset is identical across captures (same
+            filter), so stacked waveforms still align.  Returns int16, matching
+            the raw-slice path that feeds efm_pll / the .efm output.
+        """
+        fdata = self.data["efm"].astype(float)
+        if linelocs is None:
+            linelocs = self.linelocs
+        linelen = int(round(self.inlinelen))
+        delay = self.rf.delays["video_white"]
+        startline = self.lineoffset if self.rf.system == "NTSC" else 1
+        endline = startline + self.linecount
+        output = []
+        for l in range(startline, endline):
+            scaled = scale(fdata, linelocs[l] - delay, linelocs[l + 1] - delay, linelen)
+            output.append(np.round(np.clip(scaled, -32768, 32767)).astype(np.int16))
+        return np.concatenate(output)
+
     @profile
     def rf_tbc(self, linelocs=None):
         """ This outputs a TBC'd version of the input RF data, mostly intended
@@ -1210,32 +1236,6 @@ class Field:
             scaled = scale(fdata, linelocs[line] - delay, linelocs[line + 1] - delay, linelen)
             output.append(np.round(scaled).astype(np.int16))
 
-        return np.concatenate(output)
-
-    def efm_tbc(self, linelocs=None):
-        """ Time-base-correct the filtered EFM waveform onto the video line
-            time-base, the same way rf_tbc() does for the raw RF.  The EFM rides
-            the same disc rotation as the video, so resampling each line onto a
-            constant length removes the wow/flutter drift before the EFM PLL and
-            puts the EFM of every capture of the disc on a common disc-position
-            time-base (enabling pre-PLL waveform stacking across discs).
-
-            A constant group-delay offset relative to sync is harmless: the PLL
-            re-locks bit phase, and the offset is identical across captures (same
-            filter), so stacked waveforms still align.  Returns int16, matching
-            the raw-slice path that feeds efm_pll / the .efm output.
-        """
-        fdata = self.data["efm"].astype(float)
-        if linelocs is None:
-            linelocs = self.linelocs
-        linelen = int(round(self.inlinelen))
-        delay = self.rf.delays["video_white"]
-        startline = self.lineoffset if self.rf.system == "NTSC" else 1
-        endline = startline + self.linecount
-        output = []
-        for l in range(startline, endline):
-            scaled = scale(fdata, linelocs[l] - delay, linelocs[l + 1] - delay, linelen)
-            output.append(np.round(np.clip(scaled, -32768, 32767)).astype(np.int16))
         return np.concatenate(output)
 
     def decodephillipscode(self, linenum):

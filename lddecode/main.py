@@ -108,8 +108,9 @@ def main(args=None):
         "--threads",
         metavar="threads",
         type=int,
-        default=1,
-        help="worker threads for block demodulation (0 = auto, 1 = serial)",
+        default=0,
+        help="worker threads for block demodulation "
+             "(0 = auto (default): min(cores - 2, 10); 1 = serial)",
     )
     parser.add_argument(
         "--demod-threads-only",
@@ -150,6 +151,15 @@ def main(args=None):
         action="store_true",
         default=False,
         help="Write filtered but otherwise pre-processed EFM data",
+    )
+    parser.add_argument(
+        "--tbc_efm",
+        dest="tbc_efm",
+        action="store_true",
+        default=False,
+        help="Time-base-correct the EFM waveform onto the video line time-base "
+        "before the EFM PLL (removes wow/flutter drift; aligns EFM across "
+        "captures of the same disc for pre-PLL stacking)",
     )
     parser.add_argument(
         "--disable_analog_audio",
@@ -197,24 +207,14 @@ def main(args=None):
     )
 
     parser.add_argument(
-        "--tbc_efm",
-        dest="tbc_efm",
-        action="store_true",
-        default=False,
-        help="Time-base-correct the EFM waveform onto the video line time-base "
-        "before the EFM PLL (removes wow/flutter drift; aligns EFM across "
-        "captures of the same disc for pre-PLL stacking)",
-    )
-
-    parser.add_argument(
         "--rf_echo_cancel",
         dest="rf_echo_cancel",
         action="store_true",
         default=False,
-        help="Cancel the capture/player multi-path reflection (faint 'ghost to "
-        "the right'): auto-detect the echo from the RF cepstrum, refine its "
-        "amplitude, re-estimate continuously across the disc, and apply the "
-        "correction only when it measurably reduces the echo (no-op otherwise).",
+        help="Cancel the capture/player multi-path reflection (\"ghost\"): "
+        "auto-detect echo taps from the RF cepstrum, re-estimated across the "
+        "disc, and apply the correction only when it measurably reduces the "
+        "echo (no-op otherwise).  Forces serial demod.",
     )
     parser.add_argument(
         "--rf_echo",
@@ -222,7 +222,8 @@ def main(args=None):
         type=str,
         default="",
         help="Manual echo taps for --rf_echo_cancel as comma-separated "
-        "delay_samples:amplitude pairs (e.g. 17:0.11,28:0.05); overrides auto.",
+        "delay_samples:amplitude pairs (e.g. 17:0.11,28:0.05); overrides auto "
+        "detection and keeps parallel demod.",
     )
 
     parser.add_argument(
@@ -277,8 +278,19 @@ def main(args=None):
         action="store_true",
         default=False,
         help="Experimental alternative to --V4300D_notch_filter: coherently "
-        "estimate and time-domain subtract the ~8.5mhz LD-V4300D spur "
-        "(also removes its spectral-leakage skirts). PAL only.",
+        "estimate and time-domain subtract the ~8.5mhz LD-V4300D spur (also "
+        "removes its spectral-leakage skirts). PAL only.",
+    )
+
+    parser.add_argument(
+        "--V4300D_no_defer",
+        dest="V4300D_no_defer",
+        action="store_true",
+        default=False,
+        help="With --V4300D_coherent_subtract: apply the spur filter from the "
+        "first block instead of deferring until sync acquisition.  Keeps "
+        "parallel demod (deferring forces serial), but can break cold-start "
+        "sync on captures with a flat lead-in.",
     )
 
     parser.add_argument(
@@ -458,7 +470,9 @@ def main(args=None):
 
     # Safety check: ensure --write-test-ldf doesn't overwrite the input file
     if args.write_test_ldf is not None:
-        import os.path
+        # os (and os.path) is imported at module scope; a local re-import
+        # here would make `os` function-local and shadow it everywhere else
+        # in main(), including the auto-threads calculation above.
         input_path = os.path.abspath(filename)
         output_path = os.path.abspath(args.write_test_ldf)
         if input_path == output_path:
@@ -471,7 +485,9 @@ def main(args=None):
 
     threads = args.threads
     if threads == 0:
-        threads = min(max((os.cpu_count() or 4) - 4, 1), 12)
+        # auto (the default): leave 2 cores for the OS / main decode loop,
+        # capped at 10 (diminishing returns past that on the shared read path)
+        threads = min(max((os.cpu_count() or 4) - 2, 1), 10)
 
     extra_options = {
         "threads": threads,
@@ -498,19 +514,19 @@ def main(args=None):
     if vid_standard == "NTSC" and args.NTSC_color_notch_filter:
         extra_options["NTSC_ColorNotchFilter"] = True
 
-    if vid_standard == "PAL" and args.V4300D_notch_filter:
-        extra_options["PAL_V4300D_NotchFilter"] = True
+    if args.fm_pll:
+        extra_options["fm_pll"] = True
+        extra_options["fm_pll_fn"] = args.fm_pll_fn * 1e6
 
     if vid_standard == "PAL" and args.V4300D_coherent_subtract:
         extra_options["PAL_V4300D_CoherentSubtract"] = True
         # Defer the spur filter until sync is acquired: the filter breaks
         # cold-start sync in the flat lead-in on some captures, so decode the
         # lead-in plain and switch the filter on for the program content.
-        extra_options["V4300_defer"] = True
-
-    if args.fm_pll:
-        extra_options["fm_pll"] = True
-        extra_options["fm_pll_fn"] = args.fm_pll_fn * 1e6
+        # --V4300D_no_defer opts out (keeps parallel demod; deferring forces
+        # serial because the acquired-event can't cross spawn workers).
+        if not args.V4300D_no_defer:
+            extra_options["V4300_defer"] = True
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")
