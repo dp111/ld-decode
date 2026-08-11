@@ -1024,6 +1024,73 @@ class RFDecode:
 
         return True
 
+    def demodblock_sync(self, data=None, fftdata=None, cut=False):
+        """Demodulate only the 0.5 MHz path used for vertical-sync detection.
+
+        A cut-down demodblock() for cheap "is there video here at all" probes
+        (ld-find-start's preamble scan): identical to demodblock()'s demod_05
+        output at mtf_level 0 on the default path, at a fraction of the cost.
+        """
+
+        if fftdata is not None:
+            indata_fft = fftdata
+        elif data is not None:
+            # Same rfft+mirror as demodblock() (byte-identical to a full fft).
+            raw = data[: self.blocklen]
+            nfft = raw.shape[0]
+            half = npfft.rfft(raw)
+            nr = half.shape[0]
+            full = np.empty(nfft, dtype=half.dtype)
+            full[:nr] = half
+            full[nr:] = np.conj(half[1:nfft - nr + 1])[::-1]
+            indata_fft = full
+        else:
+            raise Exception("demodblock_sync called without raw or FFT data")
+
+        v4300_on = (not self.v4300_defer) or (
+            self._acquired_event is not None and self._acquired_event.is_set()
+        )
+        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract and v4300_on:
+            indata_fft = self.v4300d_coherent_subtract(indata_fft)
+        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter and v4300_on:
+            indata_fft = indata_fft.copy()
+            sl = slice(
+                int(self.blocklen * (8.42 / self.freq)),
+                int(1 + (self.blocklen * (8.6 / self.freq))),
+            )
+            sq_sl = sqsum(indata_fft[sl])
+            m = np.mean(sq_sl) + (np.std(sq_sl) * 3)
+
+            for i in np.where(sq_sl > m)[0]:
+                indata_fft[(i - 1 + sl.start)] = 0
+                indata_fft[(i + sl.start)] = 0
+                indata_fft[(i + 1 + sl.start)] = 0
+                indata_fft[self.blocklen - (i + sl.start)] = 0
+                indata_fft[self.blocklen - (i - 1 + sl.start)] = 0
+                indata_fft[self.blocklen - (i + 1 + sl.start)] = 0
+
+        indata_fft_filt = indata_fft * self.Filters["RFVideo"]
+        if "FcutPAL" in self.Filters and self.pal_audio_carriers_present(indata_fft):
+            indata_fft_filt = indata_fft_filt * self.Filters["FcutPAL"]
+
+        hilbert = npfft.ifft(indata_fft_filt)
+        demod = unwrap_hilbert(hilbert, self.freq_hz)
+
+        demod_fft = npfft.rfft(np.clip(demod, 1500000, self.freq_hz * 0.75))
+        nr = demod_fft.shape[0]
+        sync = npfft.irfft(
+            demod_fft * self.Filters["FVideo05"][:nr], n=self.blocklen
+        )
+
+        if cut:
+            sync = sync[self.blockcut : -self.blockcut_end]
+        return sync.astype(np.float32)
+
+    def demodblock_cpu(self, *args, **kwargs):
+        """Monolith-API alias: core.py dispatched demodblock() to a CPU/GPU
+        implementation; the split keeps a single implementation."""
+        return self.demodblock(*args, **kwargs)
+
     def demodblock(self, data=None, mtf_level=0, fftdata=None, cut=False,
                    raw_mtf=False):
         # raw_mtf: use mtf_level as-is (delay calibration passes the true

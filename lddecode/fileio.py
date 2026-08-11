@@ -283,7 +283,7 @@ class LoadFFmpeg:
         # small amounts. The last byte returned by ffmpeg is at the end of
         # this buffer.
         self.rewind_size = 16 * 1024 * 1024
-        self.rewind_buf = b""
+        self.rewind_buf = bytearray()
 
     def _close(self):
         if self.ffmpeg is not None:
@@ -301,7 +301,8 @@ class LoadFFmpeg:
         self.position += len(data)
 
         self.rewind_buf += data
-        self.rewind_buf = self.rewind_buf[-self.rewind_size :]
+        if len(self.rewind_buf) > 2 * self.rewind_size:
+            del self.rewind_buf[: len(self.rewind_buf) - self.rewind_size]
 
         return data
 
@@ -325,7 +326,7 @@ class LoadFFmpeg:
             end = min(start + readlen_bytes, len(self.rewind_buf))
             if start < 0:
                 raise IOError("Seeking too far backwards with ffmpeg")
-            buf_data = self.rewind_buf[start:end]
+            buf_data = bytes(self.rewind_buf[start:end])
             sample_bytes += len(buf_data)
             readlen_bytes -= len(buf_data)
         else:
@@ -378,7 +379,7 @@ class LoadLDF:
         # the equivalent LoadFFmpeg buffer): a backward seek within this range is
         # served from RAM instead of forcing an expensive container re-seek.
         self.rewind_size = 16 * 1024 * 1024
-        self.rewind_buf = b""
+        self.rewind_buf = bytearray()
 
         # Forward seeks farther than this (in bytes) restart the decoder with a
         # container seek instead of reading and discarding samples one by one.
@@ -430,7 +431,7 @@ class LoadLDF:
         self._stop_event = stop_event
 
         self.position = sample * 2
-        self.rewind_buf = b""
+        self.rewind_buf = bytearray()
 
         self._reader_thread = threading.Thread(
             target=self._reader_loop,
@@ -532,7 +533,8 @@ class LoadLDF:
         self.position += len(data)
 
         self.rewind_buf += data
-        self.rewind_buf = self.rewind_buf[-self.rewind_size:]
+        if len(self.rewind_buf) > 2 * self.rewind_size:
+            del self.rewind_buf[: len(self.rewind_buf) - self.rewind_size]
 
         return data
 
@@ -560,7 +562,7 @@ class LoadLDF:
                 self._start_decoder(sample)
                 buf_data = b""
             else:
-                buf_data = self.rewind_buf[start:end]
+                buf_data = bytes(self.rewind_buf[start:end])
                 sample_bytes += len(buf_data)
                 readlen_bytes -= len(buf_data)
         else:
