@@ -55,6 +55,41 @@ def cav_picture(vbidata):
     return None
 
 
+def _bcd2(x):
+    hi, lo = (x >> 4) & 0xF, x & 0xF
+    if hi > 9 or lo > 9:
+        return None
+    return hi * 10 + lo
+
+
+def clv_frame(vbidata):
+    """Absolute CLV frame number from a frame's VBI codes (both fields'
+    vbiData concatenated), or None.
+
+    IEC 60856 10.1.8/10.1.10: the CLV picture number (line 16,
+    0x8XEYZZ with X=sec-tens+0xA, Y=sec-units BCD, ZZ=picture BCD) gives
+    seconds+frame; the programme time code (lines 17/18, 0xFHDDMM BCD)
+    gives hours+minutes. Every CLV programme frame broadcasts both."""
+    sec = pic = hr = mn = None
+    for v in vbidata:
+        if v is None:
+            continue
+        if (v & 0xF0F000) == 0x80E000:
+            x1 = (v >> 16) & 0xF
+            su = (v >> 8) & 0xF
+            p = _bcd2(v & 0xFF)
+            if x1 >= 0xA and su <= 9 and p is not None:
+                sec, pic = 10 * (x1 - 0xA) + su, p
+        elif (v & 0xF0FF00) == 0xF0DD00:
+            h = (v >> 16) & 0xF
+            m = _bcd2(v & 0xFF)
+            if h <= 9 and m is not None:
+                hr, mn = h, m
+    if sec is not None and hr is not None:
+        return ((hr * 60 + mn) * 60 + sec) * 25 + pic
+    return None
+
+
 def field_vbi(field_json):
     return field_json.get("vbi", {}).get("vbiData", []) or []
 
@@ -153,9 +188,23 @@ class TBCFrameSource(FrameSource):
         nframes = len(self.fields) // 2
         if self.pcm is not None and nframes:
             self._spf = len(self.pcm) // nframes
+        prev = None
         for fi in range(nframes):
             j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
-            key = cav_picture(field_vbi(j0) + field_vbi(j1)) if self.cav else fi
+            vbi = field_vbi(j0) + field_vbi(j1)
+            if self.cav:
+                key = cav_picture(vbi)
+            else:
+                # CLV: absolute timecode frame; frames with unreadable codes
+                # continue sequentially from the previous good key so captures
+                # still align absolutely (falls back to plain index when the
+                # source has no CLV codes at all)
+                if 0x88FFFF in vbi:        # lead-in: never key (a lead-in
+                    continue               # frame must not shadow t=0:00:00)
+                key = clv_frame(vbi)
+                if key is None:
+                    key = fi if prev is None else prev + 1
+                prev = key
             if key is not None and key not in self._idx:
                 self._idx[key] = fi
 
