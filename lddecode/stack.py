@@ -476,13 +476,19 @@ def dropout_mask(shape, dropouts):
     return m
 
 
-def combine_fields(fields, masks, weights, sigma):
+def combine_fields(fields, masks, weights, sigma, diff_dod=False):
     """Dropout-aware, inverse-variance weighted combine of registered fields.
 
     fields: list of float 2D arrays (already registered to a common grid)
     masks:  list of bool dropout masks (True = bad pixel, exclude)
     weights: per-capture inverse-variance weights
     sigma:  per-capture noise (for outlier rejection vs the median)
+    diff_dod: dropout flags are sometimes over-cautious (idea from
+      decode-orc's stacker): where EVERY source flagged the pixel, accept
+      the median of the flagged values anyway IF at least 2 of >=3 sources
+      still agree within the usual 5-sigma window AND the level is
+      plausible video (a real dropout rails low; 8192 is ~half the
+      standard 16-bit black level, well below sync tips).
     """
     stack = np.stack(fields, 0)
     good = ~np.stack(masks, 0)
@@ -491,9 +497,20 @@ def combine_fields(fields, masks, weights, sigma):
     # reject pixels far from the median (catches un-flagged dropouts/glitches)
     thr = (5.0 * np.array(sigma)).reshape(-1, 1, 1)
     good &= np.abs(stack - med[None]) <= thr
-    w = np.array(weights).reshape(-1, 1, 1) * good
+    w = np.array(weights, dtype=np.float64).reshape(-1, 1, 1) * good
     wsum = w.sum(0)
     out = np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
+    if diff_dod and len(fields) >= 3:
+        allbad = wsum == 0
+        if allbad.any():
+            vals = stack[:, allbad]
+            dmed = np.median(vals, axis=0)
+            nagree = (np.abs(vals - dmed[None])
+                      <= 5.0 * float(np.median(sigma))).sum(0)
+            rec = (nagree >= 2) & (dmed > 8192.0)
+            if rec.any():
+                o = out[allbad]; o[rec] = dmed[rec]; out[allbad] = o
+                ws = wsum[allbad]; ws[rec] = 1e-6; wsum[allbad] = ws
     return out, wsum
 
 
@@ -970,7 +987,7 @@ def _compute_frame(fd, P):
         ref_field = getattr(ref_frame, which).astype(np.float64)
         do_attr = "do0" if which == "f0" else "do1"
 
-        def combine_set(names):
+        def combine_set(names, diff_dod=False):
             regs, masks, ws, sigs = [], [], [], []
             for n in names:
                 fr = fd[n]
@@ -991,9 +1008,10 @@ def _compute_frame(fd, P):
             if P["reg_confidence"]:
                 ws = perframe_weights(regs, masks, ws, ra, ca,
                                       drop=True, drop_mult=P["reg_drop_mult"])
-            return combine_fields(regs, masks, ws, sigs)
+            return combine_fields(regs, masks, ws, sigs,
+                                  diff_dod=diff_dod)
 
-        out, wsum = combine_set(present_primary)
+        out, wsum = combine_set(present_primary, diff_dod=True)
         allbad = (wsum == 0)            # dropout present in EVERY primary disc
         # ---- cross-master fill: patch master-level dropouts from alt master
         if present_fill and allbad.any():
