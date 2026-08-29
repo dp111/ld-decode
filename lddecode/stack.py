@@ -189,6 +189,7 @@ class TBCFrameSource(FrameSource):
         if self.pcm is not None and nframes:
             self._spf = len(self.pcm) // nframes
         prev = None
+        raw = []
         for fi in range(nframes):
             j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
             vbi = field_vbi(j0) + field_vbi(j1)
@@ -205,7 +206,22 @@ class TBCFrameSource(FrameSource):
                 if key is None:
                     key = fi if prev is None else prev + 1
                 prev = key
-            if key is not None and key not in self._idx:
+            if key is not None:
+                raw.append((fi, key))
+        # An isolated corrupt VBI read (weak inner-radius RF flipping a
+        # picture-number digit) can claim a far-away key and, via
+        # first-occurrence, SHADOW the real frame (EcoDisc S2: an early frame
+        # misreading as picture 2156 displaced the true one on all four
+        # captures). Reject keys that deviate wildly from the local trend of
+        # their neighbours before assigning slots.
+        for idx, (fi, key) in enumerate(raw):
+            lo, hi = max(0, idx - 2), min(len(raw), idx + 3)
+            neigh = [k for j, (_, k) in enumerate(raw[lo:hi], lo) if j != idx]
+            if neigh:
+                med = sorted(neigh)[len(neigh) // 2]
+                if abs(key - med) > 50:
+                    continue
+            if key not in self._idx:
                 self._idx[key] = fi
 
     def keys(self):
