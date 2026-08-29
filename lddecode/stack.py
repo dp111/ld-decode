@@ -318,14 +318,29 @@ def integer_shift(ref, img):
     return sy, sx
 
 
+def _apply_shift_spectrum(F, H, W, dy, dx, _pycache=None, _pxcache=None):
+    """irfft2 of a cached rfft2 spectrum with a (dy, dx) phase-ramp shift.
+    The ramp is separable, so build it as two 1-D phasor vectors instead of a
+    full 2-D exp (identical result to fft2/ifft2 with the full ramp, since a
+    real image's shift ramp preserves Hermitian symmetry)."""
+    py = None if _pycache is None else _pycache.get(dy)
+    if py is None:
+        py = np.exp(-2j * np.pi * np.fft.fftfreq(H) * dy)[:, None]
+        if _pycache is not None:
+            _pycache[dy] = py
+    px = None if _pxcache is None else _pxcache.get(dx)
+    if px is None:
+        px = np.exp(-2j * np.pi * np.fft.rfftfreq(W) * dx)[None, :]
+        if _pxcache is not None:
+            _pxcache[dx] = px
+    return np.fft.irfft2((F * py) * px, s=(H, W))
+
+
 def fourier_shift(img, dy, dx):
     if dy == 0 and dx == 0:
         return img
     H, W = img.shape
-    fy = np.fft.fftfreq(H)[:, None]
-    fx = np.fft.fftfreq(W)[None, :]
-    F = np.fft.fft2(img)
-    return np.real(np.fft.ifft2(F * np.exp(-2j * np.pi * (fy * dy + fx * dx))))
+    return _apply_shift_spectrum(np.fft.rfft2(img), H, W, dy, dx)
 
 
 def _smooth_axis0(a, sigma):
@@ -391,6 +406,9 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0):
     best = (float(iy), float(ix))
     if subpixel:
         refblk = ref[ra, ca]
+        H, W = fa.shape
+        Ffa = np.fft.rfft2(fa)          # forward FFT once for the whole search
+        pyc, pxc = {}, {}
         # two-stage grid search: coarse (0.25) then fine (0.05) around the best,
         # so the fractional offset that distinguishes glass masters (~0.1 px) is
         # resolved rather than quantised to the coarse step.
@@ -399,7 +417,11 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0):
             bestrms = None
             for dy in cy + np.arange(-span, span + 1e-9, step):
                 for dx in cx + np.arange(-span, span + 1e-9, step):
-                    s = fourier_shift(fa, dy, dx)[ra, ca]
+                    if dy == 0 and dx == 0:
+                        s = fa[ra, ca]
+                    else:
+                        s = _apply_shift_spectrum(Ffa, H, W, dy, dx,
+                                                  pyc, pxc)[ra, ca]
                     rms = np.mean((s - refblk) ** 2)
                     if bestrms is None or rms < bestrms:
                         bestrms, best = rms, (dy, dx)
