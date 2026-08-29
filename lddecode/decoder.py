@@ -922,6 +922,11 @@ class LDdecode:
         # flushes the whole file).  Restored to OFF after that commit.
         sync_now = (f_id + 1) % self.DB_SYNC_FIELDS == 0
         if sync_now:
+            # A speculation_log insert since the last field's commit leaves
+            # a transaction open, and the safety level cannot be changed
+            # mid-transaction; fold it into this field's boundary commit.
+            if self.dbconn.in_transaction:
+                self.dbconn.commit()
             self.dbconn.execute("PRAGMA synchronous=FULL")
 
         decodeFaults = None if fi.get('decodeFaults') == 0 else fi.get('decodeFaults')
