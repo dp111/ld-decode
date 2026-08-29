@@ -116,12 +116,29 @@ class TBCFrameSource(FrameSource):
         fw = self.videoParameters["fieldWidth"]
         fh = self.videoParameters["fieldHeight"]
         n = len(self.fields)
-        self.tbc = np.memmap(base + ".tbc", dtype="<u2", mode="r",
-                             shape=(n, fh, fw))
+        # positional bulk reads, NOT np.memmap: on network/9P mounts (WSL
+        # drvfs) memmap faults each 4KB page through the filesystem server,
+        # which serialises the whole worker pool; one os.pread per field is a
+        # single large sequential read. os.pread is offset-explicit, so forked
+        # workers can share the fd without seek races.
+        self._tbc_fd = os.open(base + ".tbc", os.O_RDONLY)
+        self._fshape = (fh, fw)
+        self._fbytes = fh * fw * 2
+        self._nfields = n
         self.pcm = None
         p = base + ".pcm"
         if os.path.exists(p):
             self.pcm = np.fromfile(p, dtype="<i2").reshape(-1, 2)
+
+    def _read_field(self, idx):
+        buf = os.pread(self._tbc_fd, self._fbytes, idx * self._fbytes)
+        return np.frombuffer(buf, dtype="<u2").reshape(self._fshape)
+
+    def close(self):
+        try:
+            os.close(self._tbc_fd)
+        except OSError:
+            pass
 
     def _dropouts(self, fj):
         do = fj.get("dropOuts") or {}
@@ -157,7 +174,7 @@ class TBCFrameSource(FrameSource):
             audio = np.asarray(self.pcm[fi * self._spf:(fi + 1) * self._spf])
         return Frame(
             key,
-            np.asarray(self.tbc[fi * 2]), np.asarray(self.tbc[fi * 2 + 1]),
+            self._read_field(fi * 2), self._read_field(fi * 2 + 1),
             j0, j1, self._dropouts(j0), self._dropouts(j1),
             audio, None,
         )
