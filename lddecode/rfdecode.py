@@ -623,6 +623,21 @@ class RFDecode:
             )
             SF["FVideoPilot"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * SF["Fpilot"]
 
+        self._build_video_batch()
+
+    def _build_video_batch(self):
+        """Stack the half-spectrum video product filters into one contiguous
+        array so demodblock can batch all their inverse transforms into a
+        single multi-row irfft call (ported from upstream b35507dd).  Must be
+        rebuilt whenever any FVideo* filter changes (computevideofilters and
+        recompute_fvideo)."""
+        SF = self.Filters
+        nr = self.blocklen // 2 + 1
+        vf = [SF["FVideo"][:nr], SF["FVideo05"][:nr], SF["FVideoBurst"][:nr]]
+        if self.system == "PAL":
+            vf.append(SF["FVideoPilot"][:nr])
+        SF["FVideo_rfft_batch"] = np.ascontiguousarray(np.stack(vf))
+
     def recompute_fvideo(self):
         """Rebuild only FVideo after an inverse MTF strength change.
 
@@ -644,6 +659,7 @@ class RFDecode:
             SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
 
         SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
+        self._build_video_batch()
 
     def build_video_eq(self, points):
         """Zero-phase magnitude EQ from (freq_hz, gain_db) anchor points.
@@ -1201,17 +1217,17 @@ class RFDecode:
         # rfft/irfft pair is mathematically identical to fft/ifft.real (the filters
         # are conjugate-symmetric) at ~2.3x the speed of the full complex transforms.
         demod_fft = npfft.rfft(np.clip(demod, 1500000, self.freq_hz * 0.75))
-        nr = demod_fft.shape[0]
         bl = self.blocklen
 
-        out_video = npfft.irfft(demod_fft * self.Filters["FVideo"][:nr], n=bl)
-
-        out_video05 = npfft.irfft(demod_fft * self.Filters["FVideo05"][:nr], n=bl)
-
-        out_videoburst = npfft.irfft(demod_fft * self.Filters["FVideoBurst"][:nr], n=bl)
+        # one batched multi-row irfft over all video products (each row is an
+        # independent transform, so results are identical to per-product calls)
+        vids = npfft.irfft(
+            demod_fft * self.Filters["FVideo_rfft_batch"], n=bl, axis=1
+        )
+        out_video, out_video05, out_videoburst = vids[0], vids[1], vids[2]
 
         if self.system == "PAL":
-            out_videopilot = npfft.irfft(demod_fft * self.Filters["FVideoPilot"][:nr], n=bl)
+            out_videopilot = vids[3]
             video_out = np.rec.array(
                 [
                     out_video.astype(np.float32),
