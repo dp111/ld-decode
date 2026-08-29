@@ -409,22 +409,43 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0):
         H, W = fa.shape
         Ffa = np.fft.rfft2(fa)          # forward FFT once for the whole search
         pyc, pxc = {}, {}
-        # two-stage grid search: coarse (0.25) then fine (0.05) around the best,
-        # so the fractional offset that distinguishes glass masters (~0.1 px) is
-        # resolved rather than quantised to the coarse step.
-        for step, span in ((0.25, 0.5), (0.05, 0.25)):
-            cy, cx = best
-            bestrms = None
-            for dy in cy + np.arange(-span, span + 1e-9, step):
-                for dx in cx + np.arange(-span, span + 1e-9, step):
-                    if dy == 0 and dx == 0:
-                        s = fa[ra, ca]
-                    else:
-                        s = _apply_shift_spectrum(Ffa, H, W, dy, dx,
-                                                  pyc, pxc)[ra, ca]
-                    rms = np.mean((s - refblk) ** 2)
-                    if bestrms is None or rms < bestrms:
-                        bestrms, best = rms, (dy, dx)
+        cands = {}
+
+        def ev(dy, dx):
+            key = (round(dy, 4), round(dx, 4))
+            if key not in cands:
+                if dy == 0 and dx == 0:
+                    s = fa[ra, ca]
+                else:
+                    s = _apply_shift_spectrum(Ffa, H, W, dy, dx,
+                                              pyc, pxc)[ra, ca]
+                cands[key] = np.mean((s - refblk) ** 2)
+            return cands[key]
+
+        # coarse 5x5 grid (0.25 step) around the integer estimate, then
+        # per-axis parabolic interpolation of the RMS surface for the
+        # sub-step optimum (~0.03px, vs 0.05px for the old 11x11 fine grid,
+        # at ~5x fewer full-field transforms). A verification eval keeps
+        # the result no worse than the best grid point.
+        cy, cx = best
+        bestrms = None
+        for dy in cy + np.arange(-0.5, 0.5 + 1e-9, 0.25):
+            for dx in cx + np.arange(-0.5, 0.5 + 1e-9, 0.25):
+                r = ev(dy, dx)
+                if bestrms is None or r < bestrms:
+                    bestrms, best = r, (dy, dx)
+
+        def para(fm, f0, fp, h):
+            den = fm - 2.0 * f0 + fp
+            if den <= 0:
+                return 0.0
+            return float(np.clip(0.5 * (fm - fp) / den * h, -h, h))
+
+        by, bx = best
+        oy = para(ev(by - 0.25, bx), ev(by, bx), ev(by + 0.25, bx), 0.25)
+        ox = para(ev(by, bx - 0.25), ev(by, bx), ev(by, bx + 0.25), 0.25)
+        if (oy or ox) and ev(by + oy, bx + ox) <= bestrms:
+            best = (by + oy, bx + ox)
     shifted = fourier_shift(fa, best[0], best[1])
     # affine level match (gain+offset) to reference over active region
     x = shifted[ra, ca].ravel()
