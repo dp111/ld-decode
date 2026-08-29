@@ -948,11 +948,116 @@ def average_efm(waves, weights):
     return (acc / max(ws, 1e-9)) if ws else acc
 
 
+def _compute_frame(fd, P):
+    """Stack one aligned frame dict {name: Frame} -> a writable result dict
+    (pure per-frame computation; no shared state, so it can run in a worker).
+    Returns None when no primary capture carries this frame."""
+    primary, fill_sources = P["primary"], P["fill_sources"]
+    ra, ca, fh, fw = P["ra"], P["ca"], P["fh"], P["fw"]
+    weights, sig = P["weights"], P["sig"]
+    present_primary = [n for n in primary if n in fd]
+    present_fill = [n for n in fill_sources if n in fd] if P["cross_fill"] else []
+    if not present_primary:
+        # picture missing from every primary-master capture: build the frame
+        # from the alt-master captures rather than dropping it from the output
+        if not present_fill:
+            return None
+        present_primary, present_fill = present_fill, []
+    ref_frame = fd[present_primary[0]]
+    filled = 0
+    out_fields = []
+    for fidx, which in enumerate(("f0", "f1")):
+        ref_field = getattr(ref_frame, which).astype(np.float64)
+        do_attr = "do0" if which == "f0" else "do1"
+
+        def combine_set(names):
+            regs, masks, ws, sigs = [], [], [], []
+            for n in names:
+                fr = fd[n]
+                if fr is ref_frame:
+                    # registering/phase-aligning the reference to itself is an
+                    # identity (the search provably lands at (0,0), the affine
+                    # at gain 1 offset 0, the chroma rotation at 0) -- skip it
+                    reg = ref_field
+                else:
+                    reg, _ = register_field(getattr(fr, which).astype(np.float64),
+                                            ref_field, ra, ca, P["subpixel"],
+                                            line_reg=P["line_reg"])
+                    if P["chroma_align"]:
+                        reg = chroma_align_field(reg, ref_field, ca)
+                regs.append(reg)
+                masks.append(dropout_mask((fh, fw), getattr(fr, do_attr)))
+                ws.append(weights[n]); sigs.append(sig[n])
+            if P["reg_confidence"]:
+                ws = perframe_weights(regs, masks, ws, ra, ca,
+                                      drop=True, drop_mult=P["reg_drop_mult"])
+            return combine_fields(regs, masks, ws, sigs)
+
+        out, wsum = combine_set(present_primary)
+        allbad = (wsum == 0)            # dropout present in EVERY primary disc
+        # ---- cross-master fill: patch master-level dropouts from alt master
+        if present_fill and allbad.any():
+            fout, fws = combine_set(present_fill)
+            fillable = allbad & (fws > 0)
+            if fillable.any():
+                out = out.copy()
+                out[fillable] = fout[fillable]
+                filled += int(fillable.sum())
+                allbad = allbad & ~fillable
+        outu = np.clip(np.round(out), 0, 65535).astype(np.uint16)
+        meta = ref_frame.meta0 if which == "f0" else ref_frame.meta1
+        resid_do = []                   # still bad after cross-fill
+        if allbad.any():
+            for ln in np.where(allbad.any(1))[0]:
+                xs = np.where(allbad[ln])[0]
+                resid_do.append((int(ln), int(xs.min()), int(xs.max()) + 1))
+        # EFM: pool ALL discs (the digital data is master-independent)
+        efm_src = [n for n in present_primary + present_fill
+                   if fd[n].efm is not None]
+        efm_avi = None
+        if efm_src:
+            av = average_efm([fd[n].efm[fidx] for n in efm_src],
+                             [weights[n] for n in efm_src])
+            efm_avi = np.clip(np.round(av), -32768, 32767).astype("<i2")
+        audio_n = (0 if which == "f1" else
+                   (ref_frame.audio.shape[0] if ref_frame.audio is not None else 0))
+        out_fields.append((outu, meta, field_vbi(meta), resid_do, efm_avi,
+                           audio_n))
+    # audio: PRIMARY master only (analog audio is master-specific).
+    # Sub-sample align each capture to the reference, then robust
+    # (outlier-rejecting) weighted-average so a click/glitch in one capture
+    # is excluded rather than smeared into the mean.
+    audio_out = None
+    ref_audio = ref_frame.audio
+    if ref_audio is not None:
+        refm = ref_audio[:, 0].astype(np.float64)
+        aligned, awts = [], []
+        for n in present_primary:
+            fa = fd[n].audio
+            if fa is None or fa.shape != ref_audio.shape:
+                continue
+            lag = align_audio(refm, fa[:, 0].astype(np.float64))
+            aligned.append(frac_shift_audio(fa, lag))
+            awts.append(weights[n])
+        if aligned:
+            audio_out = combine_audio(aligned, awts)
+    return {"fields": out_fields, "audio": audio_out, "filled": filled}
+
+
+_WORKER_STATE = None            # (sources, P) inherited by forked pool workers
+
+
+def _frame_by_key(key):
+    sources, P = _WORKER_STATE
+    fd = {s.name: s.get(key) for s in sources if key in s.keys()}
+    return _compute_frame(fd, P)
+
+
 def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
           cross_fill=True, masters=None, sample=24, analysis_window=None,
           max_frames=None,
           scratch_dir=None, git_commit="", reg_confidence=True, reg_drop_mult=3.0,
-          line_reg=0, log=print):
+          line_reg=0, jobs=0, log=print):
     aw = analysis_window or max(sample * 2, 40)
     merged = lockstep(sources)
 
@@ -1017,89 +1122,61 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
     filled_total = 0
     import itertools
 
-    def do_frame(key, fd):
+    P = dict(primary=primary, fill_sources=fill_sources, cross_fill=cross_fill,
+             weights=weights, sig=sig, ra=ra, ca=ca, fh=fh, fw=fw,
+             subpixel=subpixel, chroma_align=chroma_align, line_reg=line_reg,
+             reg_confidence=reg_confidence, reg_drop_mult=reg_drop_mult)
+
+    def emit(r):
         nonlocal nwritten, filled_total
-        present_primary = [n for n in primary if n in fd]
-        if not present_primary:
+        if r is None:
             return
-        ref_frame = fd[present_primary[0]]
-        present_fill = [n for n in fill_sources if n in fd] if cross_fill else []
-        for fidx, which in enumerate(("f0", "f1")):
-            ref_field = getattr(ref_frame, which).astype(np.float64)
-            do_attr = "do0" if which == "f0" else "do1"
-
-            def combine_set(names):
-                regs, masks, ws, sigs = [], [], [], []
-                for n in names:
-                    fr = fd[n]
-                    reg, _ = register_field(getattr(fr, which).astype(np.float64),
-                                            ref_field, ra, ca, subpixel,
-                                            line_reg=line_reg)
-                    if chroma_align:
-                        reg = chroma_align_field(reg, ref_field, ca)
-                    regs.append(reg)
-                    masks.append(dropout_mask((fh, fw), getattr(fr, do_attr)))
-                    ws.append(weights[n]); sigs.append(sig[n])
-                if reg_confidence:
-                    ws = perframe_weights(regs, masks, ws, ra, ca,
-                                          drop=True, drop_mult=reg_drop_mult)
-                return combine_fields(regs, masks, ws, sigs)
-
-            out, wsum = combine_set(present_primary)
-            allbad = (wsum == 0)            # dropout present in EVERY primary disc
-            # ---- cross-master fill: patch master-level dropouts from alt master
-            if present_fill and allbad.any():
-                fout, fws = combine_set(present_fill)
-                fillable = allbad & (fws > 0)
-                if fillable.any():
-                    out = out.copy()
-                    out[fillable] = fout[fillable]
-                    filled_total += int(fillable.sum())
-                    allbad = allbad & ~fillable
-            outu = np.clip(np.round(out), 0, 65535).astype(np.uint16)
-            meta = ref_frame.meta0 if which == "f0" else ref_frame.meta1
-            resid_do = []                   # still bad after cross-fill
-            if allbad.any():
-                for ln in np.where(allbad.any(1))[0]:
-                    xs = np.where(allbad[ln])[0]
-                    resid_do.append((int(ln), int(xs.min()), int(xs.max()) + 1))
-            # EFM: pool ALL discs (the digital data is master-independent)
-            efm_src = [n for n in present_primary + present_fill
-                       if fd[n].efm is not None]
+        for outu, meta, vbidata, resid_do, efm_avi, audio_n in r["fields"]:
             efm_t = 0
-            if efm_src:
-                av = average_efm([fd[n].efm[fidx] for n in efm_src],
-                                 [weights[n] for n in efm_src])
-                avi = np.clip(np.round(av), -32768, 32767).astype("<i2")
-                efm_stream.append(avi); efm_t = len(avi)
-            writer.write_field(outu, meta, field_vbi(meta), resid_do, efm_t,
-                               0 if which == "f1" else
-                               (ref_frame.audio.shape[0] if ref_frame.audio is not None else 0))
-        # audio: PRIMARY master only (analog audio is master-specific).
-        # Sub-sample align each capture to the reference, then robust
-        # (outlier-rejecting) weighted-average so a click/glitch in one capture
-        # is excluded rather than smeared into the mean.
-        ref_audio = ref_frame.audio
-        if ref_audio is not None:
-            refm = ref_audio[:, 0].astype(np.float64)
-            aligned, awts = [], []
-            for n in present_primary:
-                fa = fd[n].audio
-                if fa is None or fa.shape != ref_audio.shape:
-                    continue
-                lag = align_audio(refm, fa[:, 0].astype(np.float64))
-                aligned.append(frac_shift_audio(fa, lag))
-                awts.append(weights[n])
-            if aligned:
-                writer.write_audio(combine_audio(aligned, awts))
+            if efm_avi is not None:
+                efm_stream.append(efm_avi); efm_t = len(efm_avi)
+            writer.write_field(outu, meta, vbidata, resid_do, efm_t, audio_n)
+        if r["audio"] is not None:
+            writer.write_audio(r["audio"])
+        filled_total += r["filled"]
         nwritten += 1
         if nwritten % 50 == 0:
             log(f"  ... {nwritten} frames")
 
-    for key, fd in itertools.chain(head_buf, merged):
-        if max_frames and nwritten >= max_frames:
-            break
-        do_frame(key, fd)
+    all_tbc = all(isinstance(s, TBCFrameSource) for s in sources)
+    if jobs and jobs > 1 and all_tbc:
+        # frames are independent -> fan the per-frame computation out over a
+        # fork pool (sources/P inherited copy-on-write, .tbc via memmap); the
+        # parent writes results in key order, so output is byte-identical to
+        # the sequential path
+        import multiprocessing as mp
+        global _WORKER_STATE
+        # UNION of pictures, not intersection: a CAV picture readable on any
+        # capture is stacked from whichever captures carry it. Intersection
+        # silently dropped pictures missing from even one capture, compressing
+        # the output timeline (~50 frames / 2s over a Domesday AIV side) and
+        # putting burnt-in timecodes out of step.
+        keysets = [s.keys() for s in sources]
+        shared = sorted(set.union(*keysets))
+        n_all = len(set.intersection(*keysets))
+        if max_frames:
+            shared = shared[:max_frames]
+        log(f"[stack] parallel: {jobs} workers over {len(shared)} frames "
+            f"({len(shared) - n_all} present on only some captures)")
+        _WORKER_STATE = (sources, P)
+        try:
+            with mp.get_context("fork").Pool(jobs) as pool:
+                for r in pool.imap(_frame_by_key, shared, chunksize=4):
+                    emit(r)
+        finally:
+            _WORKER_STATE = None
+    else:
+        if jobs and jobs > 1:
+            log("[stack] --jobs ignored (needs all-.tbc inputs)")
+        for key, fd in itertools.chain(head_buf, merged):
+            if max_frames and nwritten >= max_frames:
+                break
+            emit(_compute_frame(fd, P))
 
     efm_bytes = None
     efm_merged = False
@@ -1254,6 +1331,10 @@ def main(argv=None):
                    "subtraction (recommended for Domesday/EFM PAL captures)")
     p.add_argument("--rf_echo", type=str, default=None,
                    help="(.ldf) RF echo cancellation, e.g. 26:0.035,38:0.018")
+    p.add_argument("--jobs", type=int, default=0,
+                   help="parallelise the per-frame stacking over this many "
+                   "worker processes (all-.tbc inputs only; output is "
+                   "byte-identical to the sequential path). 0 = sequential.")
     p.add_argument("--scratch-dir", type=str, default=None,
                    help="where to put per-capture scratch (window .tbc/.efm, "
                    "merge .bin).  Default: a RAM tmpfs (/dev/shm) if available "
@@ -1297,7 +1378,7 @@ def main(argv=None):
               max_frames=args.max_frames,
               reg_confidence=not args.no_reg_confidence,
               reg_drop_mult=args.reg_drop_mult, line_reg=args.line_reg,
-              git_commit=_git_commit())
+              jobs=args.jobs, git_commit=_git_commit())
     finally:
         for s in sources:
             s.close()
