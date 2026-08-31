@@ -562,6 +562,14 @@ def dropout_mask(shape, dropouts):
     return m
 
 
+# reject a capture deviating > K x the per-pixel MAD (0 disables; env override
+# exists so the threshold can be tuned/measured without editing the source)
+LOCAL_SPREAD_K = float(os.environ.get("LDSTACK_LOCAL_SPREAD_K", "6.0"))
+# cross-master fill must sit within K x the captures' noise of a simple vertical
+# estimate; 0 disables the check
+FILL_SANITY_K = float(os.environ.get("LDSTACK_FILL_SANITY_K", "8.0"))
+
+
 def combine_fields(fields, masks, weights, sigma, diff_dod=False):
     """Dropout-aware, inverse-variance weighted combine of registered fields.
 
@@ -583,6 +591,17 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False):
     # reject pixels far from the median (catches un-flagged dropouts/glitches)
     thr = (5.0 * np.array(sigma)).reshape(-1, 1, 1)
     good &= np.abs(stack - med[None]) <= thr
+    # ...and again against the LOCAL spread. A capture-specific defect that no
+    # dropout detector flagged (Community North DS3 put a 26000-level streak
+    # through one line where the other five agreed to within ~3000) sits well
+    # inside the global 5-sigma window, so it survived into the output. Compare
+    # each capture with the per-pixel MAD of the set instead, floored by the
+    # captures' own noise so ordinary disagreement is never rejected.
+    if len(fields) >= 4 and LOCAL_SPREAD_K > 0:
+        dev = np.abs(stack - med[None])
+        mad = np.median(dev, axis=0) * 1.4826
+        floor = 3.0 * float(np.median(sigma))
+        good &= dev <= np.maximum(LOCAL_SPREAD_K * mad, floor)[None]
     w = np.array(weights, dtype=np.float64).reshape(-1, 1, 1) * good
     wsum = w.sum(0)
     out = np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
@@ -1103,6 +1122,21 @@ def _compute_frame(fd, P):
         if present_fill and allbad.any():
             fout, fws = combine_set(present_fill)
             fillable = allbad & (fws > 0)
+            # The fill source is often a SINGLE alt-master capture, so nothing
+            # cross-checks it: combine_fields with one field cannot reject
+            # anything. A defect on that one capture then lands in the output
+            # and is marked good (Community North: ds3's unflagged streak was
+            # filled into a line where all five primaries were flagged bad).
+            # Require the fill to be plausible against its own vertical
+            # neighbourhood; where it is not, leave the pixel flagged so the
+            # downstream dropout corrector conceals it instead.
+            if fillable.any() and FILL_SANITY_K > 0:
+                est = np.empty_like(fout)
+                est[1:-1] = 0.5 * (fout[:-2] + fout[2:])
+                est[0], est[-1] = fout[1], fout[-2]
+                lim = max(FILL_SANITY_K * float(np.median(list(sig.values()))), 1500.0)
+                implausible = fillable & (np.abs(fout - est) > lim)
+                fillable &= ~implausible
             if fillable.any():
                 out = out.copy()
                 out[fillable] = fout[fillable]
