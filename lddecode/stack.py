@@ -492,14 +492,25 @@ def subpixel_warp_x(img, ref, ra, ca, nblocks=1, max_shift=0.3, line_sigma=4.0):
     return out
 
 
-def register_field(field, ref, ra, ca, subpixel=True, line_reg=0):
+def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
     """Return field resampled to align with ref, plus affine level-matched.
     ra/ca are the active row/col slices used for measuring the shift.
     line_reg>0 adds a per-line (==1) / within-line (>1, = #blocks) sub-pixel
-    horizontal warp after the global shift, to remove residual intra-line wow."""
+    horizontal warp after the global shift, to remove residual intra-line wow.
+
+    hint: this capture's shift on the previous frame. Inter-capture offsets
+    drift slowly, so searching a small window around the hint costs ~9 field
+    transforms instead of the ~34 the cold path needs (integer_shift's three,
+    plus a 5x5 grid). If the best lands on the window's border the hint has
+    gone stale and the full cold search runs, so this cannot mis-register:
+    it only skips work when the answer is already bracketed."""
     fa = field.astype(np.float64)
-    iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
-    best = (float(iy), float(ix))
+    best = None
+    if subpixel and hint is not None:
+        best = (float(hint[0]), float(hint[1]))
+    if best is None:
+        iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
+        best = (float(iy), float(ix))
     if subpixel:
         refblk = ref[ra, ca]
         H, W = fa.shape
@@ -524,12 +535,24 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0):
         # at ~5x fewer full-field transforms). A verification eval keeps
         # the result no worse than the best grid point.
         cy, cx = best
+        span = 0.25 if hint is not None else 0.5      # warm: 3x3, cold: 5x5
         bestrms = None
-        for dy in cy + np.arange(-0.5, 0.5 + 1e-9, 0.25):
-            for dx in cx + np.arange(-0.5, 0.5 + 1e-9, 0.25):
+        for dy in cy + np.arange(-span, span + 1e-9, 0.25):
+            for dx in cx + np.arange(-span, span + 1e-9, 0.25):
                 r = ev(dy, dx)
                 if bestrms is None or r < bestrms:
                     bestrms, best = r, (dy, dx)
+        if hint is not None and (abs(best[0] - cy) >= span - 1e-9
+                                 or abs(best[1] - cx) >= span - 1e-9):
+            # stale hint: the optimum is outside the warm window - cold search
+            iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
+            cy, cx = float(iy), float(ix)
+            bestrms = None
+            for dy in cy + np.arange(-0.5, 0.5 + 1e-9, 0.25):
+                for dx in cx + np.arange(-0.5, 0.5 + 1e-9, 0.25):
+                    r = ev(dy, dx)
+                    if bestrms is None or r < bestrms:
+                        bestrms, best = r, (dy, dx)
 
         def para(fm, f0, fp, h):
             den = fm - 2.0 * f0 + fp
@@ -602,6 +625,10 @@ FILL_SANITY_K = float(os.environ.get("LDSTACK_FILL_SANITY_K", "8.0"))
 # picture-number progression: tolerance per frame, and how many consecutive
 # consistent frames confirm a genuine resync after a skip/seek
 SEQ_TOL = int(os.environ.get("LDSTACK_SEQ_TOL", "2"))
+# frames per worker chunk: long contiguous runs keep each worker's registration
+# hint warm (a worker that jumps ahead every few frames re-does the cold search)
+CHUNK = int(os.environ.get("LDSTACK_CHUNK", "48"))
+WARM = os.environ.get("LDSTACK_WARM", "1") not in ("0", "", "no")
 SEQ_CONFIRM = int(os.environ.get("LDSTACK_SEQ_CONFIRM", "4"))
 # a capture's frame is dropped when its level is this many robust sigmas from
 # the consensus of the captures for that frame (catches seek/scan frames)
@@ -1124,6 +1151,33 @@ def _compute_frame(fd, P):
         if not present_fill:
             return None
         present_primary, present_fill = present_fill, []
+    # Integrity check (ported from ld-disc-stacker's isIntegrityOk): in a
+    # correctly timed field the sync region sits well below black on every
+    # line. Three consecutive lines that do not is the signature of a skip or
+    # sample drop, i.e. a field the TBC could not place - drop that capture for
+    # this frame. Catches scrambled frames at normal brightness, which the
+    # level test below cannot see.
+    if len(present_primary) >= 3 and P.get("black") is not None:
+        thr = P["black"] - 2560.0            # 10 IRE below black
+        ok = []
+        for n in present_primary:
+            bad = False
+            for which2 in ("f0", "f1"):
+                col = np.asarray(getattr(fd[n], which2))[:, 4].astype(np.float64)
+                over = col > thr
+                run = 0
+                for v in over:
+                    run = run + 1 if v else 0
+                    if run >= 3:
+                        bad = True
+                        break
+                if bad:
+                    break
+            if not bad:
+                ok.append(n)
+        if len(ok) >= 2:
+            present_primary = ok
+
     # Reference selection: everything registers to this capture's field, so a
     # garbage frame here poisons the whole combine. Take the capture closest to
     # the consensus level rather than whichever sorts first, and drop captures
@@ -1157,9 +1211,12 @@ def _compute_frame(fd, P):
                     # at gain 1 offset 0, the chroma rotation at 0) -- skip it
                     reg = ref_field
                 else:
-                    reg, _ = register_field(getattr(fr, which).astype(np.float64),
-                                            ref_field, ra, ca, P["subpixel"],
-                                            line_reg=P["line_reg"])
+                    hk = (n, which)
+                    reg, shift = register_field(
+                        getattr(fr, which).astype(np.float64), ref_field,
+                        ra, ca, P["subpixel"], line_reg=P["line_reg"],
+                        hint=_SHIFT_HINT.get(hk) if WARM else None)
+                    _SHIFT_HINT[hk] = shift
                     if P["chroma_align"]:
                         reg = chroma_align_field(reg, ref_field, ca)
                 regs.append(reg)
@@ -1241,6 +1298,7 @@ def _compute_frame(fd, P):
 
 
 _WORKER_STATE = None            # (sources, P) inherited by forked pool workers
+_SHIFT_HINT = {}                # (capture, field) -> last registration shift
 
 
 def _frame_by_key(key):
@@ -1319,6 +1377,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
     import itertools
 
     P = dict(primary=primary, fill_sources=fill_sources, cross_fill=cross_fill,
+             black=float(vp.get("black16bIre", 0)) or None,
              weights=weights, sig=sig, ra=ra, ca=ca, fh=fh, fw=fw,
              subpixel=subpixel, chroma_align=chroma_align, line_reg=line_reg,
              reg_confidence=reg_confidence, reg_drop_mult=reg_drop_mult)
@@ -1362,7 +1421,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         _WORKER_STATE = (sources, P)
         try:
             with mp.get_context("fork").Pool(jobs) as pool:
-                for r in pool.imap(_frame_by_key, shared, chunksize=4):
+                for r in pool.imap(_frame_by_key, shared, chunksize=CHUNK):
                     emit(r)
         finally:
             _WORKER_STATE = None
