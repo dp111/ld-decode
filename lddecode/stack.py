@@ -190,6 +190,7 @@ class TBCFrameSource(FrameSource):
             self._spf = len(self.pcm) // nframes
         prev = None
         raw = []
+        keep = []
         for fi in range(nframes):
             j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
             vbi = field_vbi(j0) + field_vbi(j1)
@@ -221,6 +222,36 @@ class TBCFrameSource(FrameSource):
                 med = sorted(neigh)[len(neigh) // 2]
                 if abs(key - med) > 50:
                     continue
+            keep.append((fi, key))
+        # A capture that starts mid-programme and then seeks back to the disc
+        # start sweeps the laser across tracks, and every frame it crosses
+        # carries a REAL picture number on garbage/black content (CommunitySouth
+        # ds1: ...389 390 390 390 340 290 240 190 90 30 1 1 2 3...). Those keys
+        # are not misreads, so no value test can spot them - but during genuine
+        # playback the picture number advances by one per frame. Accept a key
+        # only while it follows that progression, and require several
+        # consecutive consistent frames before trusting a new position (a real
+        # skip/seek in the middle of a capture).
+        expect = None
+        pending = []
+        for fi, key in keep:
+            if expect is None or abs(key - expect) <= SEQ_TOL:
+                expect = key + 1
+                pending = []
+            else:
+                pending.append((fi, key))
+                tail = pending[-SEQ_CONFIRM:]
+                if len(tail) >= SEQ_CONFIRM and all(
+                        b[1] - a[1] == 1 for a, b in zip(tail, tail[1:])):
+                    # a confirmed resync (the capture really is playing from a
+                    # new position): adopt the confirming run, discard the
+                    # transient frames that preceded it
+                    for pfi, pkey in tail:
+                        if pkey not in self._idx:
+                            self._idx[pkey] = pfi
+                    expect = key + 1
+                    pending = []
+                continue
             if key not in self._idx:
                 self._idx[key] = fi
 
@@ -568,6 +599,14 @@ LOCAL_SPREAD_K = float(os.environ.get("LDSTACK_LOCAL_SPREAD_K", "6.0"))
 # cross-master fill must sit within K x the captures' noise of a simple vertical
 # estimate; 0 disables the check
 FILL_SANITY_K = float(os.environ.get("LDSTACK_FILL_SANITY_K", "8.0"))
+# picture-number progression: tolerance per frame, and how many consecutive
+# consistent frames confirm a genuine resync after a skip/seek
+SEQ_TOL = int(os.environ.get("LDSTACK_SEQ_TOL", "2"))
+SEQ_CONFIRM = int(os.environ.get("LDSTACK_SEQ_CONFIRM", "4"))
+# a capture's frame is dropped when its level is this many robust sigmas from
+# the consensus of the captures for that frame (catches seek/scan frames)
+FRAME_LEVEL_K = float(os.environ.get("LDSTACK_FRAME_LEVEL_K", "8.0"))
+DIFF_DOD = os.environ.get("LDSTACK_DIFF_DOD", "0") not in ("0", "", "no")
 
 
 def combine_fields(fields, masks, weights, sigma, diff_dod=False):
@@ -1085,6 +1124,22 @@ def _compute_frame(fd, P):
         if not present_fill:
             return None
         present_primary, present_fill = present_fill, []
+    # Reference selection: everything registers to this capture's field, so a
+    # garbage frame here poisons the whole combine. Take the capture closest to
+    # the consensus level rather than whichever sorts first, and drop captures
+    # whose frame is grossly inconsistent with the others (a seek/scan frame
+    # carrying a real picture number, but black or scrambled content).
+    if len(present_primary) >= 3:
+        means = {n: float(np.mean(fd[n].f0)) for n in present_primary}
+        vals = sorted(means.values())
+        cons = vals[len(vals) // 2]
+        spread = max(np.median([abs(v - cons) for v in vals]) * 1.4826, 250.0)
+        keep = [n for n in present_primary
+                if abs(means[n] - cons) <= FRAME_LEVEL_K * spread]
+        if len(keep) >= 2:
+            present_primary = keep
+        present_primary = sorted(present_primary,
+                                 key=lambda n: abs(means[n] - cons))
     ref_frame = fd[present_primary[0]]
     filled = 0
     out_fields = []
@@ -1116,7 +1171,10 @@ def _compute_frame(fd, P):
             return combine_fields(regs, masks, ws, sigs,
                                   diff_dod=diff_dod)
 
-        out, wsum = combine_set(present_primary, diff_dod=True)
+        # dropout-flagged pixels are never used, even when every capture
+        # flagged them (user instruction): leave them for the dropout
+        # corrector rather than trusting flagged samples
+        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD)
         allbad = (wsum == 0)            # dropout present in EVERY primary disc
         # ---- cross-master fill: patch master-level dropouts from alt master
         if present_fill and allbad.any():
