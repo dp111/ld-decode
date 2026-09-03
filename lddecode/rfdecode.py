@@ -620,6 +620,15 @@ class RFDecode:
         mtf_vals = compute_mtf(freq_array.copy(), cavframe=0)
         mtf_norm = np.clip(mtf_vals / mtf_at_crossover, 0.05, 1.0)
         SF["Finverse_mtf_base"] = 1.0 / mtf_norm
+        # EXPERIMENT: band-limit the chroma correction.  The servo sizes its
+        # strength to flatten the band at fsc, but this filter rises
+        # monotonically, so the same scalar over-corrects above fsc: at
+        # strength -1.6 it cuts 3.02 dB harder at 5.8 MHz than at fsc, which
+        # is what drives multiburst packet_6 from 16.2 to 7.3 IRE.  Taper the
+        # exponent to zero above the chroma band so the correction stays where
+        # it is measured.  W(fsc) == 1, so inverse_mtf_log_at_fsc is unchanged.
+        _w = np.clip((5.4e6 - freq_array) / (5.4e6 - 4.8e6), 0.0, 1.0)
+        SF["Finverse_mtf_window"] = _w
 
         fsc_bin = int(round(fsc_hz * self.blocklen / self.freq_hz))
         self.inverse_mtf_log_at_fsc = np.log(SF["Finverse_mtf_base"][fsc_bin])
@@ -648,7 +657,8 @@ class RFDecode:
 
         imtf_strength = DP.get("inverse_mtf_strength", 0.0)
         if imtf_strength != 0:
-            SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
+            SF["FVideo"] = SF["FVideo"] * (
+                SF["Finverse_mtf_base"] ** (imtf_strength * SF["Finverse_mtf_window"]))
 
         if DP.get("video_eq_auto"):
             SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq_auto"]
@@ -810,7 +820,8 @@ class RFDecode:
 
         imtf_strength = DP.get("inverse_mtf_strength", 0.0)
         if imtf_strength != 0:
-            SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
+            SF["FVideo"] = SF["FVideo"] * (
+                SF["Finverse_mtf_base"] ** (imtf_strength * SF["Finverse_mtf_window"]))
 
         SF["Fvideo_eq_auto"] = self.build_video_eq(
             DP.get("video_eq_auto"))
