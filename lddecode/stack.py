@@ -1331,8 +1331,27 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         raise SystemExit("could not determine video parameters from any capture")
     ra, ca = _active(vp)
     fh, fw = vp["fieldHeight"], vp["fieldWidth"]
-    step = max(1, len(head_buf) // sample)
-    info = analyse([fd for _, fd in head_buf[::step][:sample]], ra, ca)
+    # Sample for the quality / master analysis.  The head window is all a
+    # streaming .ldf source can offer, but the opening frames of a disc are a
+    # poor proxy for the side: on an AIV disc they are often a near-identical
+    # still, so inter-capture differences there collapse to almost nothing and
+    # the noise cutoff (4x the primary median) becomes hair-trigger.  NationalA
+    # dropped two good captures that way - 794 and 1385 against a 37-41
+    # baseline over frames 1-48, where all six measure 1015-1286 sampled across
+    # the disc.  Indexed .tbc sources are randomly accessible, so spread the
+    # sample over the whole side; fall back to the head window otherwise.
+    asample = None
+    if all(isinstance(s, TBCFrameSource) for s in sources):
+        keysets = [s.keys() for s in sources]
+        span = sorted(set.intersection(*keysets)) or sorted(set.union(*keysets))
+        if span:
+            pick = span[::max(1, len(span) // sample)][:sample]
+            asample = [{s.name: s.get(k) for s in sources if k in s.keys()}
+                       for k in pick]
+    if not asample:
+        step = max(1, len(head_buf) // sample)
+        asample = [fd for _, fd in head_buf[::step][:sample]]
+    info = analyse(asample, ra, ca)
     if masters:
         # explicit master grouping (e.g. from the disc PP/NP/AK marks); group 0
         # is the primary, the rest are alt-master fill sources.  Tokens are
