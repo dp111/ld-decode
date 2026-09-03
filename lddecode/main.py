@@ -304,6 +304,15 @@ def build_parser():
     )
 
     parser.add_argument(
+        "--vits_servos",
+        dest="vits_servos",
+        action="store_true",
+        default=False,
+        help="enable the VITS-driven 2T MTF and multiburst video-EQ servos "
+             "(off by default: both loops run away to their rails on the "
+             "Domesday captures, see decoder.py)",
+    )
+    parser.add_argument(
         "--no_chroma_dg",
         dest="chroma_dg",
         action="store_false",
@@ -551,6 +560,7 @@ def build_options(args):
         "write_pre_efm": args.prefm,
         "tbc_efm": args.tbc_efm,
         "field_reg": args.field_reg,
+        "vits_servos": args.vits_servos,
         "efm_demod": args.efm_demod,
         "efm_conf": args.efm_conf,
         "efm_eq_taps": args.efm_eq_taps,

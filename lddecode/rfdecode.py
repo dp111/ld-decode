@@ -818,7 +818,7 @@ class RFDecode:
             SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq_auto"]
 
         SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
-        self._build_video_batch()
+        self.build_video_rfft_stack()
 
         self.build_video_rfft_stack()
 

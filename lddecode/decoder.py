@@ -663,8 +663,19 @@ class LDdecode:
         # scaling, since the servo would just compensate the override
         # away; when no valid 2T pulse is available the b/w mapping is
         # the fallback.
+        # The VITS-driven servos (2T MTF, multiburst video EQ and the
+        # inverse-MTF ceiling they publish) are OFF by default here.  On the
+        # BBC Domesday captures both loops run away to their rails: measured
+        # on CommunityNorth ds8, mtf_level integrates to -1.000 and
+        # inverse_mtf_strength to -2.000, leaving burst at 15.4 IRE against
+        # the 21.43 spec, and it happens identically at -t 1 and -t 4 so it is
+        # not a stale-worker effect.  The lock-once burst calibration lands on
+        # 21.25 on the same material.  Enable with --vits_servos once the
+        # loops have been validated against the VITS conformance suite.
+        self.vits_servos = bool(extra_options.get("vits_servos", False))
         self.mtf_2t_servo = (
-            extra_options.get("MTF_level", 1.0) == 1.0
+            self.vits_servos
+            and extra_options.get("MTF_level", 1.0) == 1.0
             and extra_options.get("MTF_offset", 0) == 0
         )
         self._servo_samples = []   # (field readloc, level_used, pulse/bar)
@@ -706,7 +717,7 @@ class LDdecode:
         # Multiburst-driven video EQ servo (primary response reference
         # when a VITS multiburst line exists, with the 2T servo keeping
         # mtf_level as the fallback/second reference).
-        self.veq_servo = True
+        self.veq_servo = self.vits_servos
         # Anchor cap: the EQ never touches the chroma band (see the
         # multiburst EQ servo comment by the VEQ_ constants); fsc
         # differs by system.
