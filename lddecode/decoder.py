@@ -664,15 +664,20 @@ class LDdecode:
         # away; when no valid 2T pulse is available the b/w mapping is
         # the fallback.
         # The VITS-driven servos (2T MTF, multiburst video EQ and the
-        # inverse-MTF ceiling they publish) are OFF by default here.  On the
-        # BBC Domesday captures both loops run away to their rails: measured
-        # on CommunityNorth ds8, mtf_level integrates to -1.000 and
-        # inverse_mtf_strength to -2.000, leaving burst at 15.4 IRE against
-        # the 21.43 spec, and it happens identically at -t 1 and -t 4 so it is
-        # not a stale-worker effect.  The lock-once burst calibration lands on
-        # 21.25 on the same material.  Enable with --vits_servos once the
-        # loops have been validated against the VITS conformance suite.
-        self.vits_servos = bool(extra_options.get("vits_servos", False))
+        # inverse-MTF ceiling they publish) are ON by default.  They read as a
+        # runaway if you judge them by burst amplitude - on CommunityNorth ds8
+        # they drive mtf_level to -1.000 and inverse_mtf_strength to -2.000 and
+        # burst falls to 15.5 IRE against the 21.43 spec - but burst is one
+        # frequency and the loops are flattening the whole chroma band, which
+        # is the trade _publish_imtf_flat_band documents (DD86-DS2 inner asks
+        # ~-1.3, the multiburst measures -1.5).  Judged by upstream's own
+        # analysis/vits_conformance.py against IEC 60856 9.1.3 Figure 8 c),
+        # servos on is clearly right: multiburst packets 1-5 land within
+        # +/-2.4 IRE of the 30.0 nominal (1 fail overall) against a -13.8..+9.3
+        # spread with them off (4 fails).  Saturation ceiling 63.4% vs 78.6%.
+        # Known remaining defect: packet_6 (top of band) is worse with them on,
+        # 7.3 IRE vs 16.2, nominal 30 - it fails either way.
+        self.vits_servos = bool(extra_options.get("vits_servos", True))
         self.mtf_2t_servo = (
             self.vits_servos
             and extra_options.get("MTF_level", 1.0) == 1.0

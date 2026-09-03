@@ -304,13 +304,13 @@ def build_parser():
     )
 
     parser.add_argument(
-        "--vits_servos",
+        "--no_vits_servos",
         dest="vits_servos",
-        action="store_true",
-        default=False,
-        help="enable the VITS-driven 2T MTF and multiburst video-EQ servos "
-             "(off by default: both loops run away to their rails on the "
-             "Domesday captures, see decoder.py)",
+        action="store_false",
+        default=True,
+        help="disable the VITS-driven 2T MTF and multiburst video-EQ servos "
+             "(on by default; they flatten the multiburst response markedly "
+             "on Domesday - see decoder.py)",
     )
     parser.add_argument(
         "--no_chroma_dg",
