@@ -718,7 +718,27 @@ class LDdecode:
         # units per level unit; deliberately below the measured slope
         # (~1.7 Louvre PAL, ~0.85 he010 NTSC) so the burst tracking
         # trims the rest instead of overshooting.
-        self.mtf_deemp_feedforward = 1.2 if system == "PAL" else 0.6
+        # Everything below that is counted in inverse-MTF *strength* units is
+        # only worth a fixed number of dB for one particular
+        # Finverse_mtf_base: strength is an exponent on that curve.  The
+        # tuned values were calibrated against the curve the MTF model
+        # produced with laser 780 / NA 0.52 / 30 rev/s, whose log-gain at fsc
+        # is IMTF_REF_LOG_AT_FSC.  Scale them by how much the curve in force
+        # actually applies, so each keeps its calibrated meaning in dB
+        # whatever the model says.  The factor is 1.0 for that reference
+        # curve, so this changes nothing unless the model does.
+        self.imtf_unit = self.IMTF_REF_LOG_AT_FSC / (
+            getattr(self.rf, "inverse_mtf_log_at_fsc", 0.0)
+            or self.IMTF_REF_LOG_AT_FSC)
+        self.mtf_deemp_feedforward = (1.2 if system == "PAL" else 0.6) * self.imtf_unit
+        # dB-denominated quantities (IMTF_CUT_ENGAGE_DB, VEQ_DEADBAND_DB) are
+        # already model-independent and are deliberately not scaled.
+        self.imtf_strength_limit = self.IMTF_STRENGTH_LIMIT * self.imtf_unit
+        self.imtf_ceiling_deadband = self.IMTF_CEILING_DEADBAND * self.imtf_unit
+        #: "any non-trivial strength" and the tracking trim dead-band
+        #: (~2% chroma), both strength-counted
+        self.imtf_adopt_floor = 0.02 * self.imtf_unit
+        self.imtf_track_deadband = 0.05 * self.imtf_unit
         # Multiburst-driven video EQ servo (primary response reference
         # when a VITS multiburst line exists, with the 2T servo keeping
         # mtf_level as the fallback/second reference).
@@ -1279,6 +1299,9 @@ class LDdecode:
     #: +4.0 dB at 4.8 - is about -1.5, so this leaves headroom without
     #: letting a mismeasured field wind the band away.
     IMTF_STRENGTH_LIMIT = 2.0
+    #: log-gain at fsc of the Finverse_mtf_base the strength-counted constants
+    #: above were tuned against; see imtf_unit in __init__
+    IMTF_REF_LOG_AT_FSC = 0.3101
 
     #: How hot, in dB at the subcarrier, the multiburst must find the
     #: chroma band before it may spend the negative half of that limit.
@@ -1498,7 +1521,7 @@ class LDdecode:
             return None
         if flat < 0.0 and not self._imtf_cut_engaged(flat):
             return 0.0
-        return float(max(-self.IMTF_STRENGTH_LIMIT, flat))
+        return float(max(-self.imtf_strength_limit, flat))
 
     def _imtf_cut_engaged(self, flat):
         """Whether a negative flat-band strength is big enough to act on.
@@ -1717,7 +1740,7 @@ class LDdecode:
             return False
         if (self._imtf_flat_band is not None
                 and abs(flat_band - self._imtf_flat_band)
-                < self.IMTF_CEILING_DEADBAND):
+                < self.imtf_ceiling_deadband):
             return False
         # Rate limit, mirroring the EQ's: warmup is exempt because it
         # needs to converge before the first frame is written, and after
@@ -1969,7 +1992,7 @@ class LDdecode:
             # plain 0.0 floor would walk a negative strength back up to
             # zero on the next MTF adoption and undo the verdict.
             s = np.clip(current + self.mtf_deemp_feedforward * delta,
-                        min(0.0, current), self.IMTF_STRENGTH_LIMIT)
+                        min(0.0, current), self.imtf_strength_limit)
             self.rf.DecoderParams["inverse_mtf_strength"] = float(s)
             self.rf.recompute_fvideo()
             if self._job_engine is not None:
@@ -2061,7 +2084,7 @@ class LDdecode:
         # below.
         estimate = float(np.clip(
             current + np.log(expected / measured) / log_base,
-            0.0, self.IMTF_STRENGTH_LIMIT
+            0.0, self.imtf_strength_limit
         ))
 
         # Burst amplitude cannot tell a channel that lost the subcarrier
@@ -2077,10 +2100,10 @@ class LDdecode:
             # A first calibration adopts any non-trivial strength, in
             # either direction: a multiburst ceiling can make that first
             # verdict a cut.
-            if abs(estimate) < 0.02:
+            if abs(estimate) < self.imtf_adopt_floor:
                 return False
         elif (len(self._deemp_burst_samples) < 3
-                or np.abs(estimate - current) < 0.05):
+                or np.abs(estimate - current) < self.imtf_track_deadband):
             return False
 
         capped = "" if ceiling is None or estimate < ceiling else (
