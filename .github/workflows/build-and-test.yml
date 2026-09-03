@@ -12,9 +12,48 @@ on:
   release:
     types: [created, published]
 
+# End to end this workflow is a two-hour unit + functional + packaging run, so
+# a superseded one is two hours of runner time spent on a commit nobody is
+# waiting for any more.  Cancel those - but never on the default branch or on a
+# tag, where the run is what produces the release artefacts and must finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
+  # The fast gate.  Everything below waits on it, so a broken unit lane fails
+  # in a couple of minutes rather than after a two-hour decode run.
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      # Deliberately without submodules.  The unit lane is hermetic by
+      # contract, and checking out a tree with no testdata/ is what keeps that
+      # honest: a suite that started reading a capture would fail here rather
+      # than pass quietly on a developer's populated checkout.
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+
+      # --strict-markers is also in pyproject.toml; repeated here so the gate
+      # does not silently weaken if that setting is ever edited.
+      #
+      # Coverage is reported, not enforced.  The number understates the
+      # layer-0 modules badly - dsp.py, efm_pll.py, pulses.py and filters.py
+      # run as compiled Numba code, which coverage.py cannot see into - so it
+      # is a trend line to watch, not a target to chase.  See TESTING.md.
+      - name: Run the hermetic unit lane (Nix)
+        timeout-minutes: 20
+        run: |
+          nix develop .#default -c bash -lc '
+            python -m pytest -q tests/unit --strict-markers \
+              --cov=lddecode --cov-report=term-missing
+          '
+
   functional-tests:
     name: Functional Tests
+    needs: unit-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +63,9 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v25
 
+      # Everything but the VITS radius sweep, which vits-conformance below
+      # runs as its own job.  The two lanes partition the suite on the "vits"
+      # label, so nothing is decoded twice and the two run side by side.
       - name: Run functional tests (Nix)
         timeout-minutes: 120
         run: |
@@ -31,26 +73,77 @@ jobs:
             mkdir -p build/testout
             cd build
             cmake -DCMAKE_BUILD_TYPE=Release ..
-            ctest --output-on-failure -V
+            ctest -LE vits --output-on-failure -V
           '
+
+  # VITS conformance across disc radius: thirteen cuts from four discs,
+  # decoded and judged against testdata/vits-manifest.json and the known
+  # deviations in analysis/vits_known_deviations.toml.  It is its own job
+  # because its output is a measurement table a developer reads, not a log -
+  # see the step summary below - and because a decoder fault that only shows
+  # at one radius should name itself rather than arrive as one red line in a
+  # two-hour functional run.
+  vits-conformance:
+    name: VITS Conformance
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+
+      - name: Run the VITS conformance sweep (Nix)
+        timeout-minutes: 90
+        run: |
+          nix develop .#default -c bash -lc '
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            ctest --test-dir build -L vits --output-on-failure
+          '
+
+      # Written whether the sweep passed or failed: a red run is exactly when
+      # the measured values and the bands they missed are wanted, and the
+      # alternative is downloading the artefact below to find out.
+      - name: Summarise the measurements
+        if: always()
+        run: |
+          shopt -s nullglob
+          reports=(build/testout/*.conformance.json)
+          if [ ${#reports[@]} -eq 0 ]; then
+            echo "No VITS conformance reports were produced." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          nix develop .#default -c python3 analysis/vits_summary.py \
+            "${reports[@]}" --output "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the conformance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vits-conformance-reports
+          path: build/testout/*.conformance.json
+          if-no-files-found: warn
 
   build-appimage:
     name: Build Linux AppImage
-    needs: functional-tests
+    needs: [functional-tests, vits-conformance]
     permissions:
       contents: write
     uses: ./.github/workflows/appimage.yml
 
   build-macos-dmg:
     name: Build macOS DMG
-    needs: functional-tests
+    needs: [functional-tests, vits-conformance]
     permissions:
       contents: write
     uses: ./.github/workflows/macos-dmg.yml
 
   build-windows-zip:
     name: Build Windows ZIP
-    needs: functional-tests
+    needs: [functional-tests, vits-conformance]
     permissions:
       contents: write
     uses: ./.github/workflows/windows-zip.yml

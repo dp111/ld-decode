@@ -3,10 +3,12 @@
 Split verbatim out of core.py.
 """
 
+import copy
 import itertools
 from dataclasses import dataclass, field as dc_field
 
 import numpy as np
+from scipy import fft as spfft
 from scipy import interpolate
 
 from . import utils_logging as logs
@@ -28,6 +30,8 @@ from .dsp import (
     nb_round,
     nb_std,
     phase_distance,
+    refine_hsync_zcs,
+    refine_pilot_zcs,
     rms,
     scale,
     scale_field,
@@ -77,6 +81,215 @@ class FieldAnchor:
 
 
 # The Field class contains common features used by NTSC and PAL
+#: Luminance level, in IRE, at which the chroma differential-gain
+#: correction leaves gain untouched.  The multiburst-driven servos
+#: calibrate the chroma band on signals riding the 50 IRE grey pedestal
+#: (the multiburst line's own pedestal, and the chroma bars beside it),
+#: so that is the level whose chroma gain is already right; the
+#: correction equalises every other luminance level to it.  Anchoring at
+#: blanking instead was measured to pull the mid-luminance chroma bars
+#: 15% low on BBC Domesday DD86-DS2 - correct differential gain, wrong
+#: absolute gain.
+CHROMA_DG_ANCHOR_IRE = 50.0
+
+#: Zero-phase window pairs for the correction, cached per (length, fs):
+#: a bandpass around the colour subcarrier and the low-pass that reads
+#: the luminance the chroma is riding on.
+_chroma_dg_windows = {}
+
+
+def _chroma_dg_window(length, fs_mhz):
+    key = (length, round(fs_mhz, 6))
+    got = _chroma_dg_windows.get(key)
+    if got is not None:
+        return got
+    freqs = np.fft.rfftfreq(length, 1.0 / fs_mhz)
+    fsc = fs_mhz / 4.0
+
+    def raised(low, high, transition):
+        w = np.zeros(len(freqs))
+        w[(freqs >= low) & (freqs <= high)] = 1.0
+        for edge, sign in ((low, -1.0), (high, 1.0)):
+            t = (freqs - edge) * sign
+            sel = (t > 0) & (t < transition)
+            w[sel] = 0.5 * (1.0 + np.cos(np.pi * t[sel] / transition))
+        return w
+
+    got = (raised(fsc - 1.1, fsc + 1.1, 0.3), raised(-1.0, 1.0, 0.4))
+    _chroma_dg_windows[key] = got
+    return got
+
+
+def _correct_chroma_vs_luma(ire, fs_mhz, slope, phase):
+    """Core of the differential gain/phase corrector, in IRE.
+
+    out = composite + Re[(G(luma) - 1) * chroma_analytic]
+    G(L) = (1 + slope * ANCHOR) / (1 + slope * max(L, 0))
+           * exp(-1j * radians(phase) * max(L, 0))
+
+    With phase == 0 the gain is real and the cheaper real-band path is
+    taken, reproducing the pure differential gain corrector exactly.
+    The phase term rotates chrominance by -phase*luma degrees, anchored
+    at blanking: burst sits at blanking level, so it is never rotated
+    and stays the hue reference every downstream chroma decoder locks
+    to; equalising every level's phase to the burst's is what zero
+    differential phase means.
+    """
+    # scipy's pocketfft returns the same bits as numpy's here but runs
+    # its Bluestein path twice as fast - and one of the two PAL field
+    # lattice lengths (354689) is prime, so every transform takes it.
+    bandpass, lowpass = _chroma_dg_window(len(ire), fs_mhz)
+    spectrum = spfft.rfft(ire)
+    luma = spfft.irfft(spectrum * lowpass, len(ire))
+    level = np.clip(luma, 0.0, None)
+    gain = ((1.0 + slope * CHROMA_DG_ANCHOR_IRE)
+            / (1.0 + slope * level))
+    if phase == 0.0:
+        chroma = spfft.irfft(spectrum * bandpass, len(ire))
+        return ire + (gain - 1.0) * chroma
+
+    # The rotation needs the chroma band's analytic signal: positive
+    # frequencies only, doubled (DC and Nyquist stay, though the
+    # bandpass has removed both anyway).
+    n = len(ire)
+    half = spectrum * bandpass
+    full = np.zeros(n, dtype=np.complex128)
+    full[: len(half)] = half
+    full[1 : (n + 1) // 2] *= 2.0
+    chroma_analytic = spfft.ifft(full)
+    g = gain * np.exp(-1j * np.deg2rad(phase) * level)
+    return ire + np.real((g - 1.0) * chroma_analytic)
+
+
+def apply_chroma_dg_correction(hz_samples, rf, slope, phase=0.0):
+    """Equalise chroma gain and phase across luminance on a 4fsc stream.
+
+    The FM channel scales and rotates recovered chrominance by the
+    luminance it rides on - differential gain and differential phase -
+    because the carrier's sidebands sweep the RF filter chain's tilts as
+    luminance moves the carrier, one-sidedly inward of mid-radius where
+    the disc's own optical MTF has taken the upper sideband.  The
+    luminance staircase stays linear while it happens (the distortion
+    lives only where the sidebands sit far from the carrier), so no
+    memoryless transfer curve can undo it; what can is the classic
+    corrector topology _correct_chroma_vs_luma implements.
+
+    `slope` is the measured fractional chroma-gain change per IRE of
+    luminance and `phase` the measured chroma rotation in degrees per
+    IRE (both from decoder.measure_vits_dg_staircase); the correction is
+    exact for the linear dependence the staircase measures.  The
+    subcarrier bandpass and the luminance low-pass are zero-phase and
+    G(blanking-and-below) is a constant, so luminance levels and sync
+    are untouched; burst gains the same factor as all other
+    blanking-level chrominance and is never rotated, which is what zero
+    differential gain and phase mean.
+
+    Applied at write time only (downscale_cvbs for the CVBS output,
+    apply_chroma_dg_correction_output for the TBC output): every servo
+    measures the uncorrected signal, so none of them closes a loop
+    through this.
+
+    hz_samples is the demodulated stream in Hz on the 4fsc lattice;
+    returns the corrected stream, same dtype domain (float).
+    """
+    dp = rf.DecoderParams
+    ire0, hz_ire = dp["ire0"], dp["hz_ire"]
+    ire = (np.asarray(hz_samples, dtype=np.float64) - ire0) / hz_ire
+    ire = _correct_chroma_vs_luma(ire, rf.SysParams["outfreq"], slope, phase)
+    return (ire * hz_ire + ire0).astype(np.float32)
+
+
+def apply_chroma_dg_correction_output(picture, field, slope, phase=0.0):
+    """The same correction on output-unit (uint16 TBC) samples.
+
+    The TBC picture is downscaled on worker threads before the servo's
+    estimate for the field is even pooled, so the correction cannot live
+    in downscale(); it is applied here, by the parent at write time, to
+    a copy - field.dspicture stays uncorrected and every servo keeps
+    measuring the raw decode.
+    """
+    samples = np.asarray(picture)
+    if samples.dtype != np.uint16:
+        samples = np.frombuffer(samples, dtype=np.uint16)
+    ire = field.output_to_ire(samples.astype(np.float64))
+    ire = _correct_chroma_vs_luma(
+        ire, field.rf.SysParams["outfreq"], slope, phase)
+    out = ((ire - field.rf.DecoderParams["vsync_ire"]) * field.out_scale
+           + field.rf.SysParams["outputZero"] + 0.5)
+    return np.clip(out, 0, 65535).astype(np.uint16)
+
+
+def chroma_dg_output_key(rf, slope, phase):
+    """Everything apply_chroma_dg_correction_output's result depends on
+    beyond the picture: the servo's estimate and the AGC's vsync level
+    (out_scale and outputZero are per-system constants).  A worker
+    stamps the key it corrected under on the field (chroma_dg_applied);
+    the writer compares it with the current one."""
+    return (float(slope), float(phase), float(rf.DecoderParams["vsync_ire"]))
+
+
+def chroma_dg_output_picture(picture, field, slope, phase, tolerance=None):
+    """The TBC picture to write for a field under the current chroma DG
+    estimate, applying apply_chroma_dg_correction_output only when the
+    field does not already carry it.
+
+    A field decoded in a worker process may arrive with `picture`
+    already corrected (field.chroma_dg_applied records the key it was
+    corrected under, see chroma_dg_output_key); that copy is used as is
+    while the key is still current, and discarded for a fresh correction
+    of the raw field.dspicture when the servo has since adopted new
+    values - the same computation the serial decode performs at this
+    point, so the output does not depend on which path produced it.
+
+    tolerance, a (slope, phase) pair in per-IRE units, is the tolerant
+    speculation mode's allowance: a correction whose slope and phase are
+    each within it of the current estimate (and whose vsync level is
+    the same) is kept rather than redone, as an in-flight field decoded
+    under a slightly stale MTF level is.  None demands the exact key.
+    Returns picture itself when no correction applies."""
+    if field is None:
+        return picture
+    key = chroma_dg_output_key(field.rf, slope, phase)
+    applied = getattr(field, "chroma_dg_applied", None)
+    if applied is not None and applied != key:
+        close_enough = (
+            tolerance is not None
+            and applied[2] == key[2]
+            and abs(applied[0] - key[0]) <= tolerance[0]
+            and abs(applied[1] - key[1]) <= tolerance[1]
+        )
+        if not close_enough:
+            picture = field.dspicture
+            applied = None
+    if applied is None and (slope != 0.0 or phase != 0.0):
+        picture = apply_chroma_dg_correction_output(picture, field, slope, phase)
+    return picture
+
+
+def field_output_view(field):
+    """A shallow copy of a committed field bound to a snapshot of the
+    decoder parameters, for output work that runs after the commit.
+
+    Every write-time computation reads levels and servo estimates
+    through field.rf.DecoderParams (hz_to_output, the chroma DG
+    corrector, downscale_cvbs), and in the serial decode that read
+    happens the moment the field commits.  When the output stage trails
+    the commit loop (OrderedOutputLane), the live parameters may have
+    moved on by the time it runs, so the view carries the values as
+    they were at commit: a copy of the RFDecode with its own copy of
+    DecoderParams.  The field's sample arrays are shared, not copied,
+    and the original field stays bound to the live decoder for the
+    servos that keep measuring it.
+    """
+    if field is None:
+        return None
+    view = copy.copy(field)
+    rf = copy.copy(field.rf)
+    rf.DecoderParams = dict(field.rf.DecoderParams)
+    view.rf = rf
+    return view
+
+
 class Field:
     burst_lines = (11, 264)  # NTSC default
     burst_max_ire = None  # PAL overrides to 30
@@ -97,6 +310,8 @@ class Field:
     ):
         self.rawdata = decode["input"]
         self.data = decode
+        # set by prepare_transport(keep_demod=True) once data is stripped
+        self.transport_demod = None
         self.initphase = initphase  # used for seeking or first field
         self.readloc = readloc
 
@@ -159,7 +374,17 @@ class Field:
 
         self.valid     = True
 
-        self.out_scale = np.double(self.output_white - self.output_black) / (
+        self.out_scale = self.compute_out_scale()
+
+    def compute_out_scale(self):
+        """Output code values per IRE.
+
+        output_black/output_white are the codes for vsync_ire and 100 IRE
+        (not for black), so the span they cover is 100 - vsync_ire IREs.
+        Computed at process() time rather than in __init__ because the AGC
+        rewrites DecoderParams["vsync_ire"] between fields.
+        """
+        return np.double(self.output_white - self.output_black) / (
             100 - self.rf.DecoderParams["vsync_ire"]
         )
 
@@ -1166,7 +1391,7 @@ class Field:
         "anchor",
     )
 
-    def prepare_transport(self):
+    def prepare_transport(self, keep_demod=False):
         """Make a fully processed (and downscaled) field small and
         picklable for return from a worker process.
 
@@ -1175,8 +1400,19 @@ class Field:
         are dropped.  What survives: dspicture, dsaudio, efmout,
         linelocs, and scalar decode results.  The receiver must rebind
         .rf before use.
+
+        keep_demod additionally retains a contiguous float32 copy of the
+        demodulated video (data["video"]["demod"], ~4 MB per PAL field)
+        as transport_demod: the PAL CVBS writer resamples the field onto
+        the 4fsc frame lattice at write time, under a burst-lock shift
+        that is only known in commit order, so that resample cannot run
+        in the worker (see downscale_cvbs).
         """
         self.anchor_out = FieldAnchor.from_field(self)
+        if keep_demod and self.data is not None:
+            self.transport_demod = np.ascontiguousarray(
+                self.data["video"]["demod"], dtype=np.float32
+            )
 
         for attr in self.TRANSPORT_STRIP:
             if hasattr(self, attr):
@@ -1585,7 +1821,9 @@ class FieldPAL(Field):
             for l in range(0, n):
                 adjfreq = self.rf.freq
                 if l > 1:
-                    adjfreq /= (linelocs[l] - linelocs[l - 1]) / self.rf.linelen
+                    spacing = (linelocs[l] - linelocs[l - 1]) / self.rf.linelen
+                    if spacing > 0.1:
+                        adjfreq /= spacing
 
                 plen[l] = (adjfreq / self.rf.SysParams["pilot_mhz"]) / 2
 
@@ -1769,13 +2007,31 @@ class FieldPAL(Field):
         locs = spl(pos)
         wow = spl(pos, 1)
 
+        # A field back from a worker process has had its sample buffers
+        # stripped; the demod survives as transport_demod when the
+        # worker was told to keep it (prepare_transport(keep_demod=True)).
+        if self.data is not None:
+            demod = self.data["video"]["demod"].astype(np.float32, copy=False)
+        elif self.transport_demod is not None:
+            demod = self.transport_demod
+        else:
+            raise ValueError(
+                "downscale_cvbs needs the field's demodulated video: "
+                "the field was transported without keep_demod"
+            )
+
         out = np.zeros(len(pos), dtype=np.float32)
         scale_positions(
-            self.data["video"]["demod"].astype(np.float32, copy=False),
+            demod,
             out, locs, wow, self.rf.downscale_sinc_lut,
             frame_samples / 625.0,
             wow_level_adjust_smoothing=self.wow_level_adjust_smoothing,
         )
+
+        slope = float(self.rf.DecoderParams.get("chroma_dg_slope", 0.0))
+        phase = float(self.rf.DecoderParams.get("chroma_dg_phase", 0.0))
+        if slope != 0.0 or phase != 0.0:
+            out = apply_chroma_dg_correction(out, self.rf, slope, phase)
 
         return self.hz_to_output(out)
 

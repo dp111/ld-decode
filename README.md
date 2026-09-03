@@ -78,15 +78,30 @@ ahead of it.  **Output is bit-identical for any `-t` value** — this is
 asserted by the test suite — so there is no quality trade-off, only
 memory (~150–200 MB per worker process).  Steady-state throughput on a
 36-core machine: ~2.4 fields/s serial → ~13 fields/s at `-t 12`
-(≈5.7×).  Modes that consume raw field data at write time (`--RF-TBC`,
-AC3, `--cvbs`) automatically use block-level parallelism instead
-(~4×); `--demod-threads-only` keeps everything in threads (slower,
-lightest on memory).
+(≈5.7×).  Modes that consume raw RF samples at write time (`--RF-TBC`,
+AC3) automatically use block-level parallelism instead (~4×);
+`--demod-threads-only` keeps everything in threads (slower, lightest
+on memory).  The TBC output's chroma differential-gain correction is
+applied by the workers under the servo estimate current at dispatch
+(the writer re-applies it only if the estimate has since moved), so the
+committing thread stays light.  PAL CVBS output resamples each field
+at write time (its burst lock runs in commit order), so workers ship
+the demodulated video back with the field (~4 MB each).  Everything
+that happens to a field after it commits - the EFM demodulation, the
+`.tbc.db` row, CVBS frame assembly and the file writes - runs on a
+separate output thread that trails the committer by up to 16 fields,
+each field carrying a snapshot of the decoder parameters it committed
+under, so the output is the same bytes the inline write would have
+produced; a stale chroma DG correction is redone on a small pool
+ahead of that thread, and the two fields of a PAL CVBS frame resample
+concurrently.
 
 By default, minor MTF calibration drift is tolerated: fields decoded
 ahead under an MTF level within 0.10 of the current one are kept
 (the visual difference of a dead-band step is fractions of a dB at
-high frequencies).  `--exact-speculation` instead discards everything
+high frequencies), and likewise a chroma DG correction applied by a
+worker within two servo dead-bands of the current estimate (~1.5% of
+chroma gain at 100 IRE).  `--exact-speculation` instead discards everything
 decoded under old parameters, keeping the output bit-exact with `-t 1`
 even across mid-run calibration changes.  Every speculation reject and
 parameter event is recorded with its cause in the `speculation_log`
@@ -94,15 +109,19 @@ table of the `.tbc.db` (and as DEBUG lines in the decode log).
 
 ## CVBS output mode
 
-`ld-decode --cvbs ...` writes spec-compliant CVBS output instead of the
-`.tbc` video output (see `cvbs-file-format-specification/`):
+ld-decode writes spec-compliant CVBS output by default (see
+`cvbs-file-format-specification/`); `--tbc` selects the legacy
+`.tbc`/`.tbc.db` video output instead:
 
-- `<out>.composite` — `CVBS_U16_4FSC` sample data in whole frames
-  (NTSC: 477,750 samples/frame; PAL: 709,379), ld-decode line convention
+- `<out>.cvbs` — sample data in whole frames (NTSC: 477,750
+  samples/frame; PAL: 709,379), ld-decode line convention
   (the layout decode-orc's `cvbs_source` reader expects)
 - `<out>.meta` — the spec's SQLite metadata; the signal state is measured
-  and declared honestly (`STANDARD_TBC_LOCKED` when the burst-vs-lattice
-  phase is stable within 3°, else `STANDARD_TBC_UNLOCKED`)
+  and declared honestly (`STANDARD_STABLE_LOCKED` when the
+  burst-vs-lattice phase is stable within 3°, else
+  `STANDARD_STABLE_UNLOCKED`), and `sequence_continuous` is declared from
+  the decode (TRUE only when no field was dropped and the fieldPhaseID
+  progression never broke)
 - `<out>_audio_00.wav` — spec WAV analog audio, frame-aligned with the
   written frames, with an honest `audio_locked` flag (PAL is frame-locked
   at 44100 Hz; NTSC is locked only with `--ntsc_audio_rate`)
@@ -113,14 +132,14 @@ table of the `.tbc.db` (and as DEBUG lines in the decode log).
 
 Note that **PAL 4fsc is not line-locked**: a line is 1135.0064 samples
 and the sampling lattice slips 4 samples per frame, so the PAL
-`.composite` is produced by a separate non-orthogonal resampler and its
+`.cvbs` is produced by a separate non-orthogonal resampler and its
 timing differs fundamentally from the line-locked `.tbc` raster.  PAL
 output is burst-anchored: the lattice constraint (sampling at 45° steps
 to +U) is defined mod 90°, and 90° of subcarrier is exactly one lattice
 sample, so the anchor is a global sub-sample time shift that tracks the
 disc's Sc/H drift.  The file starts on NTSC colour frame A / PAL
 sequence frame 1 (fieldPhaseID 1).
-`scripts/cvbs_verify.py <out>.composite` checks an output file against
+`analysis/cvbs_verify.py <out>.cvbs` checks an output file against
 the specification (frame sizing, protected values, the 0H sync lattice
 including the PAL slip, burst lock, extension sidecars, metadata, and
 audio).

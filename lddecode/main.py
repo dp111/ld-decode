@@ -11,13 +11,13 @@ from lddecode.fileio import ldf_pipe, make_loader, parse_frequency
 from lddecode.utils_logging import init_logging
 
 
-def main(args=None):
-    # Handle --version early before argparse requires positional arguments
-    check_args = args if args is not None else sys.argv[1:]
-    if "--version" in check_args or "-v" in check_args:
-        from lddecode import __version__
-        print(__version__)
-        sys.exit(0)
+def build_parser():
+    """The ld-decode command line, as an argparse parser.
+
+    Separate from main() so the flag definitions can be exercised without
+    starting a decode; build_options() maps what it returns onto the
+    decoder's option dictionaries.
+    """
     options_epilog = """FREQ can be a bare number in MHz, or a number with one of the case-insensitive suffixes Hz, kHz, MHz, GHz, fSC (meaning NTSC) or fSCPAL."""
     parser = argparse.ArgumentParser(
         description="Extracts audio and video from raw RF laserdisc captures",
@@ -84,8 +84,22 @@ def main(args=None):
         dest="cvbs",
         action="store_true",
         default=False,
-        help="write spec-compliant CVBS output (<out>.composite/.meta and "
-        "spec WAV audio) instead of the .tbc video output",
+        help="write spec-compliant CVBS output (<out>.cvbs/.meta and "
+        "spec WAV audio) instead of .tbc",
+    )
+    parser.add_argument(
+        "--tbc",
+        dest="cvbs",
+        action="store_false",
+        help="write .tbc/.tbc.db video output (the default here)",
+    )
+    parser.add_argument(
+        "--cvbs-encoding",
+        dest="cvbs_encoding",
+        choices=["CVBS_U10_4FSC", "CVBS_U16_4FSC"],
+        default=None,
+        help="sample encoding preset for CVBS output "
+        "(default: CVBS_U10_4FSC for PAL, CVBS_U16_4FSC for NTSC)",
     )
     # parser.add_argument('-c', '--cut', dest='cut', action='store_true', help='cut (to r16) instead of decode')
     parser.add_argument(
@@ -110,7 +124,7 @@ def main(args=None):
         type=int,
         default=0,
         help="worker threads for block demodulation "
-             "(0 = auto (default): min(cores - 2, 10); 1 = serial)",
+             "(0 = auto (default): min(physical cores - 2, 10); 1 = serial)",
     )
     parser.add_argument(
         "--demod-threads-only",
@@ -126,7 +140,7 @@ def main(args=None):
         default=False,
         help="with -t: discard fields decoded ahead under old decoder parameters "
              "on any parameter change (bit-exact with -t 1); by default minor "
-             "MTF drift is tolerated for throughput",
+             "MTF drift and chroma DG trims are tolerated for throughput",
     )
     parser.add_argument(
         "--noAGC", dest="noAGC", action="store_true", default=False, help="Disable AGC"
@@ -160,6 +174,40 @@ def main(args=None):
         help="Time-base-correct the EFM waveform onto the video line time-base "
         "before the EFM PLL (removes wow/flutter drift; aligns EFM across "
         "captures of the same disc for pre-PLL stacking)",
+    )
+    parser.add_argument(
+        "--efm_demod",
+        "--efm-demod",
+        dest="efm_demod",
+        choices=["pll", "timing"],
+        default="timing",
+        help="EFM demodulator: 'timing' (default) is the symbol-rate "
+        "timing-recovery demodulator (per-channel-bit Mueller & Muller loop "
+        "with bit-domain frame sync); 'pll' is the previous zero-crossing "
+        "run-length PLL",
+    )
+    parser.add_argument(
+        "--efm_conf",
+        dest="efm_conf",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Confidence-packed .efm output for .tbc mode (4-bit doubt, "
+        "0 = trusted, in the high nibble of each T-value byte).  'auto' "
+        "(default) and 'off' keep the plain .efm working with legacy "
+        "tools.  CVBS output always packs (the EFM extension format "
+        "defines the byte layout), so this option only affects .tbc "
+        "output.  LDDECODE_EFM_EMITCONF=1/0 is the environment "
+        "equivalent of on/off",
+    )
+    parser.add_argument(
+        "--efm_eq_taps",
+        dest="efm_eq_taps",
+        type=int,
+        default=0,
+        help="Experimental: tap count for the timing demodulator's "
+        "decision-directed adaptive equaliser (0 = off, the default; odd "
+        "3..15 enables it).  Measured neutral-to-harmful on the validation "
+        "captures - see docs/technical/efm-decoding.md before using",
     )
     parser.add_argument(
         "--disable_analog_audio",
@@ -256,6 +304,16 @@ def main(args=None):
     )
 
     parser.add_argument(
+        "--no_chroma_dg",
+        dest="chroma_dg",
+        action="store_false",
+        default=True,
+        help="Disable the chroma differential gain/phase servo (measured "
+             "from the VITS modulated staircase, corrected on the TBC and "
+             "CVBS outputs at write time; PAL only)",
+    )
+
+    parser.add_argument(
         "--NTSC_color_notch_filter",
         "-N",
         dest="NTSC_color_notch_filter",
@@ -269,7 +327,9 @@ def main(args=None):
         dest="V4300D_notch_filter",
         action="store_true",
         default=False,
-        help="LD-V4300D PAL/digital audio captures: remove spurious ~8.5mhz signal",
+        help="LD-V4300D PAL/digital audio captures: remove the spurious "
+        "~8.5mhz digital-audio clock signal (legacy alias for "
+        "--V4300D_coherent_subtract)",
     )
 
     parser.add_argument(
@@ -277,9 +337,9 @@ def main(args=None):
         dest="V4300D_coherent_subtract",
         action="store_true",
         default=False,
-        help="Experimental alternative to --V4300D_notch_filter: coherently "
-        "estimate and time-domain subtract the ~8.5mhz LD-V4300D spur (also "
-        "removes its spectral-leakage skirts). PAL only.",
+        help="Coherently estimate and subtract the LD-V4300D's 8.4672mhz "
+        "digital-audio clock spur and its +-88.2khz satellites. "
+        "Self-disabling on captures without the spur. PAL only.",
     )
 
     parser.add_argument(
@@ -287,10 +347,9 @@ def main(args=None):
         dest="V4300D_no_defer",
         action="store_true",
         default=False,
-        help="With --V4300D_coherent_subtract: apply the spur filter from the "
-        "first block instead of deferring until sync acquisition.  Keeps "
-        "parallel demod (deferring forces serial), but can break cold-start "
-        "sync on captures with a flat lead-in.",
+        help="Obsolete; accepted for compatibility and ignored.  The spur "
+        "filter no longer defers (its no-video guard makes it safe from the "
+        "first block) and parallel demod is always available.",
     )
 
     parser.add_argument(
@@ -440,12 +499,16 @@ def main(args=None):
         help="Write the input portion being decoded to a .ldf file for bug reporting",
     )
 
-    args = parser.parse_args(args)
-    # print(args)
-    filename = args.infile
-    outname = args.outfile
-    firstframe = args.start
-    req_frames = args.length
+    return parser
+
+
+def build_options(args):
+    """Map parsed arguments onto the decoder's option dictionaries.
+
+    Pure apart from the fatal exits on contradictory flags: everything
+    here is decided by the command line alone, before any file is opened,
+    so the mapping can be checked without running a decode.
+    """
     vid_standard = "PAL" if args.pal else "NTSC"
 
     if args.pal and (args.ntsc or args.ntscj):
@@ -468,26 +531,15 @@ def main(args=None):
                 file=sys.stderr,
             )
 
-    # Safety check: ensure --write-test-ldf doesn't overwrite the input file
-    if args.write_test_ldf is not None:
-        # os (and os.path) is imported at module scope; a local re-import
-        # here would make `os` function-local and shadow it everywhere else
-        # in main(), including the auto-threads calculation above.
-        input_path = os.path.abspath(filename)
-        output_path = os.path.abspath(args.write_test_ldf)
-        if input_path == output_path:
-            print("ERROR: --write-test-ldf output file cannot be the same as input file", file=sys.stderr)
-            print(f"Input:  {filename}", file=sys.stderr)
-            print(f"Output: {args.write_test_ldf}", file=sys.stderr)
-            sys.exit(1)
-
-    audio_pipe = None
-
     threads = args.threads
     if threads == 0:
         # auto (the default): leave 2 cores for the OS / main decode loop,
-        # capped at 10 (diminishing returns past that on the shared read path)
-        threads = min(max((os.cpu_count() or 4) - 2, 1), 10)
+        # capped at 10 (diminishing returns past that on the shared read
+        # path).  Physical cores, not SMT threads: the workers are
+        # FFT-bound and two of them on one core's siblings run at about
+        # half speed each, so an 8-core/16-thread box decodes faster with
+        # 6 workers than with 10.
+        threads = min(max(physical_cpu_count() - 2, 1), 10)
 
     extra_options = {
         "threads": threads,
@@ -495,13 +547,17 @@ def main(args=None):
         "exact_speculation": args.exact_speculation,
         "useAGC": not args.noAGC,
         "write_RF_TBC": args.RF_TBC,
-        "pipe_RF_TBC": audio_pipe,
+        "pipe_RF_TBC": None,
         "write_pre_efm": args.prefm,
         "tbc_efm": args.tbc_efm,
         "field_reg": args.field_reg,
+        "efm_demod": args.efm_demod,
+        "efm_conf": args.efm_conf,
+        "efm_eq_taps": args.efm_eq_taps,
         "deemp_coeff": (args.deemp_low, args.deemp_high),
         "deemp_str": args.deemp_strength if args.deemp_strength is not None else (1.0 if args.pal else 0.96),
         "auto_deemp": args.deemp_strength is None,
+        "chroma_dg": args.chroma_dg,
         "MTF_level": args.MTF,
         "MTF_offset": args.MTF_offset,
         "audio_filterwidth": args.audio_filterwidth,
@@ -518,15 +574,13 @@ def main(args=None):
         extra_options["fm_pll"] = True
         extra_options["fm_pll_fn"] = args.fm_pll_fn * 1e6
 
-    if vid_standard == "PAL" and args.V4300D_coherent_subtract:
+    if vid_standard == "PAL" and (args.V4300D_notch_filter or args.V4300D_coherent_subtract):
+        # --V4300D_notch_filter is a legacy alias: the coherent subtract
+        # supersedes the FFT-bin notch (it also removes the leakage skirts
+        # and the clock's satellites), and its no-video guard makes lead-in
+        # deferral unnecessary, so both switches enable the same filter and
+        # parallel demod stays available.
         extra_options["PAL_V4300D_CoherentSubtract"] = True
-        # Defer the spur filter until sync is acquired: the filter breaks
-        # cold-start sync in the flat lead-in on some captures, so decode the
-        # lead-in plain and switch the filter on for the program content.
-        # --V4300D_no_defer opts out (keeps parallel demod; deferring forces
-        # serial because the acquired-event can't cross spawn workers).
-        if not args.V4300D_no_defer:
-            extra_options["V4300_defer"] = True
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")
@@ -555,8 +609,103 @@ def main(args=None):
     if args.cvbs:
         extra_options["output_cvbs"] = True
         if args.ntscj:
-            # NTSC-J: no setup pedestal; record the black-level override
             extra_options["cvbs_black_level"] = 240
+        if args.cvbs_encoding:
+            extra_options["cvbs_encoding"] = args.cvbs_encoding
+
+    DecoderParamsOverride = {}
+    if args.vbpf_low is not None:
+        DecoderParamsOverride["video_bpf_low"] = args.vbpf_low * 1000000
+
+    if args.vbpf_high is not None:
+        DecoderParamsOverride["video_bpf_high"] = args.vbpf_high * 1000000
+
+    if args.vlpf is not None:
+        DecoderParamsOverride["video_lpf_freq"] = args.vlpf * 1000000
+
+    if args.vlpf_order >= 1:
+        DecoderParamsOverride["video_lpf_order"] = args.vlpf_order
+
+    return {
+        "system": vid_standard,
+        "analog_audio_freq": analog_audio_freq,
+        "extra_options": extra_options,
+        "decoder_params_override": DecoderParamsOverride,
+    }
+
+
+def count_cores(sibling_lists):
+    """Physical cores described by a set of sysfs thread_siblings_list
+    strings ("0,8", "1-3", ...): SMT siblings of one core share a
+    list, so the distinct lists count the cores."""
+    cores = set()
+    for text in sibling_lists:
+        cpus = set()
+        for part in text.strip().split(","):
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cpus.update(range(int(lo), int(hi) + 1))
+            else:
+                cpus.add(int(part))
+        if cpus:
+            cores.add(frozenset(cpus))
+    return len(cores)
+
+
+def physical_cpu_count(sysfs="/sys/devices/system/cpu"):
+    """Physical cores on this machine, from the Linux CPU topology;
+    the logical count wherever that is not exposed."""
+    logical = os.cpu_count() or 4
+    try:
+        import glob
+        lists = [
+            open(path).read()
+            for path in glob.glob(
+                os.path.join(sysfs, "cpu[0-9]*", "topology",
+                             "thread_siblings_list"))
+        ]
+        cores = count_cores(lists)
+    except OSError:
+        return logical
+    return cores if 0 < cores <= logical else logical
+
+
+def main(args=None):
+    # Handle --version early before argparse requires positional arguments
+    check_args = args if args is not None else sys.argv[1:]
+    if "--version" in check_args or "-v" in check_args:
+        from lddecode import __version__
+        print(__version__)
+        sys.exit(0)
+    parser = build_parser()
+    args = parser.parse_args(args)
+    # print(args)
+    filename = args.infile
+    outname = args.outfile
+    firstframe = args.start
+    req_frames = args.length
+    options = build_options(args)
+    vid_standard = options["system"]
+    analog_audio_freq = options["analog_audio_freq"]
+    extra_options = options["extra_options"]
+    DecoderParamsOverride = options["decoder_params_override"]
+
+    # Safety check: ensure --write-test-ldf doesn't overwrite the input file
+    if args.write_test_ldf is not None:
+        # os (and os.path) is imported at module scope; a local re-import
+        # here would make `os` function-local and shadow it everywhere else
+        # in main().
+        input_path = os.path.abspath(filename)
+        output_path = os.path.abspath(args.write_test_ldf)
+        if input_path == output_path:
+            print("ERROR: --write-test-ldf output file cannot be the same as input file", file=sys.stderr)
+            print(f"Input:  {filename}", file=sys.stderr)
+            print(f"Output: {args.write_test_ldf}", file=sys.stderr)
+            sys.exit(1)
+
+    audio_pipe = None
 
     try:
         loader = make_loader(filename, args.inputfreq)
@@ -572,19 +721,6 @@ def main(args=None):
 
     from lddecode import __version__
     logger.debug("ld-decode version " + __version__)
-
-    DecoderParamsOverride = {}
-    if args.vbpf_low is not None:
-        DecoderParamsOverride["video_bpf_low"] = args.vbpf_low * 1000000
-
-    if args.vbpf_high is not None:
-        DecoderParamsOverride["video_bpf_high"] = args.vbpf_high * 1000000
-
-    if args.vlpf is not None:
-        DecoderParamsOverride["video_lpf_freq"] = args.vlpf * 1000000
-
-    if args.vlpf_order >= 1:
-        DecoderParamsOverride["video_lpf_order"] = args.vlpf_order
 
     ldd = LDdecode(
         filename,

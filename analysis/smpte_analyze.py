@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from lddecode.metrics import CombNTSC
-from tbc_common import (
+from video_common import (
     load_tbc, load_cvbs, detect_patterns, summarize_patterns, detect_colorbars,
     burst_ref, demod_region, pal_fold_uv, phase_diff,
 )
@@ -528,7 +528,7 @@ def main():
         parser.error("Provide a .tbc file or use --decode with an .lds/.ldf file")
 
     # Load
-    if tbc_path.endswith(".composite"):
+    if tbc_path.endswith((".cvbs", ".composite")):
         params, fields, tbc_data = load_cvbs(tbc_path)
     else:
         params, fields, tbc_data = load_tbc(tbc_path)

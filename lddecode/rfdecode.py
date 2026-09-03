@@ -105,7 +105,8 @@ class RFDecode:
         has_analog_audio     -- Whether or not analog(ue) audio channels are on the disk
 
         extra_options -- Dictionary of additional options (typically boolean) - these include:
-          - PAL_V4300D_NotchFilter - cut 8.5mhz spurious signal
+          - PAL_V4300D_CoherentSubtract - remove the LD-V4300D 8.4672mhz digital-audio
+            clock spur (see v4300d_coherent_subtract)
           - NTSC_ColorNotchFilter:  notch filter on decoded video to reduce color 'wobble'
           - lowband: Substitute different decode settings for lower-bandwidth disks
           - AC3: Supports AC3
@@ -138,14 +139,7 @@ class RFDecode:
         self.setupcount   = 0
 
         self.NTSC_ColorNotchFilter = extra_options.get("NTSC_ColorNotchFilter", False)
-        self.PAL_V4300D_NotchFilter = extra_options.get("PAL_V4300D_NotchFilter", False)
         self.PAL_V4300D_CoherentSubtract = extra_options.get("PAL_V4300D_CoherentSubtract", False)
-        # Deferred V4300D filtering: keep the spur filter off until sync is
-        # acquired (the flat lead-in loses legitimate energy to it and can fail
-        # to lock).  The "acquired" signal is a shared threading.Event flipped
-        # from the decode loop; the decoder forces serial demod when this is set.
-        self.v4300_defer = extra_options.get("V4300_defer", False)
-        self._acquired_event = extra_options.get("_acquired_event", None)
         # Optional PLL FM discriminator (unwrap_hilbert_pll) in place of the
         # default conjugate-product one.  Experimental / negative result: LD's
         # low modulation index gives a PLL no threshold extension, so it measures
@@ -282,6 +276,14 @@ class RFDecode:
         This improved EFM filter was devised by Adam Sampson (@atsampson)
         """
 
+        # Sweep hook: LDDECODE_EFM_FRONTEND=hardware substitutes the
+        # hardware-derived front end (player RF EQ + elliptic LPF) for the
+        # anchor-table equaliser below.  For filter comparison experiments
+        # only; see docs/technical/efm-decoding.md.
+        if os.environ.get("LDDECODE_EFM_FRONTEND", "") == "hardware":
+            self.Filters["Fefm"] = self._efm_hardware_frontend()
+            return
+
         # Frequency bands
         freqs = np.linspace(0.0e6, 1.9e6, num=11)
         freq_per_bin = self.freq_hz / self.blocklen
@@ -337,6 +339,53 @@ class RFDecode:
         _sghigh = float(os.environ.get("LDDECODE_EFM_SGHIGH", _sghigh_default))
         _sglow = float(os.environ.get("LDDECODE_EFM_SGLOW", "20000"))   # low band edge (bandwidth)
         self.Filters["Fefm"] *= gen_bpf_supergauss(_sglow, _sghigh, _sgorder, 20000000, 32768)
+
+    def _efm_hardware_frontend(self):
+        """Hardware-derived EFM front end as frequency-domain coefficients.
+
+        The alternative evaluated in the front-end comparison (see
+        docs/technical/efm-decoding.md): a LaserDisc player's input
+        equalisation instead of the empirically tuned anchor table.
+
+        - "RF EQ": the biquad museld derived by bilinear transform from the
+          RF equaliser in the Sony HIL-C1 service-manual schematic.  The
+          sample-rate-parameterised coefficient formulas are taken from
+          museld (https://github.com/staffanu/museld,
+          player/src/efm/EfmDemodulator.cpp, GPLv3 - licence-compatible).
+        - Elliptic low-pass: ellip(4, 3 dB, 40 dB, 1.7 MHz), the
+          anti-noise cutoff museld pairs it with.
+
+        Returns complex coefficients over the positive-frequency bins of
+        the demod block (same one-sided convention as the anchor-table
+        filter), peak-magnitude-matched to it so int16 levels compare.
+        """
+        fs = float(self.freq_hz)
+        d = 136762495344372.0 * fs**2 + 1.03400100063e21 * fs + 1.11017205e27
+        b_eq = np.array([
+            (39176791720000.0 * fs**2 + 1.0256763e21 * fs + 1.705e26) / d,
+            (3.41e26 - 78353583440000.0 * fs**2) / d,
+            (39176791720000.0 * fs**2 - 1.0256763e21 * fs + 1.705e26) / d,
+        ])
+        a_eq = np.array([
+            1.0,
+            (2.2203441e27 - 273524990688744.0 * fs**2) / d,
+            (136762495344372.0 * fs**2 - 1.03400100063e21 * fs + 1.11017205e27) / d,
+        ])
+        b_lpf, a_lpf = sps.ellip(4, 3, 40, 1.7e6, fs=fs)
+
+        # Evaluate the cascade on the block's positive-frequency bins.
+        nonzero_bins = self.blocklen // 2
+        bin_freqs = np.arange(nonzero_bins) * (fs / self.blocklen)
+        _, h_eq = sps.freqz(b_eq, a_eq, worN=bin_freqs, fs=fs)
+        _, h_lpf = sps.freqz(b_lpf, a_lpf, worN=bin_freqs, fs=fs)
+        response = h_eq * h_lpf
+        response[0] = 0.0  # no DC (the anchor filter zeroes it too)
+
+        coeffs = np.zeros(self.blocklen, dtype=complex)
+        # Match the anchor-table filter's peak gain (1.03 * 8) so the
+        # int16 EFM output uses the same headroom either way.
+        coeffs[:nonzero_bins] = response * (8.24 / np.abs(response).max())
+        return coeffs
 
     # Lambda-scale functions used to simplify following filter builders
 
@@ -508,6 +557,14 @@ class RFDecode:
             # is an amplitude compensation by design, and the FFT
             # overlap-save pipeline makes acausal zero-phase filters free.
             SF["RFVideo"] = np.abs(SF["RFVideo"])
+            # Amplitude-only MTF was also tried for NTSC alone
+            # (2026-08-31): it removes the DP the MTF poles' phase adds
+            # per mtf_level (+1.7 deg at level 1.5 on he010), but the
+            # phased response turns out to be load-bearing for FM
+            # demodulation there — |MTF|**level loses sync lock
+            # entirely at effective exponent ~0.4 at inner radius,
+            # where the phased filter is still healthy at 0.6.  Do not
+            # re-split this without re-running the he010 offset sweeps.
             SF["MTF"] = np.abs(SF["MTF"])
             if "FcutPAL" in SF:
                 # The per-block audio-carrier notch multiplies into the same
@@ -553,6 +610,10 @@ class RFDecode:
         # there is no boost; auto-calibration sets the strength from burst
         # amplitude measurements so that chroma recovers to spec level with
         # zero differential-phase cost (unlike de-emphasis adjustment).
+        # Negative strengths run the same curve the other way, cutting a
+        # chroma band the VITS multiburst measures hot; the burst servo
+        # may not ask for that, only the multiburst may (decoder's
+        # _imtf_ceiling).
         freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
         crossover = 2.0e6
         mtf_at_crossover = compute_mtf(crossover, cavframe=0)
@@ -562,12 +623,21 @@ class RFDecode:
 
         fsc_bin = int(round(fsc_hz * self.blocklen / self.freq_hz))
         self.inverse_mtf_log_at_fsc = np.log(SF["Finverse_mtf_base"][fsc_bin])
+        self._imtf_2t_gain_cache = {}
+        self._veq_2t_gain_cache = {}
 
         # Zero-phase magnitude EQ from (freq_hz, dB) anchor points.  Real
         # valued, so it cannot move phase; applied to both the output and
         # burst reference paths so burst-based auto-calibration measures the
         # corrected signal.
         SF["Fvideo_eq"] = self.build_video_eq(DP.get("video_eq"))
+        # Dynamic per-disc EQ measured from VITS multiburst lines by the
+        # decoder's servo (decoder._veq_estimate).  Zero-phase, pinned to
+        # 0 dB from DC and beyond its last anchor + 0.5 MHz, so with
+        # anchors capped below ~3.6 MHz the chroma band stays owned by
+        # the burst-based inverse-MTF calibration.
+        SF["Fvideo_eq_auto"] = self.build_video_eq(
+            DP.get("video_eq_auto"))
 
         # Post processing: lowpass filter + full de-emphasis + inverse MTF
         # chroma correction + group-delay equaliser.  De-emphasis stays at
@@ -577,8 +647,11 @@ class RFDecode:
         #SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq"]
 
         imtf_strength = DP.get("inverse_mtf_strength", 0.0)
-        if imtf_strength > 0:
+        if imtf_strength != 0:
             SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
+
+        if DP.get("video_eq_auto"):
+            SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq_auto"]
 
         # Correct the post-demod video group delay to the IEC spec curve the
         # disc was pre-distorted against (PAL: IEC 60856 9.1.6, NTSC: IEC 60857
@@ -623,20 +696,101 @@ class RFDecode:
             )
             SF["FVideoPilot"] = SF["Fvideo_lpf"] * SF["Fdeemp"] * SF["Fpilot"]
 
-        self._build_video_batch()
+        self.build_video_rfft_stack()
 
-    def _build_video_batch(self):
-        """Stack the half-spectrum video product filters into one contiguous
-        array so demodblock can batch all their inverse transforms into a
-        single multi-row irfft call (ported from upstream b35507dd).  Must be
-        rebuilt whenever any FVideo* filter changes (computevideofilters and
-        recompute_fvideo)."""
+    def build_video_rfft_stack(self):
+        """Stack the video output filters' positive-frequency halves.
+
+        demod and all four video products are real, so the half spectrum is
+        exact (see demodblock).  Keeping them in one contiguous 2-D array lets
+        demodblock do a single batched irfft instead of one call per output.
+        Must be rebuilt by anything that changes one of these filters --
+        recompute_fvideo() does.
+        """
         SF = self.Filters
         nr = self.blocklen // 2 + 1
-        vf = [SF["FVideo"][:nr], SF["FVideo05"][:nr], SF["FVideoBurst"][:nr]]
+
+        stack = [SF["FVideo"][:nr], SF["FVideo05"][:nr], SF["FVideoBurst"][:nr]]
         if self.system == "PAL":
-            vf.append(SF["FVideoPilot"][:nr])
-        SF["FVideo_rfft_batch"] = np.ascontiguousarray(np.stack(vf))
+            stack.append(SF["FVideoPilot"][:nr])
+
+        SF["FVideo_rfft"] = np.asarray(stack)
+
+    def inverse_mtf_2t_peak_gain(self, strength):
+        """Peak gain of the inverse-MTF chroma filter on an ideal 2T pulse.
+
+        The correction filter shapes the whole upper video band, so it
+        also moves the ITS 2T pulse the MTF servo measures; dividing the
+        measured pulse-to-bar ratio by this factor decouples the two
+        control loops (otherwise: servo raises mtf_level -> burst drops
+        -> chroma strength rises -> 2T rises -> servo raises further).
+        Computed by passing a sine-squared pulse (HAD = 2 video periods)
+        through Finverse_mtf_base ** strength; cached per strength.
+
+        A negative strength lowers the pulse rather than lifting it, and
+        is divided out the same way: the loop it would otherwise close is
+        the same one running backwards.
+        """
+        key = round(float(strength), 6)
+        g = self._imtf_2t_gain_cache.get(key)
+        if g is not None:
+            return g
+        if key == 0:
+            g = 1.0
+        else:
+            # 2T sine-squared pulse: full width twice the half-amplitude
+            # duration (nominal HAD 200 ns PAL, 250 ns NTSC)
+            had_s = 200e-9 if self.system == "PAL" else 250e-9
+            n = max(int(round(2 * had_s * self.freq_hz)), 4)
+            t = np.arange(n)
+            pulse = np.zeros(self.blocklen)
+            pulse[:n] = 0.5 * (1 - np.cos(2 * np.pi * t / n))
+            out = np.real(np.fft.ifft(
+                np.fft.fft(pulse)
+                * (self.Filters["Finverse_mtf_base"] ** key)))
+            g = float(np.max(out) / np.max(pulse))
+        self._imtf_2t_gain_cache[key] = g
+        return g
+
+    def inverse_mtf_log_db(self, freq_hz):
+        """dB the inverse-MTF filter adds at freq_hz per unit strength.
+
+        The filter is applied as ``Finverse_mtf_base ** strength``, so its
+        contribution is linear in strength once expressed in dB.  Callers
+        that need to convert a measured response deviation into the
+        strength that accounts for it divide by this.
+        """
+        base = self.Filters.get("Finverse_mtf_base")
+        if base is None:
+            return 0.0
+        index = int(round(freq_hz * self.blocklen / self.freq_hz))
+        if not 0 <= index < len(base):
+            return 0.0
+        return float(20.0 * np.log10(np.abs(base[index])))
+
+    def video_eq_2t_peak_gain(self, points):
+        """Peak gain of the dynamic video EQ on an ideal 2T pulse.
+
+        Divided out of the MTF servo's pulse-to-bar measurement so the
+        EQ and mtf_level loops stay decoupled (the servo then sees the
+        pre-EQ response); analogous to inverse_mtf_2t_peak_gain.
+        """
+        if not points:
+            return 1.0
+        key = tuple(points)
+        g = self._veq_2t_gain_cache.get(key)
+        if g is not None:
+            return g
+        had_s = 200e-9 if self.system == "PAL" else 250e-9
+        n = max(int(round(2 * had_s * self.freq_hz)), 4)
+        t = np.arange(n)
+        pulse = np.zeros(self.blocklen)
+        pulse[:n] = 0.5 * (1 - np.cos(2 * np.pi * t / n))
+        out = np.real(np.fft.ifft(
+            np.fft.fft(pulse) * self.build_video_eq(list(points))))
+        g = float(np.max(out) / np.max(pulse))
+        self._veq_2t_gain_cache[key] = g
+        return g
 
     def recompute_fvideo(self):
         """Rebuild only FVideo after an inverse MTF strength change.
@@ -655,11 +809,18 @@ class RFDecode:
         #SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq"]
 
         imtf_strength = DP.get("inverse_mtf_strength", 0.0)
-        if imtf_strength > 0:
+        if imtf_strength != 0:
             SF["FVideo"] = SF["FVideo"] * (SF["Finverse_mtf_base"] ** imtf_strength)
+
+        SF["Fvideo_eq_auto"] = self.build_video_eq(
+            DP.get("video_eq_auto"))
+        if DP.get("video_eq_auto"):
+            SF["FVideo"] = SF["FVideo"] * SF["Fvideo_eq_auto"]
 
         SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
         self._build_video_batch()
+
+        self.build_video_rfft_stack()
 
     def build_video_eq(self, points):
         """Zero-phase magnitude EQ from (freq_hz, gain_db) anchor points.
@@ -757,38 +918,206 @@ class RFDecode:
         p = self._params(spec)
         return (hz - p["ire0"]) / p["hz_ire"]
 
+    # LD-V4300D spur identification: the player's CD-family digital-audio
+    # master clock (192 x 44.1 kHz) leaks into the RF tap on PAL digital
+    # audio discs.  Measured at 8.4673 MHz on captures of three different
+    # discs spanning 2019-2025 (so it is the player, not the disc), with
+    # modulation satellites at exact +-88.2 kHz (2 x 44.1 kHz) multiples;
+    # the +176.4 kHz satellite is also 2x the 4.3218 MHz EFM bit clock.
+    V4300D_CLOCK_HZ = 8.4672e6  # 192 x 44.1 kHz master clock
+    V4300D_SATELLITE_HZ = 88.2e3  # 2 x 44.1 kHz sideband spacing
+    V4300D_SATELLITE_KS = (-1, 1, 2)  # observed: 8.379, 8.555, 8.644 MHz
+    V4300D_ANCHOR_TOL_HZ = 3e3  # search half-width: crystal tolerance
+    V4300D_WINDOW_MHZ = (8.36, 8.66)  # spans the clock and its satellites
+    # Anchored gates, in the amplitude units sqsum returns, measured over
+    # 120 decode-sized blocks per capture: the clock line stands 14-53x the
+    # window's median amplitude on program content (187-211x on lead-in),
+    # but legitimate FM sideband lines reach ~10x there and up to ~30x on
+    # spur-free captures, so prominence alone cannot separate them.  What
+    # can: legitimate lines are part of a line-rate comb (neighbours at
+    # +-15.625 kHz of comparable amplitude, peak/neighbour 0.6-6x), while
+    # the clock line stands 6.7-76x above its comb-neighbour positions.
+    V4300D_MAIN_MIN_MED = 5.0  # main line: > this x window median AND
+    V4300D_MAIN_MIN_COMB = 3.0  # > this x its line-rate comb neighbours
+    V4300D_SAT_MIN_MED = 3.0  # satellites, only once the main line is
+    V4300D_SAT_MIN_COMB = 2.0  # confirmed: relaxed versions of the same
+    # No-video guard: the whole filter is a no-op unless the video FM
+    # carrier band peak stands over the spur window's median amplitude.
+    # Measured per block: dead capture regions (no carrier - lead-in noise,
+    # inter-program gaps) sit at 11-21x, while any real video (flat lead-in
+    # included) measures 58-2850x, so 40x separates them with ~2x margin
+    # both ways.  This keeps dead regions bit-identical to an unfiltered
+    # decode - cold-start sync hunting sees exactly the same signal - which
+    # is what previously required deferring the filter (serially) until
+    # sync acquisition.
+    V4300D_MIN_CARRIER = 40.0
+    V4300D_CARRIER_MHZ = (6.6, 8.0)  # PAL video FM carrier band searched
+
+    def _v4300d_dirichlet(self, delta):
+        """Rectangular-window transform of a unit complex exponential,
+        E(delta) = sum_n exp(2j pi delta n / N) for n in [0, N): the
+        spectral footprint, at bin offset delta, that a tone leaves in an
+        unwindowed N-point FFT.  Vectorised over delta (in bins)."""
+        N = self.blocklen
+        d = np.asarray(delta, dtype=np.float64)
+        num = np.sin(np.pi * d)
+        den = np.sin(np.pi * d / N)
+        # removable singularity at integer multiples of N (delta = 0 here)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mag = np.where(np.abs(den) > 1e-12, num / den, float(N))
+        return mag * np.exp(1j * np.pi * d * (N - 1) / N)
+
+    def _v4300d_refine_subtract(self, X, k, fit_bins=64, cut_bins=2048):
+        """Refine the frequency of the tone near FFT bin k, estimate its
+        complex amplitude, and subtract its spectral footprint from X in
+        place.  Returns the refined frequency in Hz.
+
+        Everything happens in the frequency domain: the projection of the
+        block onto a trial tone at bin offset f is a Dirichlet-weighted sum
+        of the +-fit_bins FFT bins around it (truncation keeps >99.7% of
+        the tone's energy), which replaces the O(N) time-domain dot
+        products and exponentials of the direct formulation -- ~100x
+        cheaper per line, which matters because a V4300D capture trips the
+        detector on essentially every block.
+
+        Three-point parabolic interpolation of the rectangular-window
+        magnitude is biased ~0.1-0.2 bin, and a 0.2-bin error alone leaves
+        sinc^2(0.2) ~ -9 dB of the tone behind.  The true peak lies within
+        +-0.5 bin of the argmax bin, so search a fine grid bracketing it,
+        parabolically interpolate the energy maximum (<0.01 bin), then
+        subtract the fitted tone's Dirichlet kernel over +-cut_bins
+        (leaving <-74 dB of skirt beyond) and mirror the change into the
+        conjugate-symmetric negative-frequency half.
+
+        X must be the FFT of a real signal (conjugate-symmetric), with the
+        tone away from DC/Nyquist by more than cut_bins."""
+        N = self.blocklen
+        fpb = self.freq_hz / N
+        m = np.arange(k - fit_bins, k + fit_bins + 1)
+        Xw = X[m]
+
+        # normalised least-squares projection c(f) = <X, E(f-m)> / ||E||^2
+        # evaluated on a fine grid bracketing the argmax bin
+        grid = k + np.linspace(-0.6, 0.6, 9)
+        E = self._v4300d_dirichlet(grid[:, np.newaxis] - m[np.newaxis, :])
+        num = E.conj() @ Xw
+        den = np.sum(E.real**2 + E.imag**2, axis=1)
+        c = num / den
+        mag = (num.real**2 + num.imag**2) / den  # captured tone energy
+        g = int(np.argmax(mag))
+        if 0 < g < len(grid) - 1:
+            d2 = mag[g - 1] - (2 * mag[g]) + mag[g + 1]
+            frac = np.clip(0.5 * (mag[g - 1] - mag[g + 1]) / d2, -1.0, 1.0) if d2 else 0.0
+        else:
+            frac = 0.0
+        fbin = grid[g] + frac * (grid[1] - grid[0])
+
+        # amplitude at the refined frequency, then subtract its footprint
+        mc = np.arange(k - cut_bins, k + cut_bins + 1)
+        Ef = self._v4300d_dirichlet(fbin - m)
+        c = np.dot(Ef.conj(), Xw) / np.sum(Ef.real**2 + Ef.imag**2)
+        X[mc] -= c * self._v4300d_dirichlet(fbin - mc)
+        # keep the spectrum that of a real signal
+        X[N - mc] = np.conj(X[mc])
+        return fbin * fpb
+
     def v4300d_coherent_subtract(self, indata_fft, maxlines=10):
-        """Coherent (PLL-style, but stateless per block) removal of the
-        spurious ~8.47-8.57 MHz tone emitted by LD-V4300D players on some PAL
-        digital audio discs.
+        """Coherent (stateless per block) removal of the LD-V4300D
+        digital-audio master-clock spur from PAL digital audio captures.
 
-        For each sufficiently prominent spectral line in the window (see
-        gating below): refine its frequency to the value that maximises the
-        captured single-tone energy, least-squares fit the complex amplitude
-        over the block, and subtract the reconstructed sinusoid in the time
-        domain.  Unlike bin zeroing this also removes the off-bin spectral
-        leakage skirts, and removes nothing else (no holes in the underlying
-        video sidebands).  Self-disabling: with no anomalous line present the
-        gate never trips and the input FFT is returned unchanged.  Stateless
-        per block, so it fits the out-of-order block-cache architecture where a
-        tracking PLL would not.
+        Blocks without a video FM carrier are returned untouched (see
+        V4300D_MIN_CARRIER), so dead capture regions decode bit-identically
+        to an unfiltered decode and cold-start sync is unaffected; no
+        deferral (and no serial-demod penalty) is needed.  Then two passes
+        over the 8.36-8.66 MHz window:
 
-        Gating: static video content puts a comb of legitimate FM sideband
-        lines (line-rate spacing) in this window, measuring up to ~27x the
-        window's median power on the test captures, so a new line is only
-        accepted at >40x median; follow-up cleanup of fit residuals is allowed
-        within +-30 kHz of a confirmed line at a relaxed >5x gate.  maxlines
-        bounds the loop; blocks without a spur pay only the detection cost."""
+        1. Anchored: the spur is physically pinned to the player's
+           192 x 44.1 kHz = 8.4672 MHz clock (+- crystal tolerance), with
+           satellites at +-88.2 kHz multiples, so those lines are searched
+           directly (+-3 kHz) and accepted at modest prominence -- but only
+           when the candidate stands clear of its line-rate comb-neighbour
+           positions, which separates the lone clock line from legitimate FM
+           sideband lines (see the V4300D_* constants above for the measured
+           populations).  Satellites are only considered once the main line
+           has been confirmed in the same block.
+        2. Generic: the original lone-tone hunt for anything unexpected,
+           accepted only at >40x the window's median amplitude (legitimate
+           lines measure up to ~30x); follow-up cleanup of fit residuals is
+           allowed within +-30 kHz of any confirmed line at a relaxed >5x
+           gate.  maxlines bounds the total across both passes.
+
+        For each accepted line, _v4300d_refine_subtract pins the frequency to
+        <0.01 bin and subtracts the fitted tone's spectral footprint.  Unlike
+        bin zeroing this also removes the off-bin spectral leakage skirts,
+        and removes nothing else (no holes in the underlying video
+        sidebands).  Self-disabling: with no spur present neither gate trips
+        and the input FFT is returned unchanged (not a copy; when lines are
+        subtracted a copy is returned and the input left untouched).
+        Stateless per block, so it fits the out-of-order block-cache
+        architecture where a tracking PLL would not."""
         sl = slice(
-            int(self.blocklen * (8.42 / self.freq)),
-            int(1 + (self.blocklen * (8.6 / self.freq))),
+            int(self.blocklen * (self.V4300D_WINDOW_MHZ[0] / self.freq)),
+            int(1 + (self.blocklen * (self.V4300D_WINDOW_MHZ[1] / self.freq))),
         )
         fpb = self.freq_hz / self.blocklen
 
         X = indata_fft
-        x = None
         lines = []
-        for _ in range(maxlines):
+
+        def subtract(k):
+            nonlocal X
+            if X is indata_fft:
+                X = indata_fft.copy()
+            lines.append(self._v4300d_refine_subtract(X, k))
+
+        # No-video guard: without a video FM carrier there is nothing the
+        # spur could beat against and nothing to protect - return the block
+        # untouched so dead regions decode bit-identically to an unfiltered
+        # decode (see V4300D_MIN_CARRIER above).
+        amp_sl = sqsum(indata_fft[sl])
+        med = np.median(amp_sl)
+        if med <= 0:
+            return indata_fft
+        carrier_sl = slice(
+            int(self.blocklen * (self.V4300D_CARRIER_MHZ[0] / self.freq)),
+            int(self.blocklen * (self.V4300D_CARRIER_MHZ[1] / self.freq)),
+        )
+        if sqsum(indata_fft[carrier_sl]).max() <= self.V4300D_MIN_CARRIER * med:
+            return indata_fft
+
+        # Pass 1: anchored clock lines.  All gates are evaluated on the
+        # original spectrum (the lines are >85 kHz apart, so subtracting one
+        # does not disturb another's gate).
+        tol = max(2, int(round(self.V4300D_ANCHOR_TOL_HZ / fpb)))
+        nbtol = max(1, tol // 2)
+        # EBU Tech 3280-E: 64 us line -> 15.625 kHz comb pitch
+        fh_bins = int(round((1e6 / self.SysParams["line_period"]) / fpb))
+        main_found = False
+        for ks in (0,) + self.V4300D_SATELLITE_KS:
+            if ks != 0 and not main_found:
+                break
+            f0 = self.V4300D_CLOCK_HZ + ks * self.V4300D_SATELLITE_HZ
+            k0 = int(round(f0 / fpb))
+            seg = sqsum(indata_fft[k0 - tol : k0 + tol + 1])
+            kk = k0 - tol + int(np.argmax(seg))
+            peak = seg.max()
+            comb_nb = max(
+                sqsum(indata_fft[kk - fh_bins - nbtol : kk - fh_bins + nbtol + 1]).max(),
+                sqsum(indata_fft[kk + fh_bins - nbtol : kk + fh_bins + nbtol + 1]).max(),
+            )
+            min_med, min_comb = (
+                (self.V4300D_MAIN_MIN_MED, self.V4300D_MAIN_MIN_COMB)
+                if ks == 0
+                else (self.V4300D_SAT_MIN_MED, self.V4300D_SAT_MIN_COMB)
+            )
+            if peak > min_med * med and peak > min_comb * comb_nb:
+                subtract(kk)
+                if ks == 0:
+                    main_found = True
+
+        # Pass 2: generic lone-tone hunt, unchanged gating from the original
+        # detector; also mops up fit residuals near the anchored lines.
+        while len(lines) < maxlines:
             sq_sl = sqsum(X[sl])
             med = np.median(sq_sl)
             if med <= 0:
@@ -800,39 +1129,7 @@ class RFDecode:
             if not (ratio > 40 or (near_known and ratio > 5)):
                 break
 
-            if x is None:
-                # enter the time domain on first detection only
-                x = npfft.ifft(indata_fft).real.copy()
-                n = np.arange(self.blocklen)
-                # per-sample phase ramp, so exp(ph * f_hz) is the tone at f_hz
-                ph = (-2j * np.pi / self.freq_hz) * n
-
-            # Refine the peak frequency to the value that maximises the captured
-            # single-tone energy |P(f)|^2.  Three-point parabolic interpolation
-            # of the rectangular-window magnitude is biased ~0.1-0.2 bin, and a
-            # 0.2-bin error alone leaves sinc^2(0.2) ~ -9 dB of the tone behind.
-            # The true peak lies within +-0.5 bin of the argmax bin, so search a
-            # fine grid bracketing it and parabolically interpolate the energy
-            # maximum; this pins the frequency to <0.01 bin.
-            i = k + sl.start
-            grid = i + np.linspace(-0.6, 0.6, 9)
-            P = np.exp(np.outer(grid * fpb, ph)) @ x
-            mag = P.real ** 2 + P.imag ** 2
-            g = int(np.argmax(mag))
-            if 0 < g < len(grid) - 1:
-                d2 = mag[g - 1] - (2 * mag[g]) + mag[g + 1]
-                frac = np.clip(0.5 * (mag[g - 1] - mag[g + 1]) / d2, -1.0, 1.0) if d2 else 0.0
-            else:
-                frac = 0.0
-            fhat = (grid[g] + frac * (grid[1] - grid[0])) * fpb
-
-            # least-squares complex amplitude of the tone at fhat, then subtract
-            e = np.exp(ph * fhat)
-            amp = np.dot(x, e) / (self.blocklen / 2)
-            x -= np.real(amp * np.conj(e))
-            lines.append(fhat)
-
-            X = npfft.fft(x)
+            subtract(k + sl.start)
 
         return X
 
@@ -1040,12 +1337,21 @@ class RFDecode:
 
         return True
 
+    def apply_v4300d(self, indata_fft):
+        """PAL LD-V4300D spur removal, if enabled.  Returns the input FFT
+        unchanged (not a copy) when the workaround is off."""
+
+        if self.system != "PAL" or not self.PAL_V4300D_CoherentSubtract:
+            return indata_fft
+
+        return self.v4300d_coherent_subtract(indata_fft)
+
     def demodblock_sync(self, data=None, fftdata=None, cut=False):
         """Demodulate only the 0.5 MHz path used for vertical-sync detection.
 
-        A cut-down demodblock() for cheap "is there video here at all" probes
-        (ld-find-start's preamble scan): identical to demodblock()'s demod_05
-        output at mtf_level 0 on the default path, at a fraction of the cost.
+        A stripped-down demodblock for cheap "is there video here?" probes
+        (ld-find-start): no audio, EFM, dropout or burst/pilot products, and
+        no MTF.  Not a substitute for a real decode.
         """
 
         if fftdata is not None:
@@ -1063,27 +1369,7 @@ class RFDecode:
         else:
             raise Exception("demodblock_sync called without raw or FFT data")
 
-        v4300_on = (not self.v4300_defer) or (
-            self._acquired_event is not None and self._acquired_event.is_set()
-        )
-        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract and v4300_on:
-            indata_fft = self.v4300d_coherent_subtract(indata_fft)
-        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter and v4300_on:
-            indata_fft = indata_fft.copy()
-            sl = slice(
-                int(self.blocklen * (8.42 / self.freq)),
-                int(1 + (self.blocklen * (8.6 / self.freq))),
-            )
-            sq_sl = sqsum(indata_fft[sl])
-            m = np.mean(sq_sl) + (np.std(sq_sl) * 3)
-
-            for i in np.where(sq_sl > m)[0]:
-                indata_fft[(i - 1 + sl.start)] = 0
-                indata_fft[(i + sl.start)] = 0
-                indata_fft[(i + 1 + sl.start)] = 0
-                indata_fft[self.blocklen - (i + sl.start)] = 0
-                indata_fft[self.blocklen - (i - 1 + sl.start)] = 0
-                indata_fft[self.blocklen - (i + 1 + sl.start)] = 0
+        indata_fft = self.apply_v4300d(indata_fft)
 
         indata_fft_filt = indata_fft * self.Filters["RFVideo"]
         if "FcutPAL" in self.Filters and self.pal_audio_carriers_present(indata_fft):
@@ -1092,10 +1378,12 @@ class RFDecode:
         hilbert = npfft.ifft(indata_fft_filt)
         demod = unwrap_hilbert(hilbert, self.freq_hz)
 
+        # FVideo05 carries its delay compensation as a phase ramp, so no roll
+        # is needed here (see computevideofilters).
         demod_fft = npfft.rfft(np.clip(demod, 1500000, self.freq_hz * 0.75))
-        nr = demod_fft.shape[0]
         sync = npfft.irfft(
-            demod_fft * self.Filters["FVideo05"][:nr], n=self.blocklen
+            demod_fft * self.Filters["FVideo05"][: demod_fft.shape[0]],
+            n=self.blocklen,
         )
 
         if cut:
@@ -1155,43 +1443,7 @@ class RFDecode:
             self.blockcut - rotdelay : -self.blockcut_end - rotdelay
         ].astype(np.float32)
 
-        # In deferred mode the spur filter stays off until sync is acquired
-        # (shared event flips for all pipeline threads); see __init__.
-        v4300_on = (not self.v4300_defer) or (
-            self._acquired_event is not None and self._acquired_event.is_set()
-        )
-
-        if self.system == "PAL" and self.PAL_V4300D_CoherentSubtract and v4300_on:
-            # Experimental upgrade of the V4300D workaround below: instead of
-            # zeroing FFT bins (which leaves the off-bin spectral-leakage skirts
-            # of the interfering tone behind), estimate the tone(s) coherently
-            # and subtract them in the time domain.  See v4300d_coherent_subtract.
-            indata_fft = self.v4300d_coherent_subtract(indata_fft)
-        elif self.system == "PAL" and self.PAL_V4300D_NotchFilter and v4300_on:
-            # This routine works around an 'interesting' issue seen with LD-V4300D
-            # players and some PAL digital audio disks, where there is a signal
-            # somewhere between 8.47 and 8.57mhz.
-            #
-            # The idea here is to look for anomalies (3 std deviations) and snip
-            # them out of the FFT.  There may be side effects, however, but
-            # generally minor compared to the 'wibble' itself and only in
-            # certain cases.
-            # Copy before zeroing bins so we don't mutate the caller's FFT array.
-            indata_fft = indata_fft.copy()
-            sl = slice(
-                int(self.blocklen * (8.42 / self.freq)),
-                int(1 + (self.blocklen * (8.6 / self.freq))),
-            )
-            sq_sl = sqsum(indata_fft[sl])
-            m = np.mean(sq_sl) + (np.std(sq_sl) * 3)
-
-            for i in np.where(sq_sl > m)[0]:
-                indata_fft[(i - 1 + sl.start)] = 0
-                indata_fft[(i + sl.start)] = 0
-                indata_fft[(i + 1 + sl.start)] = 0
-                indata_fft[self.blocklen - (i + sl.start)] = 0
-                indata_fft[self.blocklen - (i - 1 + sl.start)] = 0
-                indata_fft[self.blocklen - (i + 1 + sl.start)] = 0
+        indata_fft = self.apply_v4300d(indata_fft)
 
         indata_fft_filt = indata_fft * self.Filters["RFVideo"]
 
@@ -1216,18 +1468,19 @@ class RFDecode:
         # demod is real and these video outputs are real, so the half-spectrum
         # rfft/irfft pair is mathematically identical to fft/ifft.real (the filters
         # are conjugate-symmetric) at ~2.3x the speed of the full complex transforms.
+        # All four products share demod's transform, so filter and invert them
+        # together in one batched irfft (see build_video_rfft_stack).
         demod_fft = npfft.rfft(np.clip(demod, 1500000, self.freq_hz * 0.75))
         bl = self.blocklen
 
-        # one batched multi-row irfft over all video products (each row is an
-        # independent transform, so results are identical to per-product calls)
-        vids = npfft.irfft(
-            demod_fft * self.Filters["FVideo_rfft_batch"], n=bl, axis=1
+        video_results = npfft.irfft(
+            demod_fft * self.Filters["FVideo_rfft"], n=bl, axis=1
         )
-        out_video, out_video05, out_videoburst = vids[0], vids[1], vids[2]
+
+        out_video, out_video05, out_videoburst = video_results[:3]
 
         if self.system == "PAL":
-            out_videopilot = vids[3]
+            out_videopilot = video_results[3]
             video_out = np.rec.array(
                 [
                     out_video.astype(np.float32),

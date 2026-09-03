@@ -21,7 +21,8 @@ Correctness invariants:
   Before that, decoder parameters (AGC levels, auto-deemp filters) are
   still being recalibrated mid-stream and could change under a
   prefetched block.
-- ``mtf_level`` is part of the cache key, and any post-warm-up
+- ``mtf_level`` and ``inverse_mtf_strength`` are part of the cache
+  key, and any post-warm-up
   parameter change happens via a field redo, which flushes the cache.
 - The assembled output is the same per-block concatenation the serial
   path produces, so decode results are bit-identical for any thread
@@ -90,7 +91,31 @@ def _demod_worker_init(rf_opts, decoder_params, field_cfg=None):
     _worker_cfg = field_cfg
 
 
-def _demod_worker_block(rawinput, mtf_level):
+def _sync_worker_veq(veq):
+    """Adopt a per-job dynamic video EQ in this worker (see
+    _sync_worker_imtf)."""
+    veq = tuple(veq) if veq else None
+    if _worker_rf.DecoderParams.get("video_eq_auto") != veq:
+        _worker_rf.DecoderParams["video_eq_auto"] = veq
+        _worker_rf.recompute_fvideo()
+
+
+def _sync_worker_imtf(imtf_strength):
+    """Adopt a per-job inverse-MTF strength in this worker.
+
+    Strength changes propagate per job (like mtf_level) instead of by
+    respawning the pool: rebuild only FVideo, and only when the value
+    actually changed (adoptions are dead-banded, so this is rare)."""
+    if (_worker_rf.DecoderParams.get("inverse_mtf_strength", 0.0)
+            != imtf_strength):
+        _worker_rf.DecoderParams["inverse_mtf_strength"] = imtf_strength
+        _worker_rf.recompute_fvideo()
+
+
+def _demod_worker_block(rawinput, mtf_level, imtf_strength=None, veq=None):
+    if imtf_strength is not None:
+        _sync_worker_imtf(imtf_strength)
+        _sync_worker_veq(veq)
     return _worker_rf.demodblock(
         data=rawinput,
         mtf_level=mtf_level,
@@ -99,7 +124,8 @@ def _demod_worker_block(rawinput, mtf_level):
 
 
 def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
-                         audio_field_number):
+                         imtf_strength, veq, audio_field_number,
+                         chroma_dg=None):
     """Decode one complete field in this worker process.
 
     Replicates decodefield()'s window math and demod_read()'s per-block
@@ -113,10 +139,13 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
     """
     import numpy as np
 
-    from .field import FieldNTSC, FieldPAL
+    from .field import (FieldNTSC, FieldPAL, apply_chroma_dg_correction_output,
+                        chroma_dg_output_key)
     from .metrics import computeMetrics, detect_levels
 
     try:
+        _sync_worker_imtf(imtf_strength)
+        _sync_worker_veq(veq)
         rf = _worker_rf
         cfg = _worker_cfg
 
@@ -167,12 +196,29 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
             wow_level_adjust_smoothing=cfg["wow_level_adjust_smoothing"],
             wow_interpolation_method=cfg["wow_interpolation_method"],
         )
+        # the 2T MTF servo needs to know what parameters each field was
+        # demodulated under (measurements are closed-loop)
+        f.decoded_mtf_level = mtf_level
+        f.decoded_imtf_strength = imtf_strength
+        f.decoded_video_eq = tuple(veq) if veq else None
         f.process()
 
         if not f.valid:
             return {"seq": seq, "valid": False}
 
         picture, _, efm = f.downscale(linesout=cfg["output_lines"], final=True)
+
+        # The TBC output's chroma differential gain/phase correction is
+        # a pure function of the picture and the servo's (slope, phase),
+        # so it runs here on a copy - f.dspicture stays raw for the
+        # servos - and rides the result with the key it was computed
+        # under; the writer keeps it only while that key is current
+        # (see field.chroma_dg_output_picture).
+        f.chroma_dg_applied = None
+        if chroma_dg is not None and any(chroma_dg):
+            slope, phase = chroma_dg
+            picture = apply_chroma_dg_correction_output(picture, f, slope, phase)
+            f.chroma_dg_applied = chroma_dg_output_key(rf, slope, phase)
 
         metrics = computeMetrics(rf, f, None, verbose=True)
         f.precomputed_metrics = metrics
@@ -189,7 +235,7 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
         )
 
         nextfieldoffset = float(f.nextfieldoffset)
-        f.prepare_transport()
+        f.prepare_transport(keep_demod=cfg.get("keep_demod", False))
 
         return {
             "seq": seq,
@@ -202,6 +248,7 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
             "nextfieldoffset": nextfieldoffset,
             "readloc_block": readloc_block,
             "mtf_level": mtf_level,
+            "imtf_strength": imtf_strength,
         }
     except Exception:
         import traceback
@@ -256,6 +303,9 @@ class FieldJobEngine:
         self._cur_parity = True
         self._lfw = None
         self._mtf = 0.0
+        self._imtf = 0.0
+        self._veq = None
+        self._chroma_dg = None
         self._rebase_seq = 0
 
         self._thread = threading.Thread(
@@ -263,7 +313,8 @@ class FieldJobEngine:
         )
         self._thread.start()
 
-    def reset(self, start, next_is_first, lastfieldwritten, mtf_level):
+    def reset(self, start, next_is_first, lastfieldwritten, mtf_level,
+              imtf_strength=0.0, veq=None, chroma_dg=None):
         """(Re)start speculation from known chain state."""
         with self._cond:
             self._gen += 1
@@ -277,6 +328,9 @@ class FieldJobEngine:
             self._cur_parity = bool(next_is_first)
             self._lfw = lastfieldwritten
             self._mtf = mtf_level
+            self._imtf = imtf_strength
+            self._veq = tuple(veq) if veq else None
+            self._chroma_dg = tuple(chroma_dg) if chroma_dg else None
             self._rebase_seq = 0
             self._active = True
             self._cond.notify_all()
@@ -297,6 +351,24 @@ class FieldJobEngine:
         already-dispatched jobs (tolerant parameter mode)."""
         with self._cond:
             self._mtf = mtf_level
+
+    def set_imtf(self, imtf_strength):
+        """Adopt a new inverse-MTF strength for future dispatches (the
+        workers rebuild FVideo per job; see _sync_worker_imtf)."""
+        with self._cond:
+            self._imtf = imtf_strength
+
+    def set_veq(self, veq):
+        """Adopt a new dynamic video EQ for future dispatches."""
+        with self._cond:
+            self._veq = tuple(veq) if veq else None
+
+    def set_chroma_dg(self, chroma_dg):
+        """Adopt a new chroma DG (slope, phase) for future dispatches.
+        Jobs in flight keep the old pair; the writer re-corrects those
+        from the raw picture, so nothing needs discarding."""
+        with self._cond:
+            self._chroma_dg = tuple(chroma_dg) if chroma_dg else None
 
     def stop(self):
         with self._cond:
@@ -375,6 +447,9 @@ class FieldJobEngine:
                 if start is None:
                     start = self._cur_start
                 mtf = self._mtf
+                imtf = self._imtf
+                veq = self._veq
+                chroma_dg = self._chroma_dg
                 parity = self._cur_parity
                 fn = self._predict_field_number(start)
 
@@ -391,7 +466,8 @@ class FieldJobEngine:
                     continue
 
                 fut = self.executor.submit(
-                    _decode_field_worker, seq, start, raw, span_begin, mtf, fn
+                    _decode_field_worker, seq, start, raw, span_begin, mtf,
+                    imtf, veq, fn, chroma_dg
                 )
                 self._futures[seq] = fut
                 self._next_dispatch = seq + 1
@@ -465,7 +541,7 @@ class DemodBlockCache:
     """Thread-pooled, prefetching cache of demodulated input blocks.
 
     read_fn(block_idx) returns the block's raw samples, or None at EOF.
-    demod_fn(raw, mtf_level) demodulates one block.
+    demod_fn(raw, mtf_level, imtf_strength) demodulates one block.
     Cached values are (raw, demod) tuples; None marks EOF.
     """
 
@@ -483,7 +559,7 @@ class DemodBlockCache:
         self._proc_inflight = set()         # submitted-to-pool, not yet done
         self._lock = threading.Lock()       # protects _cache/_eof_block
         self._read_lock = threading.Lock()  # serializes the raw reader
-        self._cache = {}                    # (block, mtf) -> Future
+        self._cache = {}                    # (block, mtf, imtf) -> Future
         self._eof_block = None
 
     def enable_processes(self, rf_opts, decoder_params, nprocs=None,
@@ -505,15 +581,10 @@ class DemodBlockCache:
         """
         rf_opts = dict(rf_opts)
         # Drop values demod does not need and that may not pickle.
-        # _acquired_event is a threading.Event (unpicklable): defer mode
-        # forces serial demod so this path is never taken while deferring,
-        # but if it ever were, a worker must not receive the event - it
-        # would see defer=True with event=None and deterministically keep
-        # the spur filter off.
         rf_opts["extra_options"] = {
             k: v
             for k, v in rf_opts.get("extra_options", {}).items()
-            if k not in ("pipe_RF_TBC", "_acquired_event")
+            if k not in ("pipe_RF_TBC",)
         }
 
         self._procs = ProcessPoolExecutor(
@@ -525,10 +596,12 @@ class DemodBlockCache:
         procs = self._procs
         inflight = self._proc_inflight
 
-        def demod_in_process(rawinput, mtf_level):
+        def demod_in_process(rawinput, mtf_level, imtf_strength=None,
+                             veq=None):
             # Track the in-flight future so close() can drain the pool
             # before touching the worker processes (see close()).
-            fut = procs.submit(_demod_worker_block, rawinput, mtf_level)
+            fut = procs.submit(_demod_worker_block, rawinput, mtf_level,
+                               imtf_strength, veq)
             inflight.add(fut)
             fut.add_done_callback(inflight.discard)
             return fut.result()
@@ -554,19 +627,21 @@ class DemodBlockCache:
     def read_lock(self):
         return self._read_lock
 
-    def get_span(self, brange, mtf_level):
+    def get_span(self, brange, mtf_level, imtf_strength=None, veq=None):
         """Demodulated blocks for brange (list of (raw, demod)), or None
         if EOF falls inside the span.  Schedules a sequential prefetch
-        beyond the span at the same mtf_level."""
+        beyond the span at the same parameters."""
         with self._lock:
-            futures = [self._ensure(b, mtf_level) for b in brange]
+            veq = tuple(veq) if veq else None
+            futures = [self._ensure(b, mtf_level, imtf_strength, veq)
+                       for b in brange]
 
             for b in range(brange.stop, brange.stop + self.ahead):
                 if self._eof_block is not None and b >= self._eof_block:
                     break
-                self._ensure(b, mtf_level)
+                self._ensure(b, mtf_level, imtf_strength, veq)
 
-            self._evict(brange.start, mtf_level)
+            self._evict(brange.start, mtf_level, imtf_strength, veq)
 
         out = []
         for fut in futures:
@@ -621,8 +696,8 @@ class DemodBlockCache:
 
     # internal - callers hold self._lock
 
-    def _ensure(self, b, mtf_level):
-        key = (b, mtf_level)
+    def _ensure(self, b, mtf_level, imtf_strength=None, veq=None):
+        key = (b, mtf_level, imtf_strength, veq)
         fut = self._cache.get(key)
 
         if fut is None:
@@ -630,21 +705,23 @@ class DemodBlockCache:
                 fut = Future()
                 fut.set_result(None)
             else:
-                fut = self._pool.submit(self._compute, b, mtf_level)
+                fut = self._pool.submit(self._compute, b, mtf_level,
+                                        imtf_strength, veq)
             self._cache[key] = fut
 
         return fut
 
-    def _evict(self, current_start, mtf_level):
+    def _evict(self, current_start, mtf_level, imtf_strength=None, veq=None):
         cutoff = current_start - self.keep_behind
         stale = [
             key for key in self._cache
-            if key[0] < cutoff or key[1] != mtf_level
+            if (key[0] < cutoff or key[1] != mtf_level
+                or key[2] != imtf_strength or key[3] != veq)
         ]
         for key in stale:
             self._cache.pop(key).cancel()
 
-    def _compute(self, b, mtf_level):
+    def _compute(self, b, mtf_level, imtf_strength=None, veq=None):
         with self._read_lock:
             raw = self.read_fn(b)
 
@@ -654,4 +731,70 @@ class DemodBlockCache:
                     self._eof_block = b
             return None
 
-        return raw, self.demod_fn(raw, mtf_level)
+        return raw, self.demod_fn(raw, mtf_level, imtf_strength, veq)
+
+
+class OrderedOutputLane:
+    """Run the per-field output work on one background thread, in order.
+
+    Everything that happens to a field after it is committed - the EFM
+    demodulation, the metadata database row, the CVBS frame assembly
+    and the file writes - is a function of that field and of state only
+    the output stage touches, so it can trail the commit loop by a few
+    fields without changing a byte: the callables run one at a time, in
+    submission order, exactly as the serial decode would have run them
+    inline.  The commit thread only blocks when the lane's bounded
+    look-ahead is full.
+
+    A failure in the lane (a full disk, say) is re-raised on the
+    submitting thread at its next submit() or at close(); the work
+    queued behind the failed callable is dropped.
+    """
+
+    def __init__(self, depth=16, name="ld-output"):
+        import queue
+
+        self._queue = queue.Queue(maxsize=depth)
+        self._error = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, fn, *args):
+        """Queue fn(*args) behind everything submitted before it."""
+        self._raise_error()
+        if self._closed:
+            raise RuntimeError("output lane is closed")
+        self._queue.put((fn, args))
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            if self._error is not None:
+                continue  # drop what was queued behind the failure
+            fn, args = item
+            try:
+                fn(*args)
+            except BaseException as exc:  # surfaced on the submitting thread
+                self._error = exc
+
+    def _raise_error(self):
+        if self._error is not None:
+            exc, self._error = self._error, None
+            raise exc
+
+    @property
+    def failed(self):
+        return self._error is not None
+
+    def close(self):
+        """Finish the queued work and stop the thread; re-raises a
+        failure that has not been surfaced yet."""
+        if not self._closed:
+            self._closed = True
+            self._queue.put(None)
+        self._thread.join()
+        self._raise_error()

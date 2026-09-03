@@ -4,9 +4,10 @@ ld-decode's execution is largely controlled by a number of command line switches
 
 ```
 ld-decode [-h] [--start file-location] [--length frames] [--seek frame] [--PAL] [--NTSC] [--NTSCJ] [-m mtf]
-                 [--MTF_offset mtf_offset] [--noAGC] [--noDOD] [--noEFM] [--preEFM] [--disable_analog_audio] [--AC3]
+                 [--MTF_offset mtf_offset] [--noAGC] [--noDOD] [--noEFM] [--preEFM] [--tbc_efm] [--efm_demod {pll,timing}] [--efm_conf {auto,on,off}] [--efm_eq_taps N] [--disable_analog_audio] [--AC3]
                  [--start_fileloc start_fileloc] [--ignoreleadout] [--verboseVITS] [--RF_TBC] [--lowband]
-                 [--NTSC_color_notch_filter] [--V4300D_notch_filter] [--deemp_low deemp_low] [--deemp_high deemp_high]
+                 [--NTSC_color_notch_filter] [--V4300D_notch_filter] [--V4300D_coherent_subtract] [--V4300D_no_defer]
+                 [--deemp_low deemp_low] [--deemp_high deemp_high]
                  [--deemp_strength deemp_str] [-t threads] [-f FREQ] [--analog_audio_frequency AFREQ]
                  [--video_bpf_low FREQ] [--video_bpf_high FREQ] [--video_lpf FREQ] [--video_lpf_order VLPF_ORDER]
                  [--audio_filterwidth FREQ] [--use_profiler] [--write-test-ldf output.ldf]
@@ -242,15 +243,35 @@ ld-decode --NTSC --NTSC_color_notch_filter input.ldf output
 
 ### PAL-Specific Video Options
 
-#### `--V4300D_notch_filter`, `-V`
-Remove spurious ~8.5MHz signal present in LD-V4300D PAL/digital audio captures.
+Pioneer LD-V4300D players leak their digital-audio master clock
+(192 x 44.1 kHz = 8.4672 MHz, with weaker satellites at ±88.2 kHz
+multiples) into the RF output when playing PAL discs with digital audio.
+The tone beats against the video FM carrier and shows up as a fine wavy
+pattern rolling through solid picture areas.
+
+#### `--V4300D_coherent_subtract`
+Remove the LD-V4300D spur by estimating the clock line (and its
+satellites) coherently and subtracting the fitted tones from the
+spectrum, without cutting holes in the video sidebands. Self-disabling
+on captures without the spur, and inactive on blocks with no video
+carrier, so it is safe from the first block and keeps the parallel
+(multi-threaded) decode path available.
 - **Default:** Disabled
-- **Note:** Only effective with PAL video standard; specific to Pioneer LD-V4300D player captures
+- **Note:** Only effective with PAL video standard
 
 **Example:**
 ```bash
-ld-decode --PAL --V4300D_notch_filter input.ldf output
+ld-decode --PAL --V4300D_coherent_subtract input.ldf output
 ```
+
+#### `--V4300D_notch_filter`, `-V`
+Legacy alias for `--V4300D_coherent_subtract` (which supersedes the
+original FFT-bin notch: it also removes the spur's leakage skirts and
+its satellites). Kept so existing command lines continue to work.
+
+#### `--V4300D_no_defer`
+Obsolete; accepted for compatibility and ignored. The spur filter no
+longer defers until sync acquisition and never forces a serial decode.
 
 ### Deemphasis Options
 
@@ -346,7 +367,7 @@ ld-decode --audio_filterwidth 150kHz input.ldf output
 #### `--noEFM`
 Disable EFM (Eight-to-Fourteen Modulation) front end for digital audio.
 - **Default:** EFM decoding is enabled
-- **Note:** EFM is used for digital audio (CD audio) on laserdiscs; disabling skips digital audio extraction
+- **Note:** EFM is used for digital audio (CD audio) on laserdiscs and for LV-ROM data; disabling skips digital audio extraction. See [EFM decoding](../technical/efm-decoding.md) for the EFM path, its tuning environment variables, and the `.efm` output format (including confidence-packed output).
 
 **Example:**
 ```bash
@@ -361,6 +382,38 @@ Write filtered but otherwise pre-processed EFM data.
 **Example:**
 ```bash
 ld-decode --preEFM input.ldf output
+```
+
+#### `--tbc_efm`
+Time-base-correct the EFM waveform onto the video line time-base before the EFM PLL.
+- **Default:** Disabled (also enabled by `LDDECODE_TBC_EFM=1`)
+- **Note:** Experimental; does not improve a single-capture decode. It aligns the pre-PLL EFM of multiple captures of the same disc onto a common disc-position time-base for cross-capture stacking and waveform research — see [EFM decoding](../technical/efm-decoding.md).
+
+**Example:**
+```bash
+ld-decode --tbc_efm input.ldf output
+```
+
+#### `--efm_demod`
+Select the EFM demodulator that turns the equalised EFM waveform into `.efm` T-values.
+- **Default:** `timing`
+- **Choices:** `timing` (symbol-rate timing-recovery demodulator: per-channel-bit Mueller & Müller loop with bit-domain frame sync, sync restoration and legalised T emission), `pll` (the previous zero-crossing run-length PLL)
+- **Note:** `timing` recovers noticeably more valid frames on noisy or marginal captures — it met or beat the PLL on every validation capture — and derives per-T-value confidence from its framing state. Use `pll` to reproduce pre-switch `.efm` output byte for byte. See [EFM decoding](../technical/efm-decoding.md) for the architecture and its tuning environment variables.
+
+**Example:**
+```bash
+ld-decode --efm_demod pll input.ldf output
+```
+
+#### `--efm_conf`
+Confidence-packed `.efm` output for `--tbc` mode: each byte carries the T-value in its low nibble and a 4-bit demodulator doubt in its high nibble (the byte layout of the CVBS EFM extension format; consumers separate them as `t = byte & 0x0F`, `doubt = byte >> 4` — 0 = full trust, so trusted bytes stay plain T-values). CVBS output always writes this layout — the extension format defines it — so this option only affects `--tbc` output.
+- **Default:** `auto` — **off** for `--tbc` output so the plain `.efm` keeps working with legacy tools
+- **Choices:** `auto`, `on`, `off` (`LDDECODE_EFM_EMITCONF=1`/`0` is the environment equivalent of on/off)
+- **Note:** a packed stream cannot be distinguished from a plain one by inspection, so only force `on` for `--tbc` output when the consumer knows it is getting packed data. See [EFM decoding](../technical/efm-decoding.md).
+
+**Example:**
+```bash
+ld-decode --tbc --efm_conf on input.ldf output
 ```
 
 #### `--AC3`
@@ -412,11 +465,11 @@ ld-decode -f 8fsc input.ldf output
 ### Processing Options
 
 #### `-t threads`, `--threads threads`
-Number of CPU threads to use for decoding.
+Number of worker processes to decode fields with.
 - **Type:** Integer
-- **Default:** 4
-- **Range:** 1 to number of CPU cores
-- **Note:** More threads can speed up processing but may have diminishing returns beyond the number of CPU cores
+- **Default:** 0 (auto): the machine's physical cores minus 2, capped at 10
+- **Range:** 1 (serial decode) to number of CPU cores
+- **Note:** The workers are FFT-bound, so counting SMT (hyper-threading) siblings as cores oversubscribes the machine; an 8-core/16-thread CPU decodes faster with 6 workers than with 10. Output is bit-identical for any thread count.
 
 **Example:**
 ```bash
@@ -553,7 +606,7 @@ ld-decode --NTSC --NTSC_color_notch_filter input.ldf output
 
 ### PAL V4300D Capture
 ```bash
-ld-decode --PAL --V4300D_notch_filter input.ldf output
+ld-decode --PAL --V4300D_coherent_subtract input.ldf output
 ```
 
 ### Video Only (No Audio)

@@ -70,12 +70,13 @@ def pal_lattice_positions(n_samples, origin_lines=Fraction(0)):
 import os
 import sqlite3
 import struct
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 
 _META_SCHEMA = """
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 
 CREATE TABLE cvbs_file (
     cvbs_file_id                INTEGER PRIMARY KEY,
@@ -85,13 +86,14 @@ CREATE TABLE cvbs_file (
         CHECK (sample_encoding_preset IN ('CVBS_U10_4FSC', 'CVBS_U16_4FSC', 'RAW_S16_28M', 'RAW_S16_40M', 'CVBS_TPG21_4FSC', 'CVBS_S16_4FSC')),
     signal_state_preset         TEXT    NOT NULL
         CHECK (signal_state_preset IN (
-            'STANDARD_TBC_LOCKED',
-            'STANDARD_TBC_UNLOCKED',
+            'STANDARD_STABLE_LOCKED',
+            'STANDARD_STABLE_UNLOCKED',
             'STANDARD_RAW',
-            'NONSTANDARD_TBC_LOCKED',
-            'NONSTANDARD_TBC_UNLOCKED',
+            'NONSTANDARD_STABLE_LOCKED',
+            'NONSTANDARD_STABLE_UNLOCKED',
             'NONSTANDARD_RAW'
         )),
+    sequence_continuous         BOOLEAN,
     signal_type                 TEXT    NOT NULL
         CHECK (signal_type IN ('composite', 'yc')),
     decoder                     TEXT    NOT NULL,
@@ -111,14 +113,83 @@ CREATE TABLE audio_channel_pair (
 );
 """
 
+# Lowest and highest 10-bit sample value a conformant file may contain.  Both
+# sample encodings share the normative 10-bit domain and its reserved codes,
+# so the clamp is expressed there once and applied on either output path.
+# CVBS file format specification - sample-encoding-presets: protected values
+# 0-3 and 1020-1023.
+CVBS_CLAMP_LO10 = 4
+CVBS_CLAMP_HI10 = 1019
+
+# Range representable by the s16le container CVBS_U10_4FSC stores samples in.
+# Its signed headroom is what lets a decode keep excursions outside the 10-bit
+# range instead of clipping them away.
+CVBS_U10_CONTAINER_MIN = -32768
+CVBS_U10_CONTAINER_MAX = 32767
+
+
+def encode_cvbs_frame(frame, sample_encoding, has_nonstandard_values=False):
+    """Quantise one frame from the writer's working domain to file bytes.
+
+    Parameters
+    ----------
+    frame : numpy.ndarray
+        One frame in the internal working domain, which is the 10-bit sample
+        value scaled by 64 (see CVBSWriter._to_spec_levels).
+    sample_encoding : str
+        "CVBS_U10_4FSC" (s16le, the 10-bit value with signed headroom) or
+        "CVBS_U16_4FSC" (u16le, the 10-bit value shifted left 6).
+    has_nonstandard_values : bool
+        CVBS_U10_4FSC only: keep excursions outside the 10-bit range rather
+        than clamping them to the reserved-code bounds.  A u16 container
+        cannot represent them, which is why this option belongs to that
+        encoding alone.
+
+    Returns (payload_bytes, clamped_sample_count).
+
+    Both encodings quantise to the *nearest* 10-bit code, so a decode written
+    either way holds the same sample values.  Pure: no file access and no
+    writer state, so the quantisation is unit-testable on its own.
+    """
+    # The working domain is 10-bit * 64, so this is the sample value itself.
+    frame_10 = frame / 64.0
+
+    if sample_encoding == "CVBS_U10_4FSC":
+        if has_nonstandard_values:
+            lo, hi = CVBS_U10_CONTAINER_MIN, CVBS_U10_CONTAINER_MAX
+        else:
+            lo, hi = CVBS_CLAMP_LO10, CVBS_CLAMP_HI10
+    else:
+        lo, hi = CVBS_CLAMP_LO10, CVBS_CLAMP_HI10
+
+    n_clamped = int(np.count_nonzero((frame_10 < lo) | (frame_10 > hi)))
+    if n_clamped:
+        frame_10 = np.clip(frame_10, lo, hi)
+    frame_10 = np.round(frame_10)
+
+    if sample_encoding == "CVBS_U10_4FSC":
+        return frame_10.astype("<i2").tobytes(), n_clamped
+    # Scale the quantised code into the container.  Rounding to 16 bits and
+    # masking the low six bits off would floor rather than round, biasing
+    # every sample down by up to one code (about 0.17 IRE) against the
+    # CVBS_U10_4FSC path for the same decode.
+    # CVBS file format specification - sample-encoding-presets:
+    # u16 = value_10bit * 64.
+    return (frame_10.astype(np.int32) << 6).astype("<u2").tobytes(), n_clamped
+
 
 class CVBSWriter:
     """Assembles decoded fields into spec-compliant CVBS output.
 
-    Writes <basename>.composite (u16le, CVBS_U16_4FSC), <basename>.meta
-    (SQLite, spec core schema), optional <basename>_audio_0.wav, and the
-    dropout / EFM extension sidecars (<basename>.dropouts.meta,
-    <basename>.efm + .efm.meta).
+    Writes <basename>.cvbs, <basename>.meta (SQLite, spec core schema),
+    optional <basename>_audio_0.wav, and the dropout / EFM extension
+    sidecars (<basename>.dropouts.meta, <basename>.efm + .efm.meta).
+
+    The sample encoding preset governs the binary format of the .cvbs
+    file.  CVBS_U10_4FSC (s16le, 10-bit domain with signed headroom)
+    is selected automatically when the signal contains non-standard
+    values such as PAL pilot bursts; CVBS_U16_4FSC (u16le, 10-bit<<6)
+    is used otherwise.  An explicit choice overrides the auto-selection.
 
     Audio follows the SMPTE 272M-1994 profile the spec mandates: one
     channel pair (stereo) stored as a 48 kHz, 24-bit signed little-endian
@@ -154,23 +225,30 @@ class CVBSWriter:
     def __init__(self, fname_out, system, logger=None, version=None,
                  black_level=None, write_audio=False,
                  audio_description="Analogue stereo", capture_notes=None,
-                 has_nonstandard_values=None, write_efm=False):
+                 has_nonstandard_values=None, write_efm=False,
+                 sample_encoding=None, resample_executor=None):
         self.system = system
         self.params = CVBSParams_PAL if system == "PAL" else CVBSParams_NTSC
         self.fname_out = fname_out
         self.logger = logger
+        self.has_nonstandard_values = has_nonstandard_values
 
-        self.f_video = open(fname_out + ".composite", "wb")
+        if sample_encoding is None:
+            sample_encoding = (
+                "CVBS_U10_4FSC" if has_nonstandard_values
+                else "CVBS_U16_4FSC"
+            )
+        self.sample_encoding = sample_encoding
 
-        self._pending_first = None   # (field, fi, pic_or_None, efm)
+        self.f_video = open(fname_out + ".cvbs", "wb")
+
+        self._pending_first = None   # (field, fi, pic_or_None, efm, audio)
         self._started = False
         self._fields_seen = 0
         self.frames_written = 0
         self.clamped_samples = 0
 
         lv = self.params["levels"]
-        self.clamp_lo = 4 * 64
-        self.clamp_hi = 1019 * 64
         self.blank16 = lv["blanking"] * 64
         self.white16 = lv["white"] * 64
 
@@ -178,6 +256,25 @@ class CVBSWriter:
         self._pal_shift = 0.0          # lattice-sample lattice shift
         self._lock_initialised = False
         self._lock_residuals = []      # per-frame residual, degrees
+
+        # PAL frames resample both fields under one lock shift, and only
+        # field A feeds the lock, so field B's resample (the longer one:
+        # its 354689-sample lattice length is prime, which puts every
+        # FFT in the chroma DG corrector on the Bluestein path) runs on
+        # this executor alongside field A's on the calling thread.  Both
+        # complete inside _emit_frame, so nothing they read (the lock
+        # shift, DecoderParams) can change under them.  Injectable for
+        # tests; created on first use otherwise, released by close().
+        self._resample_executor = resample_executor
+        self._owns_resample_executor = False
+
+        # sequence continuity (spec sequence_continuous): the file is one
+        # unbroken sequence unless the writer drops a field mid-file or the
+        # decoder's fieldPhaseID progression breaks; without phase IDs to
+        # check against, continuity is unknown (NULL), not asserted.
+        self._seq_broken = False
+        self._phase_seen = False
+        self._last_phase = None
 
         # extension sidecar state
         self.dropout_rows = []         # (frame_id, sample_start, count, sev)
@@ -190,7 +287,6 @@ class CVBSWriter:
         self.version = version or ""
         self.black_level = black_level
         self.capture_notes = capture_notes
-        self.has_nonstandard_values = has_nonstandard_values
 
         # audio
         self.write_audio = write_audio
@@ -222,13 +318,32 @@ class CVBSWriter:
                 return
             self._started = True
 
+        # Source-side continuity: consecutive fields must advance the colour
+        # sequence by exactly one position.  Breaks only matter once content
+        # is (or may end up) in the file; earlier ones just move the start.
+        phase = fi.get("fieldPhaseID")
+        if phase is not None:
+            cycle = 4 if self.system == "NTSC" else 8
+            if (self._last_phase is not None
+                    and phase != self._last_phase % cycle + 1
+                    and (self.frames_written > 0
+                         or self._pending_first is not None)):
+                self._seq_broken = True
+            self._last_phase = phase
+            self._phase_seen = True
+
         if is_first:
-            if self._pending_first is not None and self.logger:
-                self.logger.warning("CVBS: dropping unpaired first field")
+            if self._pending_first is not None:
+                if self.frames_written > 0:
+                    self._seq_broken = True
+                if self.logger:
+                    self.logger.warning("CVBS: dropping unpaired first field")
             self._pending_first = (field, fi, picture, efm, audio)
             return
 
         if self._pending_first is None:
+            if self.frames_written > 0:
+                self._seq_broken = True
             if self.logger:
                 self.logger.warning("CVBS: dropping unpaired second field")
             return
@@ -251,23 +366,30 @@ class CVBSWriter:
             # PAL: resample both fields onto the frame lattice with the
             # current lock shift.  On the first frame, measure and anchor
             # (one re-resample); afterwards track with small corrections.
-            a = f_a.downscale_cvbs(self._pal_shift)
+            # Burst measurement runs on the decoder-domain output (before
+            # _to_spec_levels) so the amplitude threshold is consistent.
             if not self._lock_initialised:
-                delta = self._pal_phase_error(a)
+                a_raw = f_a.downscale_cvbs(self._pal_shift)
+                delta = self._pal_phase_error(a_raw)
                 if delta is not None:
                     self._pal_shift += delta / 90.0
-                    a = f_a.downscale_cvbs(self._pal_shift)
+                    a_raw = f_a.downscale_cvbs(self._pal_shift)
                 self._lock_initialised = True
-            b = f_b.downscale_cvbs(self._pal_shift)
-            a = self._to_spec_levels(a, f_a)
-            b = self._to_spec_levels(b, f_b)
-            frame = np.concatenate([a, b])
+                b_raw = f_b.downscale_cvbs(self._pal_shift)
+            else:
+                b_pending = self._resampler().submit(
+                    f_b.downscale_cvbs, self._pal_shift)
+                a_raw = f_a.downscale_cvbs(self._pal_shift)
+                b_raw = b_pending.result()
 
-            resid = self._pal_phase_error(a)
+            resid = self._pal_phase_error(a_raw)
             if resid is not None:
                 self._lock_residuals.append(resid)
-                # tracking: correct slow Sc/H drift, next frame
                 self._pal_shift += np.clip(resid / 90.0, -0.05, 0.05)
+
+            a = self._to_spec_levels(a_raw, f_a)
+            b = self._to_spec_levels(b_raw, f_b)
+            frame = np.concatenate([a, b])
 
         frame_id = self.frames_written
         self._write_frame(frame)
@@ -277,12 +399,22 @@ class CVBSWriter:
             if aud is not None:
                 self.push_audio(aud)
 
+    def _resampler(self):
+        if self._resample_executor is None:
+            self._resample_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cvbs-resample")
+            self._owns_resample_executor = True
+        return self._resample_executor
+
     def _as_u16(self, picture):
         return (np.frombuffer(picture, dtype=np.uint16)
                 if isinstance(picture, (bytes, bytearray)) else picture)
 
     def _to_spec_levels(self, x, f):
         """Remap decoder 16-bit output onto the spec's level anchors.
+
+        Returns float64 in the internal working domain (10-bit * 64);
+        _write_frame applies the final encoding-specific conversion.
 
         The decoder's 16-bit scale pins the SYNC TIP at SysParams
         outputZero and white at output_white, with the measured (AGC)
@@ -299,28 +431,27 @@ class CVBSWriter:
         Without a field to read the decoder's anchors from, the data is
         assumed to be at spec levels already."""
         if f is None:
-            return x
+            return x.astype(np.float64)
         blank_dec = float(f.hz_to_output(f.rf.DecoderParams["ire0"]))
         white_dec = float(f.hz_to_output(f.rf.iretohz(100.0)))
         gain = (self.white16 - self.blank16) / (white_dec - blank_dec)
-        out = (x.astype(np.float64) - blank_dec) * gain + self.blank16
-        return np.clip(np.round(out), 0, 65535).astype(np.uint16)
+        return (x.astype(np.float64) - blank_dec) * gain + self.blank16
 
     def _write_frame(self, frame):
         fs = self.params["frame_samples"]
         if len(frame) != fs:
+            if self.frames_written > 0:
+                self._seq_broken = True
             if self.logger:
                 self.logger.warning(
                     "CVBS: frame size %d != %d, dropping", len(frame), fs)
             return
-        n_out = int(np.count_nonzero((frame < self.clamp_lo)
-                                     | (frame > self.clamp_hi)))
-        if n_out:
-            self.clamped_samples += n_out
-            frame = np.clip(frame, self.clamp_lo, self.clamp_hi)
-        # CVBS_U16_4FSC: 10-bit values << 6 — force the 6 LSBs clear
-        frame = (frame & 0xFFC0).astype("<u2")
-        self.f_video.write(frame.tobytes())
+
+        payload, n_clamped = encode_cvbs_frame(
+            frame, self.sample_encoding, self.has_nonstandard_values)
+        self.clamped_samples += n_clamped
+        self.f_video.write(payload)
+
         self.frames_written += 1
 
     # -- burst lock -------------------------------------------------------
@@ -380,11 +511,11 @@ class CVBSWriter:
     def _lock_state(self):
         """Decide the signal_state_preset from the measured residuals."""
         if len(self._lock_residuals) < max(1, self.frames_written // 2):
-            return "STANDARD_TBC_UNLOCKED"
+            return "STANDARD_STABLE_UNLOCKED"
         r = np.array(self._lock_residuals[1:] or self._lock_residuals)
         if np.max(np.abs(r)) <= self.LOCK_TOL:
-            return "STANDARD_TBC_LOCKED"
-        return "STANDARD_TBC_UNLOCKED"
+            return "STANDARD_STABLE_LOCKED"
+        return "STANDARD_STABLE_UNLOCKED"
 
     # -- extensions -------------------------------------------------------
 
@@ -506,6 +637,11 @@ class CVBSWriter:
         self.f_video.close()
         self.f_video = None
 
+        if self._owns_resample_executor:
+            self._resample_executor.shutdown(wait=True)
+            self._resample_executor = None
+            self._owns_resample_executor = False
+
         if self.f_wav is not None:
             self._finalise_audio()
             self.f_wav.seek(0)
@@ -522,15 +658,26 @@ class CVBSWriter:
             self._write_dropouts_meta()
 
         state = self._lock_state()
-        self._write_meta(state)
+        self._write_meta(state, self._sequence_continuous())
 
         if self.logger:
             r = self._lock_residuals
+            seq = self._sequence_continuous()
             self.logger.info(
-                "CVBS: wrote %d frames, %s (%d samples clamped, burst "
-                "residual max %.2f deg over %d frames)",
-                self.frames_written, state, self.clamped_samples,
+                "CVBS: wrote %d frames %s, %s, sequence %s (%d samples "
+                "clamped, burst residual max %.2f deg over %d frames)",
+                self.frames_written, self.sample_encoding, state,
+                {1: "continuous", 0: "BROKEN"}.get(seq, "unknown"),
+                self.clamped_samples,
                 max((abs(v) for v in r), default=float("nan")), len(r))
+
+    def _sequence_continuous(self):
+        """Spec sequence_continuous value: 1 unbroken, 0 broken, None unknown."""
+        if self.frames_written == 0:
+            return None
+        if self._seq_broken:
+            return 0
+        return 1 if self._phase_seen else None
 
     @staticmethod
     def _open_db(path):
@@ -549,7 +696,7 @@ class CVBSWriter:
         con.execute("PRAGMA temp_store = MEMORY")  # index builds in RAM
         return con
 
-    def _write_meta(self, signal_state):
+    def _write_meta(self, signal_state, sequence_continuous):
         # version strings look like "branch:describe[:dirty]"
         git_branch = git_commit = None
         if self.version:
@@ -566,11 +713,12 @@ class CVBSWriter:
         con.execute(
             """INSERT INTO cvbs_file (
                    preset, sample_encoding_preset, signal_state_preset,
-                   signal_type, decoder, git_branch, git_commit,
-                   number_of_sequential_frames, black_level,
+                   sequence_continuous, signal_type, decoder, git_branch,
+                   git_commit, number_of_sequential_frames, black_level,
                    has_nonstandard_values, capture_notes
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (self.system, "CVBS_U16_4FSC", signal_state,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (self.system, self.sample_encoding, signal_state,
+             sequence_continuous,
              "composite", "ld-decode", git_branch, git_commit,
              self.frames_written if self.frames_written else None,
              self.black_level, self.has_nonstandard_values,

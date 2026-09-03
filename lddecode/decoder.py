@@ -6,37 +6,374 @@ Split verbatim out of core.py.
 import os
 import sqlite3
 import sys
-import threading
 import time
 import traceback
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from textwrap import dedent
 
 import numpy as np
 
 from . import ac3rf
-from . import efm_pll
+from . import efm_pll, efm_score
 from . import utils_logging as logs
 from .profiling import profile
 from .rfdecode import RFDecode
-from .field import Field, FieldAnchor, FieldNTSC, FieldPAL
+from .field import (CHROMA_DG_ANCHOR_IRE, Field, FieldAnchor, FieldNTSC,
+                    FieldPAL, chroma_dg_output_picture, field_output_view)
+from .parallel import OrderedOutputLane
 from .fileio import ldf_pipe
 from .filters import inrange
 from .metrics import detect_levels
 from .dsp import FieldInfo, concatenate_blocks, nb_abs, nb_median, roundfloat
 
 
+# 2T reference layouts: (bar, baseline, pulse) windows in us and the VITS
+# lines to search.  PAL: CCIR ITS (line 19, both parities).  NTSC: NTC-7
+# composite (line 20, first fields; the second-field combination signal at
+# the same line has no full bar and is rejected by the validity checks).
+#: Largest ripple, as a fraction of the line's own white bar, that the ITS
+#: bar and baseline windows may show and still be taken for an insertion
+#: test signal.  Also the isolation limit for the 2T pulse's own tails.
+ITS_FLATNESS_FRACTION = 0.15
+
+_VITS_2T_LAYOUT = {
+    "PAL": ((13.0, 19.0), (22.2, 24.4), (24.4, 26.4), (19, 18, 20)),
+    "NTSC": ((18.0, 28.0), (31.0, 33.0), (33.0, 35.0), (20, 19)),
+}
+
+
+def measure_its_2t_ratio(field, lines=None):
+    """2T pulse-to-bar ratio from the insertion test signal, or None.
+
+    Cheap single-field version of the analysis-side transient measurement
+    (see _VITS_2T_LAYOUT for the per-system windows).  The line number is
+    searched over `lines` because ITS placement can vary by one line
+    between discs.  Validity checks reject anything that is not a clean
+    bar + 2T pulse, so content lines and discs without an ITS yield
+    None and the MTF servo falls back to the b/w RF ratio mapping.
+
+    Returns (ratio, line) on success, else None.
+    """
+    bar_win, base_win, pulse_win, def_lines = \
+        _VITS_2T_LAYOUT[field.rf.system]
+    if lines is None:
+        lines = def_lines
+    for line in lines:
+        try:
+            def seg(a, b):
+                sl = field.lineslice_tbc(line, a, b - a)
+                return field.output_to_ire(
+                    field.dspicture[sl].astype(np.float64))
+            baseline_seg = seg(*base_win)
+            bar_seg = seg(*bar_win)
+            pulse_seg = seg(*pulse_win)
+        except Exception:
+            continue
+        if len(pulse_seg) < 8 or len(bar_seg) < 8 or len(baseline_seg) < 8:
+            continue
+
+        baseline = float(np.median(baseline_seg))
+        bar = float(np.median(bar_seg)) - baseline
+        # must look like the ITS white bar over a blanking-level baseline
+        if not (80.0 <= bar <= 125.0) or abs(baseline) > 6.0:
+            continue
+        # Flatness is judged against the bar this line carries, not in
+        # absolute IRE.  A noisy pressing still presents a perfectly good
+        # ITS - BBC Domesday DD86-DS1 runs 6-10 IRE of noise on every line,
+        # against 2-4 IRE on a Pioneer calibration disc - and an absolute
+        # 4 IRE gate rejected it outright, so the 2T servo never engaged on
+        # exactly the discs whose HF response most needed correcting (its
+        # 2T pulse then reads 0.85-0.90 of the bar against 0.99 where the
+        # servo runs).  What separates an ITS from picture content is
+        # structure, and structure is a large fraction of the bar: content
+        # lines on the same disc scatter by 70-90% of it.  The same
+        # relative scale is used by the isolation test below.  Measurement
+        # noise is judged where it can be judged, over a pool of fields, by
+        # the scatter gate in _mtf_servo_estimate().
+        if (np.std(bar_seg) > ITS_FLATNESS_FRACTION * bar
+                or np.std(baseline_seg) > ITS_FLATNESS_FRACTION * bar):
+            continue
+
+        # Locate the peak on a 3-tap-smoothed copy (argmax over the raw
+        # window rides positive noise excursions, biasing the ratio high
+        # and shifting the servo equilibrium), then interpolate the
+        # height from the raw samples at that index.
+        sm = np.convolve(pulse_seg, [0.25, 0.5, 0.25], mode="same")
+        pk = int(np.argmax(sm[1:-1])) + 1
+        if pk == 0 or pk == len(pulse_seg) - 1:
+            continue
+        # parabolic sub-sample peak: the 2T pulse top spans few samples
+        a, b, c = pulse_seg[pk - 1], pulse_seg[pk], pulse_seg[pk + 1]
+        denom = a - 2 * b + c
+        peak = float(b) if denom >= 0 else float(b - 0.125 * (a - c) ** 2 / denom)
+        pulse = peak - baseline
+        ratio = pulse / bar
+        if not (0.5 <= ratio <= 1.6):
+            continue
+
+        # half-amplitude width sanity: rejects blobs that are not a 2T pulse
+        half = baseline + pulse / 2.0
+        width = int(np.count_nonzero(pulse_seg > half))
+        had_ns = width / field.rf.SysParams["outfreq"] * 1000.0
+        if not (80.0 <= had_ns <= 400.0):
+            continue
+
+        # the pulse must be isolated: away from the peak the window
+        # returns to baseline (rejects content/noise in the window)
+        tails = np.concatenate([pulse_seg[:max(pk - 6, 0)],
+                                pulse_seg[pk + 7:]])
+        if (len(tails) < 8 or np.median(np.abs(tails - baseline))
+                > ITS_FLATNESS_FRACTION * pulse):
+            continue
+        return ratio, line
+    return None
+
+
+#: Zone windows, in us from 0H, of the PAL insertion test signal's
+#: modulated staircase (IEC 60856-1986 9.1.3 Figure 9; tread timing per
+#: ITU-T J.63 Annex I sections 2 and 4): the blanking-level stretch of
+#: the superimposed subcarrier, then the five treads at 20..100 IRE,
+#: each guarded 0.7 us clear of its risers so no window straddles a
+#: luminance edge.
+#: The last tread's luminance runs to 62 us but its superimposed
+#: subcarrier stops at 60 (ITU-T J.63 Annex I section 4, window 30-60):
+#: a window past 60 dilutes that tread's amplitude with the tone-free
+#: tail and biases the whole fitted slope low.
+_VITS_DG_ZONES_PAL = ((31.0, 39.0), (40.7, 43.3), (44.7, 47.3),
+                      (48.7, 51.3), (52.7, 55.3), (56.7, 59.3))
+
+
+def measure_vits_dg_staircase(field, lines=None):
+    """Chroma gain slope against luminance from the ITS staircase, or None.
+
+    Reads the modulated staircase the PAL insertion test signal carries
+    on second fields (usually line 19; searched over neighbours like the
+    2T layout, because ITS placement varies by a line between discs).
+    Each zone yields the luminance it sits at and the subcarrier
+    amplitude and phase riding on it, by the same fs/4 quadrature the
+    analysis tree uses; straight-line fits against luminance then give
+    the fractional gain change per IRE and the phase rotation in
+    degrees per IRE - the two quantities
+    field.apply_chroma_dg_correction nulls.  The zone slices share one
+    line's 4-sample subcarrier lattice (lineslice_tbc keepphase), so
+    their quadrature phases are directly comparable; each zone's phase
+    is taken relative to the blanking-level zone, which is the burst's
+    level and therefore the hue reference.
+
+    Validity checks reject anything that is not a modulated staircase:
+    the luma-only staircase first fields carry, content lines, and discs
+    with no ITS at all yield None and the correction stays off.
+
+    Returns (slope_per_ire, phase_deg_per_ire, line) on success.
+    """
+    if field.rf.system != "PAL" or field.isFirstField:
+        return None
+    if field.dspicture is None:
+        return None
+    if lines is None:
+        lines = (19, 18, 20)
+    for line in lines:
+        lumas, amps, phasors = [], [], []
+        for start, end in _VITS_DG_ZONES_PAL:
+            try:
+                sl = field.lineslice_tbc(line, start, end - start,
+                                         keepphase=True)
+                zone = field.output_to_ire(
+                    field.dspicture[sl].astype(np.float64))
+            except Exception:
+                break
+            # Whole subcarrier cycles (4 samples at 4fsc), so the
+            # luminance term and the quadrature image cancel exactly and
+            # a pure carrier reads its own amplitude.
+            usable = (len(zone) // 4) * 4
+            if usable < 16:
+                break
+            zone = zone[:usable]
+            luma = float(np.mean(zone))
+            phasor = np.mean((zone - luma)
+                             * np.exp(-0.5j * np.pi * np.arange(usable)))
+            lumas.append(luma)
+            amps.append(float(2.0 * np.abs(phasor)))
+            phasors.append(phasor)
+        if len(lumas) != len(_VITS_DG_ZONES_PAL):
+            continue
+
+        # Must look like the composite staircase: subcarrier over
+        # blanking, then five clean risers to white.
+        if abs(lumas[0]) > 8.0:
+            continue
+        treads = lumas[1:]
+        if any(b - a < 8.0 for a, b in zip(treads, treads[1:])):
+            continue
+        if not 85.0 <= treads[-1] <= 115.0:
+            continue
+        # The nominal superimposed subcarrier is a 20 IRE carrier peak;
+        # a luma-only staircase reads noise here and is rejected, as is
+        # anything so hot it cannot be the ITS.
+        if min(amps) < 8.0 or max(amps) > 45.0:
+            continue
+
+        slope, intercept = np.polyfit(lumas, amps, 1)
+        if intercept <= 5.0:
+            continue
+        per_ire = float(slope / intercept)
+        if abs(per_ire) > 0.01:
+            continue
+
+        # Phase of each zone relative to the blanking-level zone, on the
+        # shared lattice.  True differential phase is a few degrees, so
+        # anything near a wrap is corruption the amplitude gates missed.
+        relative = np.angle(np.array(phasors) * np.conj(phasors[0]),
+                            deg=True)
+        if np.max(np.abs(relative)) > 90.0:
+            continue
+        phase_per_ire = float(np.polyfit(lumas, relative, 1)[0])
+        if abs(phase_per_ire) > 0.5:
+            continue
+        return per_ire, phase_per_ire, line
+    return None
+
+
+def measure_vits_multiburst(field, lines=None):
+    """One-line VITS multiburst from a VBI line, or None.
+
+    PAL (first fields): GGV carries one on line 13 (0.5-5.8 MHz
+    packets), the Louvre disc on line 20 (0.6-5.9 MHz).  NTSC (both
+    parities): the FCC multiburst some discs carry on line 22
+    (1.25-4.1 MHz).  The NTC-7 combination multiburst (line 20 second
+    fields) is deliberately NOT used: its packets are only ~3 us — as
+    short as the scan window at NTSC 4fsc — so nearly every window
+    straddles a packet edge and the amplitude fit under-reads by up to
+    2.5 dB (measured on he010/issue176), with the wrong sign vs the
+    averaged-field analysis measurement.  Returns (packets, line)
+    where packets is a list of
+    (freq_hz, amp_ire_pp) for at least 4 packets at monotonically
+    increasing frequencies including a reference packet near 1 MHz.
+    Validity checks reject picture content and plain reference lines,
+    so discs without a multiburst line yield None and the EQ servo
+    stays inactive.
+    """
+    if field.dspicture is None:
+        return None
+    if field.rf.system == "PAL":
+        if not field.isFirstField:
+            return None
+        if lines is None:
+            lines = (13, 20)
+    elif lines is None:
+        lines = (22,)
+    fs_mhz = field.rf.SysParams["outfreq"]
+    for line in lines:
+        try:
+            sl = field.lineslice_tbc(line, 16.0, 46.0)
+            y = field.output_to_ire(field.dspicture[sl].astype(np.float64))
+        except Exception:
+            continue
+        if len(y) < 400:
+            continue
+
+        W, step = 44, 6
+        win = np.hanning(W)
+        cands = []
+        for i in range((len(y) - W) // step):
+            w = y[i * step:i * step + W]
+            wd = w - w.mean()
+            # p-p from rms: exact for a sine at any sampling phase
+            pp = float(2.0 * np.sqrt(2.0) * np.std(wd))
+            if pp < 12.0:
+                continue
+            spec = np.abs(np.fft.rfft(wd * win))
+            k = int(np.argmax(spec[1:])) + 1
+            if k >= len(spec) - 1:
+                continue
+            # tone purity: reject windows that are not a single packet
+            e_pk = spec[k - 1] ** 2 + spec[k] ** 2 + spec[k + 1] ** 2
+            if e_pk < 0.8 * float(np.sum(spec ** 2)):
+                continue
+            a, b, c = spec[k - 1], spec[k], spec[k + 1]
+            denom = a - 2 * b + c
+            if abs(denom) > 1e-12:
+                k = k + 0.5 * (a - c) / denom
+            cands.append((k * fs_mhz / W * 1e6, pp, i * step))
+
+        if len(cands) < 8:
+            continue
+        cands.sort()
+        groups = []
+        for f, a, i0 in cands:
+            if groups and f - groups[-1][0][-1] < 0.3e6:
+                groups[-1][0].append(f)
+                groups[-1][2].append(i0)
+            else:
+                groups.append(([f], a, [i0]))
+        packets = []
+        for fl, _, il in groups:
+            if len(fl) < 2:
+                continue
+            fmed = float(np.median(fl))
+            # amplitude from a least-squares sine fit over the packet's
+            # central span: unbiased for any (non-integer) cycle count,
+            # unlike the per-window rms the scan uses
+            lo, hi = min(il), max(il) + W
+            span = hi - lo
+            lo += span // 5
+            hi -= span // 5
+            seg = y[lo:hi]
+            if len(seg) < 24:
+                continue
+            t = 2 * np.pi * fmed / (fs_mhz * 1e6) * np.arange(len(seg))
+            A = np.column_stack([np.sin(t), np.cos(t), np.ones(len(seg))])
+            coef, *_ = np.linalg.lstsq(A, seg, rcond=None)
+            amp = 2.0 * float(np.hypot(coef[0], coef[1]))
+            # the fit must explain the segment (rejects noise "packets")
+            resid = seg - A @ coef
+            if np.var(resid) > 0.35 * np.var(seg - seg.mean()):
+                continue
+            packets.append((fmed, amp))
+        if len(packets) < 4:
+            continue
+        freqs = [p[0] for p in packets]
+        if any(b <= a for a, b in zip(freqs, freqs[1:])):
+            continue
+        if freqs[-1] - freqs[0] < 2.5e6:
+            continue
+        ref = [p for p in packets if 0.75e6 <= p[0] <= 1.45e6]
+        if not ref or not (25.0 <= ref[0][1] <= 90.0):
+            continue
+        return packets, line
+    return None
+
+
 class LDdecode:
     # Tolerant speculation: accept in-flight fields whose MTF level is
     # within this of the current one (2x the adoption dead-band; an MTF
-    # step this size changes HF gain by fractions of a dB).
+    # step this size changes HF gain by fractions of a dB).  Scaled by
+    # the per-system servo gain (mtf_speculation_tolerance) so it stays
+    # the same size in pulse/bar ratio terms.
     MTF_SPECULATION_TOLERANCE = 0.10
+    # Likewise for the chroma DG (slope, phase) a field job corrected the
+    # TBC picture under, in dead-bands of the servo's own adoption
+    # thresholds (see dg_speculation_tolerance).
+    DG_SPECULATION_TOLERANCE = 2.0
 
     # The .tbc.db runs with journalling off for speed; a synchronous=FULL
     # commit is forced to disk every this many fields (~1000 frames) so a
     # killed decode loses at most that tail rather than the whole database.
     DB_SYNC_FIELDS = 2000
+
+    # How many fields the output stage may trail the commit loop by
+    # (OrderedOutputLane look-ahead) before the commit thread blocks.
+    OUTPUT_LANE_DEPTH = 16
+
+    # Interpreter thread switch interval while the output lane runs.
+    # The lane's work releases the GIL (FFTs, nogil kernels, file
+    # writes) but re-takes it between steps, and each re-take waits out
+    # whatever the commit thread still holds - up to the default 5 ms,
+    # dozens of times per field: a 2.4-2.8x slowdown of the chroma DG
+    # corrector and the EFM demodulator measured beside a busy thread,
+    # 1.1-1.2x at this setting.
+    THREAD_SWITCH_INTERVAL = 0.0005
 
     def __init__(
         self,
@@ -107,7 +444,6 @@ class LDdecode:
         self.outfile_video = None
         self.outfile_audio = None
         self.outfile_efm = None
-        self.outfile_efmc = None
         self.outfile_pre_efm = None
         self.outfile_ac3sym = None
         self.ac3_demodulator = None
@@ -121,6 +457,30 @@ class LDdecode:
         # CVBS output uses the 24-bit SMPTE 272M audio profile; every other
         # output path stays 16-bit (CD-matched .pcm / .wav).
         self.audio_output_bits = 24 if self.output_cvbs else 16
+
+        # Confidence-packed .efm output: the T-value keeps the low nibble
+        # and a 4-bit doubt (0 = fully trusted) rides the high nibble.
+        # The CVBS EFM extension format defines every .efm byte this way,
+        # so CVBS output always packs (a fully trusted run packs to its
+        # plain T-value).  For TBC output the default is OFF so the plain
+        # .efm keeps working with legacy tools; --efm_conf on/off
+        # overrides, LDDECODE_EFM_EMITCONF=1/0 is the env equivalent.
+        _conf_mode = extra_options.get("efm_conf", "auto")
+        _conf_env = os.environ.get("LDDECODE_EFM_EMITCONF", "")
+        if _conf_env == "1":
+            _conf_mode = "on"
+        elif _conf_env == "0":
+            _conf_mode = "off"
+        if self.output_cvbs:
+            if _conf_mode == "off":
+                _logger.warning(
+                    "CVBS .efm output always carries confidence "
+                    "(the EFM extension format defines the byte layout); "
+                    "ignoring --efm_conf off"
+                )
+            self.efm_conf_packed = True
+        else:
+            self.efm_conf_packed = _conf_mode == "on"
 
         if fname_out is not None:
             if self.output_cvbs:
@@ -143,6 +503,7 @@ class LDdecode:
                         if system == "PAL" else None),
                     has_nonstandard_values=True if system == "PAL" else None,
                     write_efm=bool(self.digital_audio),
+                    sample_encoding=extra_options.get("cvbs_encoding"),
                 )
             else:
                 self.outfile_video = open(fname_out + ".tbc", "wb")
@@ -151,32 +512,45 @@ class LDdecode:
             if self.digital_audio:
                 # feed EFM stream into ld-ldstoefm; in CVBS mode the writer
                 # owns <out>.efm (frame-indexed EFM extension format)
-                self.efm_pll = efm_pll.EFM_PLL()
-                # Gear-shift / fast-reacquire PLL: ON by default.  While the loop
-                # is locked it runs bit-for-bit identical to the original fixed-gain
-                # loop, so clean discs are unchanged; it only speeds pull-in on cold
-                # start, post-dropout re-acquire and marginal-SNR regions (which is
-                # where the original loop drops sectors).
-                # Set LDDECODE_EFM_GEARSHIFT=0 to restore the original loop.
-                if os.environ.get("LDDECODE_EFM_GEARSHIFT", "1") != "0":
-                    self.efm_pll.gearshift = 1
-                # Advanced: override individual acquisition-loop parameters (e.g. for
-                # multi-decode ensembles that lock different marginal frames). Unset
-                # -> the tuned defaults are used.
-                for _ev, _at, _ty in (("LDDECODE_EFM_PHASEGAIN_ACQ", "phaseGainAcq", float),
-                                      ("LDDECODE_EFM_FREQSTEPMUL", "freqStepMul", float),
-                                      ("LDDECODE_EFM_LOCKERRFRAC", "lockErrorFrac", float),
-                                      ("LDDECODE_EFM_LOCKTHRESH", "lockThreshold", int)):
-                    _v = os.environ.get(_ev, "")
-                    if _v:
-                        setattr(self.efm_pll, _at, _ty(float(_v)))
+                if extra_options.get("efm_demod", "timing") == "timing":
+                    # Symbol-rate timing-recovery demodulator (the default):
+                    # decimation + M&M timing loop + bit-domain frame sync.
+                    # Loop constants are env-tunable for sweeps; --efm_demod
+                    # pll selects the previous run-length PLL.
+                    from . import efm_demod
+                    _eq_taps = int(os.environ.get(
+                        "LDDECODE_EFM_TIMING_EQTAPS",
+                        str(extra_options.get("efm_eq_taps", 0))))
+                    self.efm_pll = efm_demod.EFMTimingDemod(
+                        inputfreq * 1e6,
+                        fn_hz=float(os.environ.get("LDDECODE_EFM_TIMING_FN", "1200")),
+                        zeta=float(os.environ.get("LDDECODE_EFM_TIMING_ZETA", "0.6")),
+                        ted_gain=float(os.environ.get("LDDECODE_EFM_TIMING_TED", "0.5")),
+                        acq_boost=float(os.environ.get("LDDECODE_EFM_TIMING_ACQBOOST", "6")),
+                        eq_taps=_eq_taps,
+                    )
+                else:
+                    self.efm_pll = efm_pll.EFM_PLL()
+                    # Gear-shift / fast-reacquire PLL: ON by default.  While the loop
+                    # is locked it runs bit-for-bit identical to the original fixed-gain
+                    # loop, so clean discs are unchanged; it only speeds pull-in on cold
+                    # start, post-dropout re-acquire and marginal-SNR regions (which is
+                    # where the original loop drops sectors).
+                    # Set LDDECODE_EFM_GEARSHIFT=0 to restore the original loop.
+                    if os.environ.get("LDDECODE_EFM_GEARSHIFT", "1") != "0":
+                        self.efm_pll.gearshift = 1
+                    # Advanced: override individual acquisition-loop parameters (e.g. for
+                    # multi-decode ensembles that lock different marginal frames). Unset
+                    # -> the tuned defaults are used.
+                    for _ev, _at, _ty in (("LDDECODE_EFM_PHASEGAIN_ACQ", "phaseGainAcq", float),
+                                          ("LDDECODE_EFM_FREQSTEPMUL", "freqStepMul", float),
+                                          ("LDDECODE_EFM_LOCKERRFRAC", "lockErrorFrac", float),
+                                          ("LDDECODE_EFM_LOCKTHRESH", "lockThreshold", int)):
+                        _v = os.environ.get(_ev, "")
+                        if _v:
+                            setattr(self.efm_pll, _at, _ty(float(_v)))
                 if not self.output_cvbs:
                     self.outfile_efm = open(fname_out + ".efm", "wb")
-                    # Soft-decision: emit a per-T-value confidence sidecar (.efmc)
-                    # that ld-process-efm turns into RS erasures.  Opt-in so
-                    # default decodes are unchanged.
-                    if os.environ.get("LDDECODE_EFM_EMITCONF", "") == "1":
-                        self.outfile_efmc = open(fname_out + ".efmc", "wb")
                 if extra_options.get("write_pre_efm", False):
                     self.outfile_pre_efm = open(fname_out + ".prefm", "wb")
             if self.write_rf_tbc:
@@ -194,7 +568,12 @@ class LDdecode:
                 for ext in ('.tbc.db', '.tbc.db-wal', '.tbc.db-shm'):
                     if os.path.exists(fname_out + ext):
                         os.unlink(fname_out + ext)
-                self.dbconn = sqlite3.connect(fname_out + '.tbc.db')
+                # The rows are written by the output stage, which runs
+                # on its own thread with -t N; the main thread only
+                # touches the connection at open and after close() has
+                # drained that stage.
+                self.dbconn = sqlite3.connect(fname_out + '.tbc.db',
+                                              check_same_thread=False)
                 self.create_db_schema()
 
         self.pipe_rftbc = extra_options.get("pipe_RF_TBC", None)
@@ -211,15 +590,6 @@ class LDdecode:
         self.capture_id = None
 
         self.system = system
-
-        # Deferred V4300D spur filtering: the "sync acquired" signal is a
-        # threading.Event shared by reference with the RFDecode instance(s) in
-        # this process.  Created only when deferring - it cannot cross spawn
-        # worker processes, so deferring also forces serial demod (below).
-        self._acquired_event = None
-        if extra_options.get("V4300_defer", False):
-            self._acquired_event = threading.Event()
-            extra_options["_acquired_event"] = self._acquired_event
 
         self.rf_opts = {
             'inputfreq':inputfreq,
@@ -280,18 +650,95 @@ class LDdecode:
 
         self.leadIn = False
         self.leadOut = False
+        self._leadout_run = 0
+        self._leadout_hit = False
         self.isCLV = False
         self.frameNumber = None
 
         self.autoMTF = True
+        # Closed-loop mtf_level servo from the ITS/NTC-7 2T pulse (the
+        # b/w RF ratio mapping cannot predict the needed level across
+        # discs, and the outer-radius droop needs negative levels it
+        # can't reach).  Disabled when the user overrides the MTF
+        # scaling, since the servo would just compensate the override
+        # away; when no valid 2T pulse is available the b/w mapping is
+        # the fallback.
+        self.mtf_2t_servo = (
+            extra_options.get("MTF_level", 1.0) == 1.0
+            and extra_options.get("MTF_offset", 0) == 0
+        )
+        self._servo_samples = []   # (field readloc, level_used, pulse/bar)
+        self._servo_last_adopt = None   # fdoffset of last servo adoption
+        self._servo_engaged = False     # 2T servo has measured this disc
+        # Loop gain is 1/|d(pulse/bar)/d(level)| — a near-Newton step.
+        # Measured slope: -0.11..-0.17 on PAL (Louvre/jason sweeps);
+        # -0.05 on NTSC over the servo's operating range of 0..+1.5
+        # (he010 radius sweeps — MTF_basemult 0.4 plus a flattening
+        # response make the NTSC exponent much weaker per level unit).
+        # The dead-band, estimate-scatter gate, and speculation
+        # tolerance are level-unit quantities, so they scale with the
+        # gain to stay the same size in ratio units.
+        self.mtf_servo_gain = 6.0 if system == "PAL" else 20.0
+        self.mtf_servo_deadband = 0.10 * self.mtf_servo_gain / 6.0
+        self.mtf_servo_scatter = 0.35 * self.mtf_servo_gain / 6.0
+        self.mtf_speculation_tolerance = (
+            self.MTF_SPECULATION_TOLERANCE * self.mtf_servo_gain / 6.0)
+        # PAL clip covers the validated +0.55..-0.65 with margin (and
+        # ggv-mb rides it, so it must not move).  NTSC needs +1.0 at
+        # he010's inner radius and must stay far below level ~2, where
+        # FM demodulation breaks down at inner radius.  The NTSC floor
+        # is 0, not negative: he010 radius sweeps show the mid/outer 2T
+        # deficit (ratio ~0.95) is NOT level-correctable there —
+        # d(ratio)/d(level) collapses to ~0 and goes non-monotonic — so
+        # chasing it would integrate to a spurious HF boost.  Clamping
+        # at 0 pins the servo exactly where the b/w mapping lands at
+        # those radii, and the correctable regime (ratio > 1, inner
+        # radius, real slope) still converges normally.
+        if system == "PAL":
+            self.mtf_servo_clip = (-1.0, 1.0)
+        else:
+            self.mtf_servo_clip = (0.0, 1.5)
+        # Chroma cost of an MTF level change, in inverse-MTF strength
+        # units per level unit; deliberately below the measured slope
+        # (~1.7 Louvre PAL, ~0.85 he010 NTSC) so the burst tracking
+        # trims the rest instead of overshooting.
+        self.mtf_deemp_feedforward = 1.2 if system == "PAL" else 0.6
+        # Multiburst-driven video EQ servo (primary response reference
+        # when a VITS multiburst line exists, with the 2T servo keeping
+        # mtf_level as the fallback/second reference).
+        self.veq_servo = True
+        # Anchor cap: the EQ never touches the chroma band (see the
+        # multiburst EQ servo comment by the VEQ_ constants); fsc
+        # differs by system.
+        self.veq_max_freq = 3.6e6 if system == "PAL" else 2.8e6
+        # (readloc, applied eq tuple, {fkey: dev_db}, imtf strength)
+        self._veq_samples = []
+        self._veq_last_adopt = None
+        #: Strength at which the multiburst last found the chroma band
+        #: flat, published by _publish_imtf_flat_band() under its own
+        #: dead-band and rate limit.  None until a multiburst has been
+        #: measured.
+        self._imtf_flat_band = None
+        self._imtf_flat_band_last_publish = None
+        self.veq_calibrated = False
         self.useAGC = extra_options.get("useAGC", True)
         self.wow_level_adjust_smoothing = extra_options.get("wow_level_adjust_smoothing", 0)
         self.wow_interpolation_method = extra_options.get("wow_interpolation_method", "linear")
+
+        # Chroma differential-gain servo state (checkChromaDG).
+        self.chroma_dg_servo = extra_options.get("chroma_dg", True)
+        self._dg_samples = []      # (field readloc, slope per IRE)
+        self._dg_last_adopt = None
+        self.dg_calibrated = False
 
         self.auto_deemp = extra_options.get("auto_deemp", True)
         self.deemp_calibrated = not self.auto_deemp
         self._deemp_burst_samples = []
         self._deemp_burst_offset = None
+        # Like _agc_adjusted_last: inverse_mtf_strength is baked into the
+        # workers' FVideo filter at spawn, so an adoption must respawn
+        # them (recompute_fvideo only fixes the parent's filters).
+        self._deemp_adjusted_last = False
 
         # Warm-up: fields decode anchored to their predecessor until the
         # calibration loops (MTF / AGC / auto-deemp) settle.  Once warm
@@ -309,12 +756,6 @@ class LDdecode:
         # warm-up transition, once calibration is final) so its Python
         # glue stays off the GIL; the thread pool then just feeds them.
         self.process_demod = extra_options.get("process_demod", True)
-        # Deferred V4300D filtering flips a shared event mid-decode, so demod
-        # is not a pure function of (block, mtf) while deferring: the block
-        # cache's prefetch would race the flip (blocks demodulated before it
-        # commit after it), and spawn workers can never see the event at all.
-        # Force fully serial demod when deferring.
-        self._v4300_defer = bool(extra_options.get("V4300_defer", False))
         # Auto RF echo cancellation keeps a per-block magnitude EMA inside
         # RFDecode, so its demod is stateful (not a pure function of block
         # index) and is incompatible with the out-of-order block cache and the
@@ -326,7 +767,7 @@ class LDdecode:
             and not getattr(self.rf, "_echo_manual", False)
         )
         self.block_cache = None
-        if self.numthreads > 1 and not self._v4300_defer and not self._auto_echo:
+        if self.numthreads > 1 and not self._auto_echo:
             from .parallel import DemodBlockCache
 
             self.block_cache = DemodBlockCache(
@@ -337,16 +778,16 @@ class LDdecode:
 
         # Whole-field speculative jobs (each field decoded end-to-end in
         # a worker process) need only the field's own outputs at commit;
-        # modes that consume a field's raw sample data at write time
-        # (RF-TBC/AC3 and the CVBS writer) fall back to block-level
-        # parallelism.
+        # modes that consume a field's raw *input* samples at write time
+        # (RF-TBC/AC3) fall back to block-level parallelism.  The PAL
+        # CVBS writer needs the demodulated video at write time instead
+        # (its burst-lock resample runs in commit order), which the
+        # workers ship back alongside the field (keep_demod below).
         self.use_field_jobs = (
             self.numthreads > 1
             and self.process_demod
-            and not self.output_cvbs
             and not self.do_rftbc
             and not self.ac3
-            and not self._v4300_defer
             and not self._auto_echo
         )
         self._job_engine = None
@@ -364,6 +805,18 @@ class LDdecode:
         # discards everything decoded under the old values, keeping the
         # output bit-exact with -t 1 across adoptions.
         self.exact_speculation = extra_options.get("exact_speculation", False)
+        # The same allowance for the chroma DG correction a field job
+        # applied: a servo trim within DG_SPECULATION_TOLERANCE dead-bands
+        # of the current estimate keeps the worker's correction (the
+        # chroma-gain difference is ~1.5% at 100 IRE per slope dead-band);
+        # anything larger - the phase term engaging, say - is redone
+        # from the raw picture at write time.  Exact mode redoes all.
+        self.dg_speculation_tolerance = (
+            None if self.exact_speculation else (
+                self.DG_SPECULATION_TOLERANCE * self.DG_SLOPE_DEADBAND,
+                self.DG_SPECULATION_TOLERANCE * self.DG_PHASE_DEADBAND,
+            )
+        )
 
         # The field pipeline: stage 1 (sync/lineloc chain) runs on the
         # main thread; stage 2 (downscale/metrics/dropouts) fans out per
@@ -380,6 +833,21 @@ class LDdecode:
                 max_workers=min(4, self.numthreads),
                 thread_name_prefix="stage2",
             )
+
+        # The output stage - EFM demodulation, the .tbc.db row, CVBS
+        # frame assembly and the file writes - trails the commit loop on
+        # its own thread (see writeout), and a stale field's chroma DG
+        # re-correction is fanned out to a small pool ahead of it.
+        # Single-threaded decodes keep it inline: that is the reference
+        # the threaded outputs are compared against.
+        self._output_lane = None
+        self._output_pool = None
+        if self.numthreads > 1:
+            self._output_lane = OrderedOutputLane(
+                depth=self.OUTPUT_LANE_DEPTH)
+            self._output_pool = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="output")
+            sys.setswitchinterval(self.THREAD_SWITCH_INTERVAL)
 
         self.verboseVITS = extra_options.get("verboseVITS", False)
 
@@ -404,6 +872,40 @@ class LDdecode:
 
     def close(self):
         """ deletes all open files, so it's possible to pickle an LDDecode object """
+        try:
+            self._finish_output()
+        finally:
+            self._close_outputs()
+
+    def _finish_output(self):
+        """Let the output stage catch up with the commit loop and stop
+        it.  A failure it has not yet surfaced (a full disk on the last
+        field, say) is raised here, after its pool is released."""
+        lane, self._output_lane = self._output_lane, None
+        pool, self._output_pool = self._output_pool, None
+        try:
+            if lane is not None:
+                lane.close()
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
+
+    def _close_outputs(self):
+        # Drain any T-values the EFM demodulator still holds: the timing
+        # demodulator buffers up to one frame awaiting its closing sync, and
+        # the stream's final frame can never be validated, so it flushes
+        # here with low confidence.  (The PLL has no flush; it only ever
+        # holds one open run.)  The tail lands after the last field's
+        # efmTValues count - it belongs to no field.
+        efm_demod_obj = getattr(self, "efm_pll", None)
+        if self.outfile_efm is not None and hasattr(efm_demod_obj, "flush"):
+            efm_tail = efm_demod_obj.flush()
+            if len(efm_tail):
+                if self.efm_conf_packed:
+                    efm_tail = efm_score.pack_t_conf(
+                        efm_tail, efm_demod_obj.conf_view()
+                    )
+                self.outfile_efm.write(efm_tail.tobytes())
 
         if self._job_engine is not None:
             self._job_engine.stop()
@@ -437,7 +939,6 @@ class LDdecode:
             "outfile_video",
             "outfile_audio",
             "outfile_efm",
-            "outfile_efmc",
             "outfile_pre_efm",
             "outfile_rftbc",
             "outfile_ac3sym",
@@ -466,11 +967,13 @@ class LDdecode:
 
         self.print_stats()
 
-    def update_sqlite_field_count(self):
+    def update_sqlite_field_count(self, n_fields=None):
+        if n_fields is None:
+            n_fields = len(self.fieldinfo)
         if self.capture_id:
             self.dbconn.execute(
                 "UPDATE capture SET number_of_sequential_fields = ? WHERE capture_id = ?",
-                (len(self.fieldinfo), self.capture_id),
+                (n_fields, self.capture_id),
             )
 
     def create_db_schema(self):
@@ -633,48 +1136,862 @@ class LDdecode:
         if isField:
             self.fdoffset *= self.bytes_per_field
 
+    # 2T servo tuning (calibrated on Louvre PAL and he010 NTSC radius
+    # sweeps, jason as flat control).  The loop gain, dead-band,
+    # scatter gate, and clip range are per-system — see mtf_servo_gain
+    # / mtf_servo_clip in __init__.  MAX_AGE ages samples out so a disc
+    # whose ITS stops falls back to the b/w mapping instead of holding
+    # a stale radius estimate.
+    MTF_SERVO_MIN_SAMPLES = 8
+    MTF_SERVO_KEEP = 60
+    MTF_SERVO_MAX_AGE_FIELDS = 240
+    # Committed-decode adoption rate limit: radius drift is glacial, so
+    # after the warmup has converged there is no reason to adopt more
+    # often than this - it caps the flush/re-cal churn measurement noise
+    # could otherwise cause.  (Warmup is exempt: it needs several rapid
+    # steps to converge before the first frame is written.)
+    MTF_SERVO_MIN_ADOPT_FIELDS = 100
+
+    # Multiburst EQ servo: anchors only below self.veq_max_freq so the
+    # EQ (pinned to 0 dB beyond its last anchor + 0.5 MHz) never touches
+    # the chroma band - GGV PAL records luma HOT but chroma LOW around
+    # fsc, and a composite filter cannot serve both, so the subcarrier
+    # region stays owned by the inverse-MTF calibration
+    # (cap 3.6 MHz for PAL fsc 4.43, 2.8 MHz for NTSC fsc 3.58).  The
+    # multiburst still rules that band, but through the strength the
+    # inverse MTF is held to rather than through an anchor of its own:
+    # see _imtf_ceiling, which bounds it in both directions.
+    #: Band, per system, whose multiburst packets straddle the colour
+    #: subcarrier and so measure what the chroma band is doing (PAL fsc
+    #: 4.43 MHz, packets at 4.0/4.8; NTSC fsc 3.58 MHz, packets at
+    #: 3.0/3.58/4.1).  Read by _imtf_strength_for_flat_band().
+    CHROMA_BAND_PROBE_HZ = {"PAL": (3.75e6, 5.25e6),
+                            "NTSC": (2.9e6, 4.3e6)}
+    VEQ_CLAMP_DB = 2.5
+    VEQ_DEADBAND_DB = 0.3
+    VEQ_MIN_SAMPLES = 6
+    VEQ_KEEP = 24
+    VEQ_MAX_AGE_FIELDS = 240
+    VEQ_MIN_ADOPT_FIELDS = 100
+
+    # Dead-band on the published chroma-band ceiling, in inverse-MTF
+    # strength units.  The same figure _deemp_calibrate() holds its own
+    # tracking trims inside, for the same reason and on the same
+    # quantity: a ceiling that moves by less than the burst servo's
+    # dead-band cannot change what the burst servo does, so publishing
+    # the move would be churn.  Measured on BBC Domesday DD86-DS1 outer,
+    # where the pooled figure settles inside 0.008 of itself once the
+    # warmup is past.
+    IMTF_CEILING_DEADBAND = 0.05
+
+    # Chroma differential-gain servo: pools per-field slope readings from
+    # measure_vits_dg_staircase and holds DecoderParams["chroma_dg_slope"],
+    # which field.downscale_cvbs nulls at CVBS write time.  The correction
+    # never touches decoding - every other servo measures the uncorrected
+    # signal - so an adoption never asks for a redo and nothing about it
+    # travels to worker processes.
+    #: Pool size and age horizon, matching the multiburst EQ pool.
+    DG_KEEP = 24
+    DG_MAX_AGE_FIELDS = 240
+    #: Samples before an adoption: 3 for the first (so a short decode is
+    #: still corrected), the full pool after.
+    DG_MIN_SAMPLES = 6
+    #: Dead-band, in gain-per-IRE units.  0.0004/IRE is ~4% of chroma
+    #: gain across the full luma range - about the pooled measurement's
+    #: own scatter over a handful of fields.
+    DG_SLOPE_DEADBAND = 0.0004
+    #: Hard bounds.  The worst measured capture (BBC Domesday DD86-DS2
+    #: NationalA inner radius) needs +0.0038; the largest negative slope
+    #: measured anywhere is -0.0003 (GGV1011).  The negative bound is
+    #: deliberately tighter because the correction's gain grows as
+    #: 1/(1 + 100*slope) at peak white: -0.004 already means boosting
+    #: bright-area chroma by a third, and beyond it the formula runs away.
+    DG_SLOPE_CLAMP_NEG = -0.004
+    DG_SLOPE_CLAMP_POS = 0.008
+    #: Committed-decode adoption rate limit, as the other servos'.
+    DG_MIN_ADOPT_FIELDS = 100
+    #: Engagement threshold.  A slope of 0.00105/IRE is the conformance
+    #: limit itself (0.105 peak-to-peak over the 100 IRE staircase), and
+    #: below about that size the pooled estimator cannot be trusted with
+    #: the sign, let alone the magnitude: GGV1011's colour-bar capture
+    #: measures -0.0010 in-decoder against a -0.0003 ground truth, and
+    #: its side-1 inner cut +0.0004 against +0.0011.  Correcting inside
+    #: the spec band on numbers that rough is as likely to put
+    #: differential gain in as take it out - the bar capture went 0.033
+    #: to 0.085 that way - so below this the servo holds zero and a
+    #: conforming disc is left exactly alone.
+    DG_SLOPE_ENGAGE = 0.0015
+
+    #: The differential-phase constants, in degrees of chroma rotation
+    #: per IRE of luminance, tracked from the same staircase readings and
+    #: corrected by the same write-time pass.  A single field's phase
+    #: fit is rough (std 0.014-0.06 deg/IRE across the discs in hand) -
+    #: far rougher relative to its engage margin than the gain fit is to
+    #: its own - so the phase decision is only taken from a full pool
+    #: (a 3-sample first-adoption median put GGV1011 over the line) and
+    #: holds its previous value until the pool fills.  The engage
+    #: threshold sits where the full-pool median separates the
+    #: populations: GGV1011's conforming capture pools 0.021-0.025
+    #: (a true 1.8 degree rise, well inside the 5.2 degree conformance
+    #: limit; threshold margin ~4 sigma of a 24-sample median), the
+    #: mildest Domesday cut ~0.026-0.031 (true DP 3.6 degrees, also
+    #: inside the limit), and the captures that genuinely fail pool
+    #: 0.044-0.061.  Below the threshold the servo holds zero:
+    #: rotations that small are invisible and the conforming control
+    #: capture must stay untouched by construction.
+    DG_PHASE_DEADBAND = 0.005
+    DG_PHASE_CLAMP = 0.15
+    DG_PHASE_ENGAGE = 0.035
+    #: Hysteresis: an engaged correction releases to zero only when the
+    #: pooled median falls below this, well under the engage threshold,
+    #: so a capture whose tilt sits right at the engage line corrects or
+    #: does not but never alternates.
+    DG_PHASE_RELEASE = 0.02
+    #: The other servos clear this pool whenever they adopt (their
+    #: calibration change makes the old readings stale), so demanding a
+    #: full 24 meant the phase decision often never arrived on an active
+    #: decode; 16 keeps ~2.7 sigma between GGV1011's pooled median and
+    #: the engage threshold.
+    DG_PHASE_MIN_SAMPLES = 16
+
+    #: How far the inverse-MTF strength may be wound, in either
+    #: direction.  Positive strengths give back what the disc's response
+    #: took away; negative ones take back what the chain added, and the
+    #: multiburst is what authorises them (see _imtf_ceiling).  The
+    #: measured need on the worst capture in hand - BBC Domesday DD86-DS2
+    #: at inner radius, whose chroma band reads +3.6 dB at 4.0 MHz and
+    #: +4.0 dB at 4.8 - is about -1.5, so this leaves headroom without
+    #: letting a mismeasured field wind the band away.
+    IMTF_STRENGTH_LIMIT = 2.0
+
+    #: How hot, in dB at the subcarrier, the multiburst must find the
+    #: chroma band before it may spend the negative half of that limit.
+    #: A cut is a claim that something upstream added gain, and below
+    #: about a dB the pooled multiburst estimate cannot carry that claim
+    #: - it is the same "within about a dB of flat" _imtf_ceiling calls
+    #: flat when it declines to let burst amplitude boost.  Measured
+    #: either side of it: BBC Domesday DD86-DS2 inner reads 4.6 dB hot
+    #: and is the blowout the cut exists for, while industrial-lv side 1
+    #: inner reads 0.6 dB hot with burst amplitude simultaneously asking
+    #: for a 1.9 dB boost - two instruments disagreeing about which way
+    #: to go, which is what a measurement at the noise floor looks like.
+    #: Cutting on that one costs it 0.5 IRE of 2T pulse and drops the
+    #: luma/chroma gain ratio from 0.279 to 0.261, outside its band.
+    #: A threshold, not a subtraction: once the band is measurably hot
+    #: the whole measured excess is taken out, because half a blowout is
+    #: still a blowout.
+    IMTF_CUT_ENGAGE_DB = 1.0
+
+    def _veq_estimate(self, field):
+        """Absolute video-EQ anchor estimate from pooled multiburst
+        measurements, or None.
+
+        Each sample stores per-packet deviations (dB, relative to the
+        ~1 MHz reference packet) together with the EQ that was applied
+        when the field was decoded, so the disc's response - and hence
+        the correction - is recovered absolutely regardless of what EQ
+        each pooled field carried (same closed-loop bookkeeping as the
+        2T servo).
+        """
+        if not self.veq_servo:
+            return None
+
+        applied = getattr(field, "decoded_video_eq", None)
+        m = measure_vits_multiburst(field)
+        if m is not None:
+            packets, _ = m
+            ref = [p for p in packets if 0.75e6 <= p[0] <= 1.45e6][0]
+            devs = {}
+            # Every packet above the reference is kept, not only the ones
+            # the EQ may anchor.  The packets that straddle the subcarrier
+            # are the only direct measurement of what the chroma band is
+            # actually doing, and _imtf_strength_for_flat_band() needs them to
+            # keep the burst servo honest; anchors are still built from
+            # the sub-veq_max_freq subset below, so the EQ's ownership of
+            # the band is unchanged.
+            for f, a in packets:
+                if f < 0.7e6:
+                    continue
+                fkey = round(f / 2.5e5) * 2.5e5
+                devs[fkey] = 20.0 * np.log10(a / ref[1])
+            if devs:
+                key = field.readloc
+                # The strength this field was decoded under travels with
+                # the sample, so a pool that spans an inverse-MTF trim
+                # still yields an absolute answer - the same closed-loop
+                # bookkeeping the applied EQ already gets.  Without it the
+                # pool's contents decide the result, and serial and
+                # threaded decodes pool different fields.
+                entry = (key, tuple(applied) if applied else (), devs,
+                         float(getattr(field, "decoded_imtf_strength", 0.0)
+                               or 0.0))
+                if self._veq_samples and self._veq_samples[-1][0] == key:
+                    self._veq_samples[-1] = entry
+                else:
+                    self._veq_samples.append(entry)
+                    self._veq_samples = self._veq_samples[-self.VEQ_KEEP:]
+
+        horizon = (self.fdoffset
+                   - self.VEQ_MAX_AGE_FIELDS * self.bytes_per_field)
+        self._veq_samples = [s for s in self._veq_samples
+                             if s[0] >= horizon]
+        need = 3 if not self.veq_calibrated else self.VEQ_MIN_SAMPLES
+        if len(self._veq_samples) < need:
+            return None
+
+        by_key = {}
+        for _, applied_eq, devs, _ in self._veq_samples:
+            adb = dict(applied_eq)
+            for fkey, dev in devs.items():
+                if fkey > self.veq_max_freq:
+                    continue
+                # correction that would zero this deviation
+                by_key.setdefault(fkey, []).append(
+                    adb.get(fkey, 0.0) - dev)
+        half = len(self._veq_samples) // 2
+        anchors = []
+        for fkey in sorted(by_key):
+            ests = by_key[fkey]
+            if len(ests) <= half:
+                continue
+            if np.std(ests) > 0.8:
+                return None    # scattered: distrust the whole line
+            db = float(np.clip(np.median(ests),
+                               -self.VEQ_CLAMP_DB, self.VEQ_CLAMP_DB))
+            anchors.append((float(fkey), round(db, 2)))
+        return tuple(anchors) if anchors else None
+
+    def _imtf_strength_for_flat_band(self, first=False):
+        """Inverse-MTF strength at which the chroma band measures flat.
+
+        The multiburst packets that straddle the subcarrier - PAL carries
+        them at 4.0 and 4.8 MHz around a 4.43 MHz subcarrier, NTSC at 3.0
+        and 4.1 MHz around 3.58 - are the only direct measurement of what
+        the decoded chroma band is doing, read against the same ~1 MHz
+        reference packet as everything else.
+
+        Each sample's deviation is taken back to what the band would have
+        read with no video EQ and no inverse MTF applied, using the EQ and
+        the strength that field was actually decoded under.  That absolute
+        figure is what makes the answer independent of which fields
+        happen to be pooled, and so identical between a serial and a
+        threaded decode; the raw deviations are not, because the pool can
+        span a trim of either filter.
+
+        Returns None where too little of the pool carries such a packet,
+        which leaves a disc without a multiburst to the burst servo alone.
+        "Too little" is whatever _veq_estimate() adopted the EQ on: this
+        reads the same pool at the same moment for the same decision, and
+        two different thresholds over one pool is not a second opinion.
+        The gap mattered - _veq_estimate takes 3 samples for a first
+        adoption against VEQ_MIN_SAMPLES afterwards, so a first adoption
+        holding 3 to 5 samples published no ceiling at all, and whether a
+        disc got one came down to how many fields happened to be in hand.
+        Measured on BBC Domesday DD86-DS1 outer, where the pool holds 5
+        and every one of them carries the packets.
+        """
+        low, high = self.CHROMA_BAND_PROBE_HZ[self.rf.system]
+        fsc = self.rf.SysParams["fsc_mhz"] * 1e6
+        fsc_per_unit = self.rf.inverse_mtf_log_db(fsc)
+        if fsc_per_unit <= 0.0:
+            return None
+        pooled = []
+        for _, applied_eq, devs, strength in self._veq_samples:
+            applied_db = dict(applied_eq)
+            # Each packet's reading taken back to what it would have been
+            # with no video EQ and no inverse MTF applied.
+            bare = []
+            for fkey, dev in devs.items():
+                if not low <= fkey <= high:
+                    continue
+                bare.append((float(fkey),
+                             dev - applied_db.get(fkey, 0.0)
+                             - strength * self.rf.inverse_mtf_log_db(fkey)))
+            if not bare:
+                continue
+            # The quantity being corrected is the gain at the subcarrier,
+            # so read the band's response there rather than averaging the
+            # strength each packet would want on its own.  Those are not
+            # the same number: the inverse-MTF curve rises more steeply
+            # across the band than the error does, so the packet below
+            # fsc asks for a deeper correction than the one above it, and
+            # a flat mean lands between two answers neither of which is
+            # about fsc.  On BBC Domesday DD86-DS2 inner the two ask for
+            # -1.66 and -1.27, and the mean overshoots into chrominance
+            # reading cold.  np.interp holds the end value where fsc
+            # falls outside the packets actually seen.
+            bare.sort()
+            at_fsc = float(np.interp(fsc, [f for f, _ in bare],
+                                     [b for _, b in bare]))
+            pooled.append(-at_fsc / fsc_per_unit)
+        if len(pooled) < (3 if first else self.VEQ_MIN_SAMPLES):
+            return None
+        return float(np.median(pooled))
+
+    def _imtf_ceiling(self, current):
+        """Largest inverse-MTF strength the measured channel justifies.
+
+        The inverse MTF exists to give back what the disc's own response
+        took away, so it may not be wound past the point where that
+        response measures flat.  Burst amplitude cannot say where that
+        point is: it is the level the burst was *recorded* at as much as
+        the channel's gain, and BBC AIV discs record theirs near 14.6 IRE
+        against the 21.4 the servo expects - measured on both a damaged
+        (DD86-DS1) and an undamaged (DD86-DS2) pressing - so the servo
+        reads a disc-mastering choice as channel loss and boosts about
+        1.2 strength units to chase it.  That lifts the whole composite:
+        +2 to +3 dB of luma at 4-4.8 MHz, and a chroma bar pushed to
+        40.8 IRE against a 30 IRE nominal.  The multiburst says the
+        channel there is within about a dB of flat, and the multiburst is
+        the instrument that measures the thing this filter changes.
+
+        A channel the multiburst finds genuinely low yields a flat-band
+        strength above what the burst asks for, so nothing is taken away.
+        None where no multiburst has been seen.
+
+        The bound reaches below zero, because a chroma band can be hot
+        for reasons the burst servo cannot undo by declining to boost.
+        The 2T servo drives mtf_level negative at inner radius - a
+        pre-demod HF boost - and mtf_deemp_feedforward exists to buy that
+        back here; on BBC Domesday DD86-DS2 inner it asks for about -1.3
+        strength units and the multiburst independently measures -1.5.
+        Floored at zero, neither could act: the burst servo bottomed out,
+        the EQ is barred from the band by veq_max_freq, and the decode
+        kept about +3 dB at fsc - chrominance 27 to 45 percent hot on
+        every VITS chrominance level, the saturation ceiling and the gain
+        ratio, worsening monotonically inwards.
+
+        Only the multiburst may spend the negative half.  The burst servo
+        clips its own estimate at zero (_deemp_calibrate) and the
+        feed-forward clips at zero too, so a cut is never applied on a
+        disc whose chroma band nothing has measured - burst amplitude is
+        a mastering choice as much as a channel gain in that direction as
+        well as this one.
+
+        And it may only spend it on a band it finds hot by more than
+        IMTF_CUT_ENGAGE_DB, because a cut below that size is not a
+        measurement of anything: it is the same sub-dB scatter this
+        function calls flat when it is refusing burst amplitude a boost,
+        and reading it as a channel fault takes gain out of a disc that
+        never had any added.  Above the threshold the whole measured
+        excess is spent, so the discs the cut exists for are untouched
+        by it.
+        """
+        flat = self._imtf_flat_band
+        if flat is None:
+            return None
+        if flat < 0.0 and not self._imtf_cut_engaged(flat):
+            return 0.0
+        return float(max(-self.IMTF_STRENGTH_LIMIT, flat))
+
+    def _imtf_cut_engaged(self, flat):
+        """Whether a negative flat-band strength is big enough to act on.
+
+        The threshold is stated in dB at the subcarrier rather than in
+        strength units so it means the same thing on both systems: one
+        unit of strength is 2.69 dB at PAL's 4.43 MHz but only 1.66 dB
+        at NTSC's 3.58 MHz, and it is the dB that says whether the band
+        is really hot.
+        """
+        per_unit = self.rf.inverse_mtf_log_db(
+            self.rf.SysParams["fsc_mhz"] * 1e6)
+        if per_unit <= 0.0:
+            return False
+        return -flat * per_unit >= self.IMTF_CUT_ENGAGE_DB
+
+    def checkChromaDG(self, field):
+        """Track chroma differential gain and phase from the ITS staircase.
+
+        Pools per-field slope and phase estimates and adopts the pooled
+        medians into DecoderParams["chroma_dg_slope"] and
+        ["chroma_dg_phase"], which the write-time corrector nulls on
+        both outputs (downscale_cvbs for CVBS,
+        apply_chroma_dg_correction_output for the TBC).  Nothing about
+        decoding depends on them - the servos all measure upstream of
+        the correction - so adopting never invalidates a field, and
+        there is nothing to hand to workers; serial and threaded decodes
+        pool the same committed fields at the same points and so adopt
+        identically.
+
+        Discs with no modulated staircase never feed the pool and both
+        corrections stay 0.0: a capture with no measured differential
+        distortion gets no correction, by construction.
+        """
+        if not self.chroma_dg_servo:
+            return
+        measured = measure_vits_dg_staircase(field)
+        if measured is not None:
+            entry = (field.readloc, measured[0], measured[1])
+            if self._dg_samples and self._dg_samples[-1][0] == entry[0]:
+                self._dg_samples[-1] = entry
+            else:
+                self._dg_samples.append(entry)
+                self._dg_samples = self._dg_samples[-self.DG_KEEP:]
+        horizon = (self.fdoffset
+                   - self.DG_MAX_AGE_FIELDS * self.bytes_per_field)
+        self._dg_samples = [x for x in self._dg_samples if x[0] >= horizon]
+        need = 3 if not self.dg_calibrated else self.DG_MIN_SAMPLES
+        if len(self._dg_samples) < need:
+            return
+
+        estimate = float(np.clip(
+            np.median([slope for _, slope, _ in self._dg_samples]),
+            self.DG_SLOPE_CLAMP_NEG, self.DG_SLOPE_CLAMP_POS))
+        if abs(estimate) < self.DG_SLOPE_ENGAGE:
+            estimate = 0.0
+        current = float(
+            self.rf.DecoderParams.get("chroma_dg_slope", 0.0))
+        current_phase = float(
+            self.rf.DecoderParams.get("chroma_dg_phase", 0.0))
+        if len(self._dg_samples) >= self.DG_PHASE_MIN_SAMPLES:
+            phase = float(np.clip(
+                np.median([ph for _, _, ph in self._dg_samples]),
+                -self.DG_PHASE_CLAMP, self.DG_PHASE_CLAMP))
+            threshold = (self.DG_PHASE_ENGAGE if current_phase == 0.0
+                         else self.DG_PHASE_RELEASE)
+            if abs(phase) < threshold:
+                phase = 0.0
+        else:
+            # A phase median from a part-filled pool cannot be trusted
+            # with the engage decision, so the phase holds until the
+            # pool fills - which also means an early gain adoption never
+            # carries a noisy phase with it.
+            phase = current_phase
+        if (abs(estimate - current) < self.DG_SLOPE_DEADBAND
+                and abs(phase - current_phase) < self.DG_PHASE_DEADBAND):
+            self.dg_calibrated = True
+            return
+        if self.dg_calibrated and self.fields_written > 0:
+            # The rate limit bounds trim churn; a phase correction
+            # switching on is a one-time calibration event (the pool
+            # only just grew deep enough to take the decision, and the
+            # hysteresis band keeps it from cycling), so it does not
+            # wait out the previous trim's holdoff.
+            engaging = current_phase == 0.0 and phase != 0.0
+            if (not engaging
+                    and self._dg_last_adopt is not None
+                    and (self.fdoffset - self._dg_last_adopt)
+                    < self.DG_MIN_ADOPT_FIELDS * self.bytes_per_field):
+                return
+            self._dg_last_adopt = self.fdoffset
+
+        gain_100 = ((1.0 + estimate * CHROMA_DG_ANCHOR_IRE)
+                    / (1.0 + estimate * 100.0))
+        logs.logger.debug(
+            f"Chroma DG servo: slope {current:+.5f} \u2192 {estimate:+.5f}"
+            f" per IRE, phase {current_phase:+.4f} \u2192 {phase:+.4f}"
+            f" deg per IRE (chroma at 100 IRE scaled by {gain_100:.3f},"
+            f" rotated by {-phase * 100.0:+.1f} deg)"
+        )
+        self.dg_calibrated = True
+        self.rf.DecoderParams["chroma_dg_slope"] = estimate
+        self.rf.DecoderParams["chroma_dg_phase"] = phase
+        engine = getattr(self, "_job_engine", None)
+        if engine is not None:
+            engine.set_chroma_dg(self._engine_chroma_dg())
+
+    def checkVideoEQ(self, field):
+        """Adopt the multiburst-derived video EQ when it drifts past
+        the dead-band.  Returns True if no redo is needed (tolerant
+        trims and holds), False to redo (first application, or exact
+        mode)."""
+        anchors = self._veq_estimate(field)
+        if anchors is None:
+            return True
+        # The multiburst's verdict on the chroma band is published before
+        # the EQ's own dead-band can decline below, because the two
+        # decisions are not the same decision.  The EQ adopts when it has
+        # a correction worth making inside the band it anchors; the
+        # ceiling says what the band *above* it needs, and "nothing" is a
+        # verdict.  Bundling them meant a channel already flat enough for
+        # the EQ to decline published no ceiling at all - and that is
+        # exactly the channel the multiburst is most confident about.
+        ceiling_moved = self._publish_imtf_flat_band(
+            first=not self.veq_calibrated)
+        # The ceiling moving inverse_mtf_strength is a filter change like
+        # any other: tolerant mode hands it to future jobs and lets the
+        # in-flight fields commit under the old strength (a dead-band
+        # sized trim), but exact mode must redo and flush for it, or the
+        # fields decoded ahead would commit under a filter the serial
+        # decode had already left behind (compare-*-parallel-tbc).  Only
+        # once fields are being written, though: the warm-up has nothing
+        # in flight, and its ceiling behaviour - cap now, let the burst
+        # tracker see the capped value on the next field - is the same
+        # in both modes (a warm-up redo here converged the servos to a
+        # different operating point on industrial-lv-side1-outer).
+        hold = not (ceiling_moved and self.exact_speculation
+                    and self.fields_written > 0)
+
+        current = self.rf.DecoderParams.get("video_eq_auto") or ()
+        cur = dict(current)
+        new = dict(anchors)
+        delta = max(abs(new.get(k, 0.0) - cur.get(k, 0.0))
+                    for k in set(cur) | set(new))
+        if delta < self.VEQ_DEADBAND_DB:
+            return hold
+
+        first = not self.veq_calibrated
+        if not first and self.fields_written > 0:
+            if (self._veq_last_adopt is not None
+                    and (self.fdoffset - self._veq_last_adopt)
+                    < self.VEQ_MIN_ADOPT_FIELDS * self.bytes_per_field):
+                return hold
+            self._veq_last_adopt = self.fdoffset
+
+        logs.logger.debug(
+            "Video EQ (VITS multiburst): "
+            + "  ".join(f"{f/1e6:.2f}MHz:{db:+.2f}dB" for f, db in anchors)
+        )
+        self.veq_calibrated = True
+        # The flat band was published above; this only enforces whatever
+        # ceiling stands, since the EQ change means recompute_fvideo() is
+        # about to run anyway.
+        self.rf.DecoderParams["video_eq_auto"] = anchors
+        self._apply_imtf_ceiling()
+        self.rf.recompute_fvideo()
+
+        if not first and not self.exact_speculation:
+            # dead-band-sized trim: hand to future jobs, keep in-flight
+            if self._job_engine is not None:
+                self._job_engine.set_veq(anchors)
+            return True
+        return False
+
+    def _publish_imtf_flat_band(self, first):
+        """Publish the multiburst's chroma-band verdict, if it has moved.
+
+        The verdict crosses loops - it is measured on the video EQ's pool
+        and it bounds the burst servo - so it may not be sampled live:
+        pool membership differs between a serial and a threaded decode,
+        the same fields but a different number of them in hand at the
+        moment the burst servo happens to ask, and sampling it live made
+        the adopted strength differ between the two, which broke
+        bit-identity (compare-pal-parallel-tbc).
+
+        It was therefore published only at a video EQ adoption, which the
+        dead-band and rate limit had already made reproducible.  That
+        borrowed reproducibility from the wrong decision.  The EQ adopts
+        when it has a correction worth making inside the band it anchors,
+        so a channel already flat there declines inside VEQ_DEADBAND_DB
+        and published no ceiling at all - leaving the burst servo
+        unbounded on exactly the discs whose multiburst is clearest.
+        Measured on BBC Domesday DD86-DS1 outer: the EQ wants +/-0.13 dB
+        at 2 MHz and never adopts, the chroma band measures flat at
+        -0.06 strength units from the tenth field on, and the burst servo
+        winds to 1.418 chasing a burst the disc recorded at 15.7 IRE
+        against the 21.4 it expects.
+
+        So the verdict gets its own dead-band and rate limit instead of
+        borrowing the EQ's, which is the same guarantee applied to the
+        quantity that actually crosses the loops.  It is still read from
+        the same pool at the same moment as the estimate the EQ was about
+        to judge, on the same sample-count threshold - two thresholds
+        over one pool is not a second opinion.
+
+        A pool that has thinned below that threshold yields None and must
+        not erase a verdict an earlier call was able to reach: the
+        multiburst does not stop having said the chroma band was flat
+        because fewer fields carry a packet now.
+
+        Returns True when the published ceiling moved the adopted
+        inverse-MTF strength (the caller decides whether that is a redo).
+        """
+        flat_band = self._imtf_strength_for_flat_band(first=first)
+        if flat_band is None:
+            return False
+        if (self._imtf_flat_band is not None
+                and abs(flat_band - self._imtf_flat_band)
+                < self.IMTF_CEILING_DEADBAND):
+            return False
+        # Rate limit, mirroring the EQ's: warmup is exempt because it
+        # needs to converge before the first frame is written, and after
+        # that a bound on a static channel has no reason to move often.
+        if self.fields_written > 0:
+            if (self._imtf_flat_band_last_publish is not None
+                    and (self.fdoffset - self._imtf_flat_band_last_publish)
+                    < self.VEQ_MIN_ADOPT_FIELDS * self.bytes_per_field):
+                return False
+        self._imtf_flat_band_last_publish = self.fdoffset
+        self._imtf_flat_band = flat_band
+        moved = self._apply_imtf_ceiling()
+        if moved:
+            self.rf.recompute_fvideo()
+        return moved
+
+    def _apply_imtf_ceiling(self):
+        """Bring the adopted inverse-MTF strength down to a new ceiling.
+
+        _deemp_calibrate() consults the ceiling only when it is adopting
+        an estimate, and it returns early inside its own dead-band.  So a
+        burst servo that has already converged never sees a ceiling
+        published after it settled, and the correction the multiburst
+        says is unjustified stays applied for the rest of the decode.
+        Measured on BBC Domesday DD86-DS1 outer: the burst servo settles
+        at 0.456, the multiburst then reports the chroma band flat at
+        0.000, and over a 150-frame decode no further burst adoption ever
+        happens - leaving chrominance about 20% hot, which fails every
+        chrominance level, the saturation ceiling and the gain ratio.
+
+        Whether that race was won differed only by how many adoptions had
+        happened first, so it was a coin toss and not a decision.  The
+        ceiling is therefore applied where it is published, by
+        _publish_imtf_flat_band(), whose own dead-band and rate limit
+        make that moment reproducible, so this adds no order dependence.
+        Lowering only - the ceiling never winds the correction up.
+
+        Returns True when the strength moved, so the caller knows whether
+        recompute_fvideo() is needed; this only moves the value.
+        """
+        ceiling = self._imtf_ceiling(
+            self.rf.DecoderParams.get("inverse_mtf_strength", 0.0))
+        if ceiling is None:
+            return False
+        current = self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
+        if current <= ceiling:
+            return False
+        logs.logger.debug(
+            f"Auto inverse-MTF chroma: inverse_mtf_strength "
+            f"{current:.3f} \u2192 {ceiling:.3f}, capped by the multiburst "
+            f"chroma band"
+        )
+        self.rf.DecoderParams["inverse_mtf_strength"] = ceiling
+        if self._job_engine is not None:
+            self._job_engine.set_imtf(ceiling)
+        # Pool samples were measured under the old strength.
+        self._deemp_burst_samples.clear()
+        self._deemp_burst_offset = None
+        return True
+
+    def _mtf_servo_target(self):
+        """Pre-filter pulse-to-bar ratio that leaves the output at unity.
+
+        The servo measures the 2T pulse with the inverse-MTF filter's and
+        the video EQ's lift divided out, which is what makes a sample
+        taken before a trim comparable with one taken after it.  But the
+        pulse a conformance check reads is the pulse in the *output*,
+        after both filters have acted.  Holding the pre-filter ratio at
+        1.0 therefore leaves the output high by exactly the gain those
+        two filters supply, and moving either of them - the multiburst
+        ceiling on inverse_mtf_strength does exactly that - walks the
+        output pulse with nothing to pull it back.
+
+        So the loop's setpoint is the pre-filter ratio whose output *is*
+        unity, and the two filters enter the servo here rather than in
+        the measurement.  Measured over the twelve radius cuts, against
+        the differential comparison IEC 60856-1986 Figure 7 states: the
+        PAL 2T pulse goes from 5 of 12 inside its band to 8 of 12, three
+        checks moving to PASS and none the other way.
+
+        The gains are read from the adopted DecoderParams, never from a
+        live sample pool: an adoption has already been through its
+        dead-band and rate limit, so the sequence of setpoints is the
+        same whether fields arrive serially or from the job engine.
+        Reading a pool median here instead is what broke
+        compare-pal-parallel-tbc when the inverse-MTF ceiling was first
+        written; see _imtf_flat_band.
+        """
+        params = getattr(self.rf, "DecoderParams", {})
+        gain = (self.rf.inverse_mtf_2t_peak_gain(
+                    params.get("inverse_mtf_strength", 0.0))
+                * self.rf.video_eq_2t_peak_gain(params.get("video_eq_auto")))
+        if not gain > 0.0:
+            return 1.0
+        return 1.0 / gain
+
+    def _mtf_servo_estimate(self, field):
+        """mtf_level estimate from the ITS 2T pulse servo, or None.
+
+        Each sample pairs the measured pulse-to-bar ratio with the
+        mtf_level the field was decoded under, giving an absolute
+        per-field estimate (raising mtf_level lowers demodulated HF, so
+        estimate = level_used + (ratio - target) * gain).  Pooling
+        absolute estimates keeps the loop stable even when in-flight
+        fields were decoded under a stale level (tolerant speculation).
+        Returns None (caller falls back) until enough recent valid
+        samples exist.
+
+        target is _mtf_servo_target(), not 1.0: the ratio has had two
+        filters divided out of it, and the pulse the output carries -
+        the one conformance judges - is the ratio those filters put
+        back.  See there.
+        """
+        if not self.mtf_2t_servo:
+            return None
+
+        level_used = getattr(field, "decoded_mtf_level", None)
+        if level_used is not None and field.dspicture is not None:
+            m = measure_its_2t_ratio(field)
+            if m is not None:
+                ratio, _ = m
+                # Divide out the inverse-MTF chroma filter's and the
+                # dynamic EQ's lift of the pulse.  What is left measures
+                # the pre-filter chain alone - a property of mtf_level
+                # and the disc, independent of what those two filters
+                # happened to be set to when this field was decoded, so
+                # samples taken either side of a trim stay comparable.
+                # The output pulse is recovered at the setpoint, not
+                # here; see _mtf_servo_target.
+                ratio /= self.rf.inverse_mtf_2t_peak_gain(
+                    getattr(field, "decoded_imtf_strength", 0.0))
+                ratio /= self.rf.video_eq_2t_peak_gain(
+                    getattr(field, "decoded_video_eq", None))
+                key = field.readloc
+                parity = bool(field.isFirstField)
+                # On a redo the same field comes through again; replace
+                # its sample rather than double-counting it.
+                if self._servo_samples and self._servo_samples[-1][0] == key:
+                    self._servo_samples[-1] = (key, level_used, ratio, parity)
+                else:
+                    self._servo_samples.append(
+                        (key, level_used, ratio, parity))
+                    self._servo_samples = \
+                        self._servo_samples[-self.MTF_SERVO_KEEP:]
+
+        horizon = (self.fdoffset
+                   - self.MTF_SERVO_MAX_AGE_FIELDS * self.bytes_per_field)
+        self._servo_samples = [s for s in self._servo_samples
+                               if s[0] >= horizon]
+
+        if len(self._servo_samples) < self.MTF_SERVO_MIN_SAMPLES:
+            return None
+        # The two PAL field parities carry different ITS variants whose
+        # 2T amplitudes can differ by a few percent (Louvre: 1.039 vs
+        # 0.996), so a plain median drifts with the pool's parity mix
+        # and hunts.  Estimate each parity separately and average.
+        # (NTSC only ever pools first fields — the NTC-7 composite —
+        # so one parity list is simply empty there.)
+        target = self._mtf_servo_target()
+        by_parity = {True: [], False: []}
+        for _, lv, r, parity in self._servo_samples:
+            by_parity[parity].append(
+                lv + (r - target) * self.mtf_servo_gain)
+        meds = [np.median(v) for v in by_parity.values() if len(v) >= 3]
+        if not meds:
+            meds = [np.median([lv + (r - target) * self.mtf_servo_gain
+                               for _, lv, r, _ in self._servo_samples])]
+        ests = [e for v in by_parity.values() for e in v]
+        # Consistency gate: a real ITS gives tight estimates (ratio
+        # sigma ~0.01-0.02/field); noisy or misdetected content scatters
+        # them.  Distrust a scattered pool and fall back.
+        if np.std(ests) > self.mtf_servo_scatter:
+            return None
+        self._servo_engaged = True
+        return float(np.clip(np.mean(meds), *self.mtf_servo_clip))
+
     def checkMTF(self, field, pfield=None):
         if not self.autoMTF:
             oldmtf = self.mtf_level
             self.mtf_level = max(1 - ((self.frameNumber or 0) / 10000), 0)
             return np.abs(self.mtf_level - oldmtf) < 0.05
 
-        if len(self.bw_ratios) == 0:
+        estimate = self._mtf_servo_estimate(field)
+        source = "2T servo"
+        # The servo's closed-loop estimate carries more measurement
+        # noise than the open-loop ratio mapping; the wider dead-band
+        # also damps limit cycles (clip-bound hunting on ggv-mb, and a
+        # +/-0.04 parity-residual cycle on Louvre that a 0.075 band let
+        # through).  0.1 PAL level is ~1.3% HF - fine granularity for a
+        # +/-20% radius drift; the NTSC band scales with the loop gain
+        # so it is the same size in pulse/bar ratio terms.
+        deadband = self.mtf_servo_deadband
+        if estimate is None and self._servo_engaged and self._servo_samples:
+            # The pool has gone momentarily unusable - too few samples
+            # inside the horizon, or scattered - on a disc whose 2T pulse
+            # the servo has already been measuring.  Hold, rather than
+            # reverting to the open-loop mapping below.  That mapping is a
+            # cold start for discs that carry no ITS at all; letting it
+            # overwrite a direct measurement of the pulse the level exists
+            # to correct is a downgrade, and on a noisy pressing it
+            # alternates with the servo every field (measured on BBC
+            # Domesday DD86-DS1: 0.000 -> -0.726 -> 0.000 -> -0.809 -> ...)
+            # so the correction never takes effect at all.  An empty pool
+            # still falls through: no ITS has been seen inside the horizon,
+            # so there is nothing better to hold.
             return True
 
-        # scale for NTSC - 1.1 to 1.55
-        estimate = np.clip((np.mean(self.bw_ratios) - 1.08) / 0.38, 0, 1)
+        if estimate is None:
+            # Fallback: open-loop mapping from the black/white carrier
+            # ratio (scale for NTSC - 1.1 to 1.55).
+            if len(self.bw_ratios) == 0:
+                return True
+            estimate = np.clip((np.mean(self.bw_ratios) - 1.08) / 0.38, 0, 1)
+            source = f"b/w RF ratio {np.mean(self.bw_ratios):.3f}"
+            deadband = 0.05
 
         # Dead-band: hold the current level until the estimate drifts by
         # the redo threshold, then adopt it (and redo the field).  Fields
         # never see a stale-by-less-than-tolerance value silently change
         # under them, which makes the decode reproducible regardless of
         # how far ahead of the commit point it runs.
-        if np.abs(estimate - self.mtf_level) < 0.05:
+        if np.abs(estimate - self.mtf_level) < deadband:
             return True
 
+        if source == "2T servo" and self.fields_written > 0:
+            if (self._servo_last_adopt is not None
+                    and (self.fdoffset - self._servo_last_adopt)
+                    < self.MTF_SERVO_MIN_ADOPT_FIELDS * self.bytes_per_field):
+                return True
+            self._servo_last_adopt = self.fdoffset
+
+        logs.logger.debug(
+            f"MTF level {self.mtf_level:.3f} → {estimate:.3f} ({source})"
+        )
+        delta = estimate - self.mtf_level
         self.mtf_level = estimate
+
+        # Feed-forward: an MTF level change moves chroma by a known
+        # amount (~1.7 strength-equivalents per level unit on Louvre),
+        # so bump the inverse-MTF strength in the same adoption instead
+        # of letting burst sag for the fields the tracking loop needs to
+        # notice.  The burst tracking then only trims the residual.
+        if self.auto_deemp and self.deemp_calibrated:
+            current = self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
+            # Floored like the burst estimate, at zero or at a standing
+            # cut, whichever is lower.  The feed-forward predicts, it
+            # does not measure: it may not open a cut of its own, and it
+            # may not close one the multiburst asked for either - a
+            # plain 0.0 floor would walk a negative strength back up to
+            # zero on the next MTF adoption and undo the verdict.
+            s = np.clip(current + self.mtf_deemp_feedforward * delta,
+                        min(0.0, current), self.IMTF_STRENGTH_LIMIT)
+            self.rf.DecoderParams["inverse_mtf_strength"] = float(s)
+            self.rf.recompute_fvideo()
+            if self._job_engine is not None:
+                self._job_engine.set_imtf(float(s))
+            self._deemp_burst_samples.clear()
+            self._deemp_burst_offset = None
         return False
 
     def checkAutoDeemp(self, field):
         """Calibrate inverse-MTF chroma correction from burst amplitude.
 
         Returns True if no adjustment was needed, False if filters were
-        recomputed (caller should redo the field).  Collects burst
-        measurements over the first few fields (so MTF has time to settle),
-        then calibrates once and stays locked.
+        recomputed (caller should redo the field).  The first calibration
+        locks quickly (3 fields, so the first written frame is correct);
+        after that the strength keeps tracking the burst with a dead-band,
+        because the required correction drifts with radius on CAV discs
+        and moves whenever the RF MTF level adapts (measured drift on the
+        Louvre PAL disc: 0.39 at frame 2000 to 0.65 at frame 40000).
 
         De-emphasis stays at full strength (1.0) for correct phase response.
         The inverse MTF filter is a zero-phase (real-valued) correction
         whose shape follows the disc's optical MTF; its strength is set so
         burst amplitude matches the spec value.
         """
-        if self.deemp_calibrated:
+        if not self.auto_deemp:
             return True
 
         # NaN must not enter the sample pool: every comparison below fails
         # open for NaN and would lock in a NaN strength.
         if not np.isfinite(field.burstmedian) or field.burstmedian <= 5:
+            return True
+
+        # A field decoded under a stale strength (tolerated in-flight
+        # speculation) measures the old correction; pooling it would
+        # re-integrate an adoption that already happened.
+        stale = getattr(field, "decoded_imtf_strength", None)
+        if (stale is not None and stale
+                != self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)):
             return True
 
         # On a redo the same field comes through again (fdoffset unchanged);
@@ -684,6 +2001,8 @@ class LDdecode:
         else:
             self._deemp_burst_samples.append(field.burstmedian)
             self._deemp_burst_offset = self.fdoffset
+        # Rolling window so old-radius samples age out of the estimate.
+        self._deemp_burst_samples = self._deemp_burst_samples[-30:]
 
         if len(self._deemp_burst_samples) < 3:
             return True
@@ -691,36 +2010,87 @@ class LDdecode:
         return not self._deemp_calibrate()
 
     def _deemp_calibrate(self):
-        """Lock the inverse-MTF strength from the collected burst pool.
+        """Set the inverse-MTF strength from the collected burst pool.
 
-        Returns True when the filter parameters changed (callers should
-        re-decode anything produced under the old ones)."""
+        burstmedian is measured on the corrected video output (the FVideo
+        path includes the inverse-MTF filter), so the estimate is relative
+        to the currently applied strength.  Pool samples are only
+        comparable when decoded under the current parameters: the pool is
+        cleared here on adoption and by the callers on MTF/AGC moves, and
+        adoptions respawn the worker processes (_deemp_adjusted_last) so
+        later measurements actually reflect the new strength — without
+        that the loop integrates against stale measurements and runs
+        away.  The first calibration adopts any non-trivial strength;
+        afterwards a dead-band holds the current value until the estimate
+        drifts, mirroring checkMTF so the decode stays reproducible.
+
+        Returns True when the filter parameters changed in a way the
+        caller must re-decode for (initial calibration / exact mode);
+        dead-band tracking trims adopt tolerantly and return False."""
         expected = self.rf.SysParams["burst_ire"]
         measured = np.median(self._deemp_burst_samples)
         log_base = self.rf.inverse_mtf_log_at_fsc
+        current = self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
 
+        first = not self.deemp_calibrated
         self.deemp_calibrated = True
 
         if not np.isfinite(measured) or measured <= 0 or log_base <= 0:
             return False
 
-        if measured >= expected:
-            return False
-
-        strength = float(np.clip(
-            np.log(expected / measured) / log_base, 0.0, 2.0
+        # Floored at zero: burst amplitude on its own may boost a channel
+        # it reads as lossy, never cut one it reads as hot, because a
+        # burst read hot is as likely to be the level the disc recorded.
+        # The cut is the multiburst's to authorise, through the ceiling
+        # below.
+        estimate = float(np.clip(
+            current + np.log(expected / measured) / log_base,
+            0.0, self.IMTF_STRENGTH_LIMIT
         ))
 
-        if strength < 0.02:
+        # Burst amplitude cannot tell a channel that lost the subcarrier
+        # from a disc that recorded it low; the multiburst can, so where
+        # one is being measured it caps how far this may wind - and,
+        # where it finds the band hot, carries the strength below the
+        # floor the burst estimate was clipped at.
+        ceiling = self._imtf_ceiling(current)
+        if ceiling is not None and estimate > ceiling:
+            estimate = ceiling
+
+        if first:
+            # A first calibration adopts any non-trivial strength, in
+            # either direction: a multiburst ceiling can make that first
+            # verdict a cut.
+            if abs(estimate) < 0.02:
+                return False
+        elif (len(self._deemp_burst_samples) < 3
+                or np.abs(estimate - current) < 0.05):
             return False
 
+        capped = "" if ceiling is None or estimate < ceiling else (
+            f", capped at {ceiling:.3f} by the multiburst chroma band")
         logs.logger.debug(
             f"Auto inverse-MTF chroma: burst {measured:.1f} IRE "
             f"(expected {expected:.1f}), "
-            f"inverse_mtf_strength 0.000 → {strength:.3f}"
+            f"inverse_mtf_strength {current:.3f} → {estimate:.3f}{capped}"
         )
-        self.rf.DecoderParams["inverse_mtf_strength"] = strength
+        self.rf.DecoderParams["inverse_mtf_strength"] = estimate
         self.rf.recompute_fvideo()
+        # Pool samples were measured under the old strength.
+        self._deemp_burst_samples.clear()
+        self._deemp_burst_offset = None
+
+        if not first and not self.exact_speculation:
+            # Tracking trims are dead-band-sized (<= ~2% chroma), so
+            # adopt tolerantly: no redo/flush - hand the new strength to
+            # future jobs and let in-flight fields commit under the old
+            # one (the burst pool's stale-strength guard keeps them out
+            # of the estimate).  A hard flush here pauses and reseeks
+            # the engine, which a pipe-backed reader cannot always
+            # rewind for.
+            if self._job_engine is not None:
+                self._job_engine.set_imtf(estimate)
+            return False
         return True
 
     @profile
@@ -751,9 +2121,10 @@ class LDdecode:
         return len(symbols)
 
     def _process_efm(self, efm):
-        """Run one field's EFM slice through the PLL and write it out.
+        """Run one field's EFM slice through the selected demodulator
+        (EFM_PLL, or EFMTimingDemod with --efm_demod timing) and write it out.
 
-        The PLL is stateful over the concatenated stream, so this must be
+        The demodulator is stateful over the concatenated stream, so this must be
         fed strictly in field write order - it is the one per-field
         computation that can never fan out, which is why it sits behind a
         single ordered entry point (a candidate for its own lane once
@@ -762,13 +2133,13 @@ class LDdecode:
             self.outfile_pre_efm.write(efm.tobytes())
 
         efm_out = self.efm_pll.process(efm)
+        if self.efm_conf_packed:
+            # Fold the demodulator's per-T confidence (conf_view is 1:1
+            # with the T-values on both demodulators) into the high
+            # nibble of each .efm byte as doubt.
+            efm_out = efm_score.pack_t_conf(efm_out, self.efm_pll.conf_view())
         if self.outfile_efm is not None:
             self.outfile_efm.write(efm_out.tobytes())
-        if self.outfile_efmc is not None:
-            # Per-T-value confidence, aligned 1:1 with the .efm T-values just written
-            self.outfile_efmc.write(
-                self.efm_pll.pllConf[: self.efm_pll.pllResultCount].tobytes()
-            )
 
         return efm_out
 
@@ -889,31 +2260,114 @@ class LDdecode:
         return np.clip(out + 0.5, 0, 65535).astype(np.uint16).reshape(-1)
 
     def writeout(self, dataset):
+        """Commit-time half of the output stage.
+
+        The field's metadata joins fieldinfo and the field is counted as
+        written here, on the commit thread, so buildmetadata and the
+        audio clock see it at once.  Everything else about writing it
+        (_write_field) is a function of the field and of state only the
+        output stage touches, so it follows on the output lane when
+        there is one - trailing the commit loop by up to
+        OUTPUT_LANE_DEPTH fields, one field at a time in this order -
+        and runs inline otherwise.  The field goes out as a view bound
+        to the decoder parameters as they are now (field_output_view),
+        which is what the inline write would have read."""
         f, fi, picture, audio, efm = dataset
+
+        fi["audioSamples"] = 0 if audio is None else int(len(audio) / 2)
+        # efmTValues and ac3Symbols are filled in by _write_field
+        fi["efmTValues"] = 0
+        fi["ac3Symbols"] = 0
+        self.fieldinfo.append(fi)
+
+        field_id = self.fields_written
+        self.fields_written += 1
+
+        view = field_output_view(f)
+        if self.cvbs_writer is None:
+            picture = self._output_picture(picture, view)
+        else:
+            self._pair_cvbs_view(view)
+
+        job = (view, fi, picture, audio, efm, field_id, len(self.fieldinfo))
+        if self._output_lane is not None:
+            self._output_lane.submit(self._write_field, job)
+        else:
+            self._write_field(job)
+
+    def _pair_cvbs_view(self, view):
+        """Bind a CVBS frame's first field to its second field's
+        parameter snapshot.
+
+        CVBSWriter holds a first field until its second arrives and only
+        then resamples both (_emit_frame), so the inline write always
+        read the parameters current at the *second* field's commit for
+        both - a servo trim adopted between the two fields reached the
+        first as well, and through the burst lock's running shift every
+        frame after.  The first field's view is re-bound here, on the
+        commit thread before the second field's job is queued, so the
+        lane reproduces exactly that."""
+        if view is None:
+            return
+        if view.isFirstField:
+            self._cvbs_first_view = view
+            return
+        first = getattr(self, "_cvbs_first_view", None)
+        if first is not None:
+            first.rf = view.rf
+            self._cvbs_first_view = None
+
+    def _output_picture(self, picture, view):
+        """The TBC picture to write for a field under the commit-time
+        chroma DG estimate (see chroma_dg_output_picture).
+
+        A field job has usually applied the correction already, and the
+        estimate it used is kept while it is current; a field that
+        needs it redone (an adoption since it was dispatched) gets the
+        three whole-field FFTs on the output pool instead, so a burst
+        of stale in-flight fields after an adoption is corrected
+        concurrently, off the commit thread.  Returns the picture, or a
+        Future of it that _write_field resolves in order."""
+        dp = view.rf.DecoderParams
+        args = (picture, view,
+                float(dp.get("chroma_dg_slope", 0.0)),
+                float(dp.get("chroma_dg_phase", 0.0)),
+                self.dg_speculation_tolerance)
+        if self._output_pool is not None:
+            return self._output_pool.submit(chroma_dg_output_picture, *args)
+        return chroma_dg_output_picture(*args)
+
+    def _write_field(self, job):
+        """Output-stage half of writeout: the EFM and AC3 demodulation,
+        the metadata database row and the sample-data writes for one
+        committed field, in commit order.  Runs on the output lane
+        (with -t N) or inline; either way the demodulators, the
+        database connection and the output files are touched by this
+        stage alone."""
+        f, fi, picture, audio, efm, field_id, n_fields = job
+        if isinstance(picture, Future):
+            picture = picture.result()
+
         efm_out = None
         if self.digital_audio is True:
             efm_out = self._process_efm(efm)
-
-        fi["audioSamples"] = 0 if audio is None else int(len(audio) / 2)
         fi["efmTValues"] = len(efm_out) if self.digital_audio else 0
 
         # Per-field symbol count, analogous to efmTValues
         if self.outfile_ac3sym is not None:
             fi["ac3Symbols"] = self.AC3demodulate(f)
-        else:
-            fi["ac3Symbols"] = 0
 
-        self.fieldinfo.append(fi)
+        if self.dbconn is not None:
+            self._write_field_db(fi, field_id, n_fields)
 
-        if self.dbconn is None:
-            self._writeout_data(fi, picture, audio, f, efm_out)
-            return
+        self._writeout_data(fi, picture, audio, f, efm_out)
 
+    def _write_field_db(self, fi, f_id, n_fields):
+        """Insert one field's rows into the .tbc.db."""
         if not self.capture_id:
             self.build_sqlite_metadata()
 
         c_id = self.capture_id
-        f_id = self.fields_written
 
         # On a ~1000-frame boundary, raise durability to FULL *before* this
         # field's inserts open a transaction: the safety level cannot be
@@ -922,9 +2376,11 @@ class LDdecode:
         # flushes the whole file).  Restored to OFF after that commit.
         sync_now = (f_id + 1) % self.DB_SYNC_FIELDS == 0
         if sync_now:
-            # A speculation_log insert since the last field's commit leaves
-            # a transaction open, and the safety level cannot be changed
-            # mid-transaction; fold it into this field's boundary commit.
+            # A speculation_log insert (or any other stray write) may
+            # have auto-opened a transaction since the last commit;
+            # close it first or the PRAGMA throws ("Safety level may
+            # not be changed inside a transaction") and kills the
+            # decode at the boundary field.
             if self.dbconn.in_transaction:
                 self.dbconn.commit()
             self.dbconn.execute("PRAGMA synchronous=FULL")
@@ -989,7 +2445,7 @@ class LDdecode:
                 ) VALUES (?, ?, ?, ?, ?)''',
                 dropout_data)
 
-        self.update_sqlite_field_count()
+        self.update_sqlite_field_count(n_fields)
 
         # Commit per field so the DB stays consistent in the page cache.
         # With journalling off this reaches disk only on the boundary
@@ -998,16 +2454,17 @@ class LDdecode:
         if sync_now:
             self.dbconn.execute("PRAGMA synchronous=OFF")
 
-        self._writeout_data(fi, picture, audio, f, None)
-
     def _writeout_data(self, fi, picture, audio, f, efm_out=None):
-        """Write the field's sample data (video/rf-tbc/audio outputs)."""
+        """Write the field's sample data (video/rf-tbc/audio outputs).
+
+        The TBC picture arrives with its chroma DG correction already
+        decided (_output_picture); the CVBS writer applies its own on
+        the 4fsc lattice."""
         if self.cvbs_writer is not None:
             self.cvbs_writer.push_field(fi, picture, f, efm=efm_out,
                                         audio=audio)
         else:
             self.outfile_video.write(picture)
-        self.fields_written += 1
 
         if self.do_rftbc:
             rftbc = f.rf_tbc()
@@ -1032,8 +2489,11 @@ class LDdecode:
             return None
         return rawinput
 
-    def _demod_raw_block(self, rawinput, mtf_level):
-        """Demodulate one raw block (pure given filter state)."""
+    def _demod_raw_block(self, rawinput, mtf_level, imtf_strength=None,
+                         veq=None):
+        """Demodulate one raw block (pure given filter state).  The
+        imtf_strength key is only meaningful for process-pool workers;
+        this main-process rf always has the current filters."""
         return self.rf.demodblock(
             data=rawinput,
             mtf_level=mtf_level,
@@ -1051,7 +2511,10 @@ class LDdecode:
                 and self._job_engine is None):
             # Blocks come from the prefetching thread pool; identical values
             # to the inline path (same per-block computation).
-            blockdata = self.block_cache.get_span(brange, MTF)
+            blockdata = self.block_cache.get_span(
+                brange, MTF,
+                self.rf.DecoderParams.get("inverse_mtf_strength", 0.0),
+                self.rf.DecoderParams.get("video_eq_auto"))
         elif self.block_cache is not None:
             # Inline demod on this thread (field-job repair/redo path and
             # warm-up with -t).  The raw window is read as ONE span under
@@ -1106,39 +2569,59 @@ class LDdecode:
 
         return rv
 
+    def read_sync(self, begin, length):
+        """ Return only the demodulated 0.5 MHz sync path for an input range.
+
+            Much cheaper than demod_read (one video product, no audio/EFM/
+            dropout work) and deliberately uncached: the only caller probes
+            widely-spaced positions and never revisits them. """
+        blocksize = self.demod_blocksize
+        brange = range(begin // blocksize, ((begin + length) // blocksize) + 1)
+
+        sync = []
+        for b in brange:
+            rawinput = self._read_raw_block(b)
+            if rawinput is None:
+                return None
+            sync.append(self.rf.demodblock_sync(data=rawinput, cut=True))
+
+        return {
+            "sync": np.concatenate(sync),
+            "startloc": (begin // blocksize) * blocksize,
+        }
+
     def has_sync(self, start):
         """Return whether a lightweight probe sees a possible field sync.
 
-        This is a conservative preamble gate (used by ld-find-start to skip
-        pre-roll cheaply).  It demodulates only the 0.5 MHz sync path and does
-        not validate a field or alter the decoder state; callers must still
-        use :meth:`decodefield` before treating a position as video.
+        This is a conservative preamble gate.  It does not validate a field or
+        alter the decoder state; callers must still use :meth:`decodefield`
+        before treating a position as video.  Returns None at EOF.
         """
 
         readloc = max(0, int(start - self.rf.blockcut))
         readloc_block = readloc // self.blocksize
         numblocks = (self.readlen // self.blocksize) + 2
-        begin = readloc_block * self.blocksize
-        length = numblocks * self.blocksize
 
-        blocksize = self.demod_blocksize
-        sync_parts = []
-        for b in range(begin // blocksize, ((begin + length) // blocksize) + 1):
-            rawinput = self._read_raw_block(b)
-            if rawinput is None:
-                return None
-            sync_parts.append(self.rf.demodblock_sync(data=rawinput, cut=True))
+        rawdecode = self.read_sync(
+            readloc_block * self.blocksize,
+            numblocks * self.blocksize,
+        )
+        if rawdecode is None:
+            return None
 
         probe_decode = {
             "input": np.empty(0, dtype=np.int16),
-            "video": np.rec.array([np.concatenate(sync_parts)], names=["demod_05"]),
+            "video": np.rec.array([rawdecode["sync"]], names=["demod_05"]),
         }
         field = self.FieldClass(
             self.rf,
             probe_decode,
             fields_written=0,
-            readloc=(begin // blocksize) * blocksize,
+            readloc=rawdecode["startloc"],
         )
+
+        # getpulses() recalibrates ire0 in place when it finds nothing; this is
+        # only a probe, so don't let it move the real decoder's levels.
         original_ire0 = self.rf.DecoderParams["ire0"]
         try:
             pulses = field.getpulses()
@@ -1200,6 +2683,14 @@ class LDdecode:
             wow_level_adjust_smoothing=self.wow_level_adjust_smoothing,
             wow_interpolation_method=self.wow_interpolation_method
         )
+
+        # the 2T MTF servo needs to know what parameters each field was
+        # demodulated under (measurements are closed-loop)
+        f.decoded_mtf_level = mtf_level
+        f.decoded_imtf_strength = getattr(
+            self.rf, "DecoderParams", {}).get("inverse_mtf_strength", 0.0)
+        f.decoded_video_eq = getattr(
+            self.rf, "DecoderParams", {}).get("video_eq_auto")
 
         # set an object-level variable to make notebook debugging easier
         self.curfield = f
@@ -1312,12 +2803,30 @@ class LDdecode:
         f = entry["f"]
         mtf0 = self.mtf_level
         strength0 = self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
+        veq0 = self.rf.DecoderParams.get("video_eq_auto")
         agc_moved = False
         keep = 900 if self.isCLV else 30
 
         prev, pos = f, entry["start"] + entry["offset"]
-        for _ in range(8):
-            if self.deemp_calibrated:
+        # Run until the calibration loops are actually stable (two
+        # consecutive fields with no parameter movement after the deemp
+        # calibration has locked), not merely until the first deemp
+        # lock: the 2T MTF servo converges over several adoptions, and
+        # exiting mid-convergence writes the first frame under still-
+        # moving parameters.  The budget bounds pathological cases.
+        stable = 0
+        for _ in range(40):
+            if (self.deemp_calibrated and stable >= 2
+                    and (not self.veq_servo or self.veq_calibrated
+                         or not self._veq_samples)
+                    and (not self.mtf_2t_servo or not self._servo_samples
+                         or len(self._servo_samples)
+                         >= self.MTF_SERVO_MIN_SAMPLES)):
+                # (a multiburst or 2T line has been seen but its servo
+                # not yet locked: keep warming up so the first frame
+                # gets it.  The 2T pool matters on NTSC, where only
+                # first fields carry the pulse, so it fills at half the
+                # rate the deemp/EQ locks need.)
                 break
             nf, off = self.decodefield(pos, self.mtf_level, prev,
                                        entry["initphase"])
@@ -1333,27 +2842,54 @@ class LDdecode:
                 self.bw_ratios = self.bw_ratios[-keep:]
 
             moved = not self.checkMTF(nf, prev)
+            if moved and self.veq_calibrated:
+                # The EQ locked against an MTF level that just changed;
+                # drop the lock so the exit condition below holds the
+                # warmup until the EQ has re-converged under the final
+                # level (post-warmup adoptions handle this by tracking,
+                # but the first written frame should carry a consistent
+                # set).
+                self.veq_calibrated = False
             if self._adjust_agc(nf, False):
                 agc_moved = True
                 moved = True
+            if not moved:
+                moved = not self.checkVideoEQ(nf)
             if moved:
                 # this field (and any pool samples) were measured under
                 # parameters that just changed
                 self._deemp_burst_samples.clear()
+                self._veq_samples.clear()
+                self._dg_samples.clear()
             elif np.isfinite(nf.burstmedian) and nf.burstmedian > 5:
                 self._deemp_burst_samples.append(nf.burstmedian)
 
             if len(self._deemp_burst_samples) >= 3:
-                self._deemp_calibrate()
+                if self._deemp_calibrate():
+                    moved = True
+            stable = 0 if moved else stable + 1
             prev = nf
+
+        if not self.deemp_calibrated and self._deemp_burst_samples:
+            # Ran out of lookahead (short capture) before collecting the
+            # full sample pool; a single field's burstmedian is already a
+            # median over hundreds of lines, so calibrate from what we
+            # have rather than writing the first frame uncorrected.
+            self._deemp_calibrate()
 
         if agc_moved:
             # worker processes hold level parameters frozen from their
             # spawn; the caller's redo path rebuilds them from this flag
             self._agc_adjusted_last = True
-        return (agc_moved or self.mtf_level != mtf0
-                or self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
-                != strength0)
+        deemp_moved = (
+            self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
+            != strength0)
+        if deemp_moved:
+            # inverse_mtf_strength is likewise frozen into the workers'
+            # FVideo filter at spawn
+            self._deemp_adjusted_last = True
+        return (agc_moved or deemp_moved or self.mtf_level != mtf0
+                or self.rf.DecoderParams.get("video_eq_auto") != veq0)
 
     def calibrate(self, f, metrics, redos):
         """Fold one decoded field's measurements into the calibration
@@ -1377,18 +2913,41 @@ class LDdecode:
         agc_adjusted = self._adjust_agc(f, False)
         self._agc_adjusted_last = agc_adjusted
 
-        if agc_adjusted and not self.deemp_calibrated:
-            # Burst samples measured under the old levels are not
-            # comparable.
+        if agc_adjusted:
+            # Burst and multiburst samples measured under the old levels
+            # are not comparable.
             self._deemp_burst_samples.clear()
             self._deemp_burst_offset = None
+            self._veq_samples.clear()
+            self._dg_samples.clear()
 
         redo = not self.checkMTF(f, self.fieldstack[0])
+        if redo:
+            # MTF moved: burst/multiburst samples measured under the old
+            # RF filter are not comparable either.
+            self._deemp_burst_samples.clear()
+            self._deemp_burst_offset = None
+            self._veq_samples.clear()
+            self._dg_samples.clear()
 
-        if not agc_adjusted:
-            redo = redo or not self.checkAutoDeemp(f)
+        veq_redo = False
+        if not agc_adjusted and not redo:
+            veq_redo = not self.checkVideoEQ(f)
 
-        return redo or agc_adjusted
+        deemp_adjusted = False
+        if not agc_adjusted and not redo and not veq_redo:
+            deemp_adjusted = not self.checkAutoDeemp(f)
+        self._deemp_adjusted_last = deemp_adjusted
+
+        changed = redo or veq_redo or agc_adjusted or deemp_adjusted
+        if changed:
+            # The staircase was measured under parameters that just
+            # moved; slope samples pooled across the change would mix
+            # two different channels.
+            self._dg_samples.clear()
+        else:
+            self.checkChromaDG(f)
+        return changed
 
     def validate_chain(self, f, prevfield):
         """Check an independently-decoded field against the committed
@@ -1535,7 +3094,8 @@ class LDdecode:
             self.block_cache.flush()
 
         if self._job_engine is not None:
-            if self.exact_speculation or self._agc_adjusted_last:
+            if (self.exact_speculation or self._agc_adjusted_last
+                    or self._deemp_adjusted_last):
                 # Hard toss: everything decoded under the old parameters
                 # is discarded and speculation restarts from truth.
                 self._log_speculation(
@@ -1557,6 +3117,10 @@ class LDdecode:
                     "speculation (tolerant mode)",
                 )
                 self._job_engine.set_mtf(self.mtf_level)
+                self._job_engine.set_imtf(self.rf.DecoderParams.get(
+                    "inverse_mtf_strength", 0.0))
+                self._job_engine.set_veq(self.rf.DecoderParams.get(
+                    "video_eq_auto"))
 
     def _commit_entry(self, entry):
         """Calibrate one chain entry (with a bounded redo budget) and
@@ -1589,6 +3153,8 @@ class LDdecode:
             self._fields_since_redo = 0
             self._flush_pipeline()
 
+            # Only AGC changes need a worker respawn now: mtf_level and
+            # inverse_mtf_strength both travel per job.
             if (self._agc_adjusted_last and self._job_engine is not None):
                 self._restart_workers()
 
@@ -1629,14 +3195,6 @@ class LDdecode:
         if ((f.sync_confidence < 50) and not
              inrange(fieldlength, self.output_lines - 2, self.output_lines + 2)):
             logs.logger.warning("WARNING: Possible player skip detected - check output")
-
-        # Deferred V4300D filtering: first solid field-length lock flips the
-        # shared event, enabling the spur filter for the rest of the decode.
-        if (self._v4300_defer and not self._acquired_event.is_set()
-                and inrange(fieldlength, self.output_lines - 2,
-                            self.output_lines + 2)):
-            self._acquired_event.set()
-            logs.logger.info("V4300D: sync acquired -- enabling spur filter for remaining decode")
 
         if len(self.fieldstack) >= 4:
             # Fields no longer hold a reference to their predecessor (they
@@ -1703,7 +3261,7 @@ class LDdecode:
         stale levels, so the pool (and the job engine pointing at it)
         is rebuilt from a fresh snapshot."""
         logs.logger.info(
-            "AGC adjusted decoder levels - restarting worker processes"
+            "decoder parameters adjusted - restarting worker processes"
         )
         if self._job_engine is not None:
             self._job_engine.stop()
@@ -1732,6 +3290,8 @@ class LDdecode:
             "useAGC": self.useAGC,
             "analog_audio": self.analog_audio,
             "audio_bits": self.audio_output_bits,
+            # the PAL CVBS writer resamples from the demod at write time
+            "keep_demod": self.output_cvbs and self.system == "PAL",
         }
 
     def _field_engine_cfg(self):
@@ -1759,9 +3319,24 @@ class LDdecode:
             next_is_first=(not prev.isFirstField) if prev is not None else True,
             lastfieldwritten=self.lastFieldWritten,
             mtf_level=self.mtf_level,
+            imtf_strength=self.rf.DecoderParams.get(
+                "inverse_mtf_strength", 0.0),
+            veq=self.rf.DecoderParams.get("video_eq_auto"),
+            chroma_dg=self._engine_chroma_dg(),
         )
         self._engine_dirty = False
         self._job_rejects = 0
+
+    def _engine_chroma_dg(self):
+        """The chroma DG (slope, phase) field jobs should correct the TBC
+        picture under - None for CVBS output, whose writer applies the
+        correction itself on the 4fsc lattice."""
+        if self.output_cvbs:
+            return None
+        return (
+            float(self.rf.DecoderParams.get("chroma_dg_slope", 0.0)),
+            float(self.rf.DecoderParams.get("chroma_dg_phase", 0.0)),
+        )
 
     def _log_speculation(self, reason, detail=""):
         """Record a speculation reject (or engine resync) with its cause:
@@ -1774,17 +3349,25 @@ class LDdecode:
         )
 
         if self.dbconn is not None:
-            try:
-                self.dbconn.execute(
-                    "INSERT INTO speculation_log "
-                    "(capture_id, field_id, file_loc, reason, detail) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (self.capture_id or 0, self.fields_written,
-                     int(self.fdoffset), reason, detail),
-                )
-            except Exception:
-                # diagnostics must never break the decode
-                pass
+            # The database belongs to the output stage: the row is
+            # written from there, in sequence with the field rows.
+            row = (self.fields_written, int(self.fdoffset), reason, detail)
+            if self._output_lane is not None:
+                self._output_lane.submit(self._db_log_speculation, row)
+            else:
+                self._db_log_speculation(row)
+
+    def _db_log_speculation(self, row):
+        try:
+            self.dbconn.execute(
+                "INSERT INTO speculation_log "
+                "(capture_id, field_id, file_loc, reason, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (self.capture_id or 0,) + row,
+            )
+        except Exception:
+            # diagnostics must never break the decode
+            pass
 
     def _accept_job(self, res):
         """Turn a speculative field result into a commit entry - or None
@@ -1813,12 +3396,30 @@ class LDdecode:
 
         mtf_drift = abs(res["mtf_level"] - self.mtf_level)
         if mtf_drift > (0 if self.exact_speculation
-                        else self.MTF_SPECULATION_TOLERANCE):
+                        else self.mtf_speculation_tolerance):
             self._log_speculation(
                 "stale-mtf",
                 f"job used {res['mtf_level']:.4f}, current {self.mtf_level:.4f}",
             )
             return None
+
+        if self.exact_speculation:
+            # The inverse-MTF strength and the video EQ shape the demod
+            # filter too; a tolerant decode accepts dead-band trims of
+            # either on in-flight fields, an exact one accepts nothing
+            # a serial decode would not have used at this field.
+            imtf = self.rf.DecoderParams.get("inverse_mtf_strength", 0.0)
+            if res["imtf_strength"] != imtf:
+                self._log_speculation(
+                    "stale-imtf",
+                    f"job used {res['imtf_strength']:.4f}, current {imtf:.4f}",
+                )
+                return None
+            veq = self.rf.DecoderParams.get("video_eq_auto")
+            veq = tuple(veq) if veq else None
+            if getattr(res["field"], "decoded_video_eq", None) != veq:
+                self._log_speculation("stale-veq", "job used a previous video EQ")
+                return None
 
         true_start = self.fdoffset
         readloc = int(true_start - self.rf.blockcut)
@@ -2017,6 +3618,11 @@ class LDdecode:
                 return (10 * decodeBCD(bcd >> 4)) + digit
 
         leadoutCount = 0
+        # consecutive-frame lead-out confirmation: reset the run when
+        # the previous frame produced no lead-out codes
+        if not self._leadout_hit:
+            self._leadout_run = 0
+        self._leadout_hit = False
 
         for linecode in f1.linecode + f2.linecode:
             if linecode is None:
@@ -2024,9 +3630,18 @@ class LDdecode:
 
             if linecode == 0x80EEEE:  # lead-out reached
                 leadoutCount += 1
-                # Require two leadouts, since there may only be one field in the raw data w/it
-                if leadoutCount == 2:
-                    self.leadOut = True
+                # Require two codes in the frame (there may only be one
+                # field in the raw data with it), on two consecutive
+                # frames: a real lead-out spans hundreds of frames,
+                # while an isolated frame's worth of 0x80EEEE can be a
+                # mid-programme picture-VBI misread (seen on the Louvre
+                # CAV disc, where it silently truncated the decode).
+                if leadoutCount == 2 and not self._leadout_hit:
+                    self._leadout_hit = True
+                    self._leadout_run += 1
+                    if self._leadout_run >= 2:
+                        logs.logger.debug("VBI: lead-out confirmed")
+                        self.leadOut = True
             elif linecode == 0x88FFFF:  # lead-in
                 self.leadIn = True
             elif (linecode & 0xF0DD00) == 0xF0DD00:  # CLV minutes/hours
