@@ -619,6 +619,12 @@ def dropout_mask(shape, dropouts):
 # reject a capture deviating > K x the per-pixel MAD (0 disables; env override
 # exists so the threshold can be tuned/measured without editing the source)
 LOCAL_SPREAD_K = float(os.environ.get("LDSTACK_LOCAL_SPREAD_K", "6.0"))
+# A capture whose sync region is mistimed over more than this fraction of a
+# field's lines is discarded for the frame (the "field the TBC could not
+# place" the integrity check was written for).  At or below it the damage is
+# treated as local and masked line-by-line instead, so a three-line defect no
+# longer costs the 623 good lines around it.
+INTEGRITY_DROP_FRAC = float(os.environ.get("LDSTACK_INTEGRITY_DROP_FRAC", "0.20"))
 # cross-master fill must sit within K x the captures' noise of a simple vertical
 # estimate; 0 disables the check
 FILL_SANITY_K = float(os.environ.get("LDSTACK_FILL_SANITY_K", "8.0"))
@@ -1157,23 +1163,28 @@ def _compute_frame(fd, P):
     # sample drop, i.e. a field the TBC could not place - drop that capture for
     # this frame. Catches scrambled frames at normal brightness, which the
     # level test below cannot see.
+    integrity_bad = {}          # name -> {"f0": bool per line, "f1": ...}
     if len(present_primary) >= 3 and P.get("black") is not None:
         thr = P["black"] - 2560.0            # 10 IRE below black
         ok = []
         for n in present_primary:
-            bad = False
+            per_field, worst = {}, 0.0
             for which2 in ("f0", "f1"):
                 col = np.asarray(getattr(fd[n], which2))[:, 4].astype(np.float64)
                 over = col > thr
+                # Keep only runs of three or more: an isolated line over the
+                # threshold is noise, a run is mistimed video.  Record WHICH
+                # lines rather than a single verdict for the field.
+                badline = np.zeros(len(over), dtype=bool)
                 run = 0
-                for v in over:
+                for i, v in enumerate(over):
                     run = run + 1 if v else 0
                     if run >= 3:
-                        bad = True
-                        break
-                if bad:
-                    break
-            if not bad:
+                        badline[i - run + 1:i + 1] = True
+                per_field[which2] = badline
+                worst = max(worst, float(badline.mean()))
+            integrity_bad[n] = per_field
+            if worst <= INTEGRITY_DROP_FRAC:
                 ok.append(n)
         if len(ok) >= 2:
             present_primary = ok
@@ -1220,7 +1231,14 @@ def _compute_frame(fd, P):
                     if P["chroma_align"]:
                         reg = chroma_align_field(reg, ref_field, ca)
                 regs.append(reg)
-                masks.append(dropout_mask((fh, fw), getattr(fr, do_attr)))
+                m = dropout_mask((fh, fw), getattr(fr, do_attr))
+                # Mask this capture's locally mistimed lines instead of
+                # discarding its whole frame; the other captures cover them
+                # exactly as they cover a dropout.
+                ib = integrity_bad.get(n, {}).get(which)
+                if ib is not None and ib.any():
+                    m[ib, :] = True
+                masks.append(m)
                 ws.append(weights[n]); sigs.append(sig[n])
             if P["reg_confidence"]:
                 ws = perframe_weights(regs, masks, ws, ra, ca,
