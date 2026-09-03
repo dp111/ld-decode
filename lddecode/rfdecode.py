@@ -616,9 +616,8 @@ class RFDecode:
         # _imtf_ceiling).
         freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
         crossover = 2.0e6
-        _fps = float(self.SysParams.get("FPS", 30))
-        mtf_at_crossover = compute_mtf(crossover, cavframe=0, fps=_fps)
-        mtf_vals = compute_mtf(freq_array.copy(), cavframe=0, fps=_fps)
+        mtf_at_crossover = compute_mtf(crossover, cavframe=0)
+        mtf_vals = compute_mtf(freq_array.copy(), cavframe=0)
         mtf_norm = np.clip(mtf_vals / mtf_at_crossover, 0.05, 1.0)
         SF["Finverse_mtf_base"] = 1.0 / mtf_norm
         # EXPERIMENT: band-limit the chroma correction.  The servo sizes its

@@ -243,13 +243,8 @@ def get_fmax(cavframe=0, laser=780, na=0.5, fps=30):
     return (2 * na / (laser / 1000)) * (2 * np.pi * fps) * loc
 
 
-def compute_mtf(freq, cavframe=0, laser=780, na=0.52, fps=30):
-    # fps is the disc's rotation rate: CAV is one frame per revolution, so
-    # PAL turns at 1500 rpm (25 rev/s) and NTSC at 1800 (29.97).  It sets the
-    # linear velocity, hence the optical cutoff, so passing the NTSC rate for
-    # a PAL disc overstates fmax by 20% and flatters its MTF (1.16 dB at fsc
-    # / 1.86 dB at 5.8 MHz at the inner radius, where the curve is built).
-    fmax = get_fmax(cavframe, laser, na, fps)
+def compute_mtf(freq, cavframe=0, laser=780, na=0.52):
+    fmax = get_fmax(cavframe, laser, na)
 
     freq_mhz = freq / 1000000
 
