@@ -78,6 +78,19 @@ class GPUDemod:
         # demodblock slices rfhpf offset by the measured rot delay
         d = getattr(rf, "delays", None)
         self.rotdelay = int(d["video_rot"]) if d and "video_rot" in d else 0
+
+        # --- V4300D coherent subtract state (mirrors rfdecode's) ------------
+        bl, freq = rf.blocklen, rf.freq
+        self.v4_on = bool(getattr(rf, "PAL_V4300D_CoherentSubtract", False))
+        self.v4_sl = slice(int(bl * (rf.V4300D_WINDOW_MHZ[0] / freq)),
+                           int(1 + bl * (rf.V4300D_WINDOW_MHZ[1] / freq)))
+        self.v4_carrier = slice(int(bl * (rf.V4300D_CARRIER_MHZ[0] / freq)),
+                                int(bl * (rf.V4300D_CARRIER_MHZ[1] / freq)))
+        self.fpb = rf.freq_hz / bl
+        self.v4_tol = max(2, int(round(rf.V4300D_ANCHOR_TOL_HZ / self.fpb)))
+        self.v4_nbtol = max(1, self.v4_tol // 2)
+        self.v4_fh = int(round((1e6 / rf.SysParams["line_period"]) / self.fpb))
+        self.d_bins = cp.arange(bl, dtype=cp.float64)
         self._mtf_cache = {}
 
     def _mtf_pow(self, level):
@@ -114,6 +127,12 @@ class GPUDemod:
         rfhpf = cfft.irfft(half * self.d_frfhpf, n=bl, axis=-1)
         rd = self.rotdelay
         rfhpf = rfhpf[:, self.blockcut - rd:bl - self.blockcut_end - rd].astype(cp.float32)
+
+        # V4300D coherent subtract, per block, entirely on the GPU: the
+        # spectrum never goes back across the bus for it
+        if self.v4_on:
+            rows = [self._v4300d(full[i]) for i in range(B)]
+            full = cp.stack(rows) if any(r is not full[i] for i, r in enumerate(rows)) else full
 
         filt = full * self.d_rfvideo
         if use_fcutpal and self.d_fcutpal is not None:
@@ -160,3 +179,93 @@ class GPUDemod:
                 "rfhpf": r_host[i],
             })
         return out
+
+    # ---- V4300D coherent subtract, per block on the GPU -------------------
+    # Ported from rfdecode.v4300d_coherent_subtract.  It does not batch: the
+    # line hunt is sequential and its gates are data-dependent, so this runs
+    # per block inside the batch.  The arrays are small (a +-2048 bin cut), so
+    # even with a kernel launch per operation this stays cheaper than sending
+    # the spectrum back to the CPU and returning it.
+
+    def _dirichlet(self, delta, N):
+        """Rectangular-window transform of a unit tone at bin offset delta."""
+        d = cp.asarray(delta, dtype=cp.float64)
+        num = cp.sin(cp.pi * d)
+        den = cp.sin(cp.pi * d / N)
+        mag = cp.where(cp.abs(den) > 1e-12, num / cp.where(den == 0, 1, den),
+                       cp.float64(N))
+        return mag * cp.exp(1j * cp.pi * d * (N - 1) / N)
+
+    def _refine_subtract(self, X, k, fit_bins=64, cut_bins=2048):
+        N = self.blocklen
+        m = cp.arange(k - fit_bins, k + fit_bins + 1)
+        Xw = X[m]
+        grid = k + cp.linspace(-0.6, 0.6, 9)
+        E = self._dirichlet(grid[:, None] - m[None, :], N)
+        num = E.conj() @ Xw
+        den = cp.sum(E.real ** 2 + E.imag ** 2, axis=1)
+        mag = (num.real ** 2 + num.imag ** 2) / den
+        g = int(cp.argmax(mag))
+        if 0 < g < 8:
+            d2 = mag[g - 1] - 2 * mag[g] + mag[g + 1]
+            frac = float(cp.clip(0.5 * (mag[g - 1] - mag[g + 1]) / d2, -1.0, 1.0)) \
+                if float(d2) != 0.0 else 0.0
+        else:
+            frac = 0.0
+        fbin = float(grid[g]) + frac * float(grid[1] - grid[0])
+        mc = cp.arange(k - cut_bins, k + cut_bins + 1)
+        Ef = self._dirichlet(fbin - m, N)
+        c = cp.dot(Ef.conj(), Xw) / cp.sum(Ef.real ** 2 + Ef.imag ** 2)
+        X[mc] -= c * self._dirichlet(fbin - mc, N)
+        X[N - mc] = cp.conj(X[mc])
+        return fbin * self.fpb
+
+    def _v4300d(self, X0, maxlines=10):
+        """Return X0 with the LD-V4300D clock spur removed (or X0 unchanged)."""
+        rf = self.rf
+        sl, X, lines = self.v4_sl, X0, []
+        amp = cp.abs(X0[sl])
+        med = float(cp.median(amp))
+        if med <= 0:
+            return X0
+        if float(cp.abs(X0[self.v4_carrier]).max()) <= rf.V4300D_MIN_CARRIER * med:
+            return X0                      # no video carrier: leave untouched
+
+        def subtract(k):
+            nonlocal X
+            if X is X0:
+                X = X0.copy()
+            lines.append(self._refine_subtract(X, int(k)))
+
+        main_found = False
+        for ks in (0,) + tuple(rf.V4300D_SATELLITE_KS):
+            if ks != 0 and not main_found:
+                break
+            k0 = int(round((rf.V4300D_CLOCK_HZ + ks * rf.V4300D_SATELLITE_HZ)
+                           / self.fpb))
+            t, nb, fh = self.v4_tol, self.v4_nbtol, self.v4_fh
+            seg = cp.abs(X0[k0 - t:k0 + t + 1])
+            kk = k0 - t + int(cp.argmax(seg))
+            peak = float(seg.max())
+            comb = max(float(cp.abs(X0[kk - fh - nb:kk - fh + nb + 1]).max()),
+                       float(cp.abs(X0[kk + fh - nb:kk + fh + nb + 1]).max()))
+            mm, mc = ((rf.V4300D_MAIN_MIN_MED, rf.V4300D_MAIN_MIN_COMB) if ks == 0
+                      else (rf.V4300D_SAT_MIN_MED, rf.V4300D_SAT_MIN_COMB))
+            if peak > mm * med and peak > mc * comb:
+                subtract(kk)
+                if ks == 0:
+                    main_found = True
+
+        while len(lines) < maxlines:                 # generic lone-tone hunt
+            sq = cp.abs(X[sl])
+            m2 = float(cp.median(sq))
+            if m2 <= 0:
+                break
+            k = int(cp.argmax(sq))
+            ratio = float(sq[k]) / m2
+            fpeak = (k + sl.start) * self.fpb
+            near = any(abs(fpeak - f) < 30e3 for f in lines)
+            if not (ratio > 40 or (near and ratio > 5)):
+                break
+            subtract(k + sl.start)
+        return X
