@@ -350,6 +350,14 @@ class StreamingDecodeSource(FrameSource):
 
 def _stream_worker(q, path, kw):
     """Decode one capture, pushing frames to the parent."""
+    # A decode is hours of CPU; if the stacker dies without getting to
+    # close(), these must not be left running.  PDEATHSIG makes the kernel
+    # signal us when the parent goes, whatever killed it.
+    try:
+        import ctypes, signal
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except Exception:
+        pass
     src = None
     try:
         src = StreamingDecodeSource(path, **kw)
@@ -387,8 +395,10 @@ class ProcessStreamSource(FrameSource):
         self._efm = (None, None)
         ctx = mp.get_context("spawn")
         self._q = ctx.Queue(maxsize=queue_depth)
-        self._p = ctx.Process(target=_stream_worker, args=(self._q, path, kw),
-                              daemon=True)
+        # NOT daemonic: the decode inside the worker spawns its own field
+        # workers, and multiprocessing forbids a daemonic process children.
+        # close() terminates it, and stack()'s finally clause calls close().
+        self._p = ctx.Process(target=_stream_worker, args=(self._q, path, kw))
         self._p.start()
 
     def frames(self):
