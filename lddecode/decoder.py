@@ -1521,7 +1521,8 @@ class LDdecode:
             return None
         if flat < 0.0 and not self._imtf_cut_engaged(flat):
             return 0.0
-        return float(max(-self.imtf_strength_limit, flat))
+        return float(max(-getattr(self, "imtf_strength_limit",
+                                 self.IMTF_STRENGTH_LIMIT), flat))
 
     def _imtf_cut_engaged(self, flat):
         """Whether a negative flat-band strength is big enough to act on.
@@ -1740,7 +1741,8 @@ class LDdecode:
             return False
         if (self._imtf_flat_band is not None
                 and abs(flat_band - self._imtf_flat_band)
-                < self.imtf_ceiling_deadband):
+                < getattr(self, "imtf_ceiling_deadband",
+                          self.IMTF_CEILING_DEADBAND)):
             return False
         # Rate limit, mirroring the EQ's: warmup is exempt because it
         # needs to converge before the first frame is written, and after
@@ -1992,7 +1994,9 @@ class LDdecode:
             # plain 0.0 floor would walk a negative strength back up to
             # zero on the next MTF adoption and undo the verdict.
             s = np.clip(current + self.mtf_deemp_feedforward * delta,
-                        min(0.0, current), self.imtf_strength_limit)
+                        min(0.0, current),
+                        getattr(self, "imtf_strength_limit",
+                                self.IMTF_STRENGTH_LIMIT))
             self.rf.DecoderParams["inverse_mtf_strength"] = float(s)
             self.rf.recompute_fvideo()
             if self._job_engine is not None:
@@ -2084,7 +2088,7 @@ class LDdecode:
         # below.
         estimate = float(np.clip(
             current + np.log(expected / measured) / log_base,
-            0.0, self.imtf_strength_limit
+            0.0, getattr(self, "imtf_strength_limit", self.IMTF_STRENGTH_LIMIT)
         ))
 
         # Burst amplitude cannot tell a channel that lost the subcarrier
@@ -2100,10 +2104,11 @@ class LDdecode:
             # A first calibration adopts any non-trivial strength, in
             # either direction: a multiburst ceiling can make that first
             # verdict a cut.
-            if abs(estimate) < self.imtf_adopt_floor:
+            if abs(estimate) < getattr(self, "imtf_adopt_floor", 0.02):
                 return False
         elif (len(self._deemp_burst_samples) < 3
-                or np.abs(estimate - current) < self.imtf_track_deadband):
+                or np.abs(estimate - current) < getattr(
+                    self, "imtf_track_deadband", 0.05)):
             return False
 
         capped = "" if ceiling is None or estimate < ceiling else (
