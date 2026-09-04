@@ -1553,47 +1553,66 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         def result(self):
             return self._v
 
-    if jobs and jobs > 1 and all_tbc:
-        # frames are independent -> fan the per-frame computation out over a
-        # fork pool (sources/P inherited copy-on-write, .tbc via memmap); the
-        # parent writes results in key order.
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor
-        global _WORKER_STATE
-        # UNION of pictures, not intersection: a CAV picture readable on any
-        # capture is stacked from whichever captures carry it. Intersection
-        # silently dropped pictures missing from even one capture, compressing
-        # the output timeline (~50 frames / 2s over a Domesday AIV side) and
-        # putting burnt-in timecodes out of step.
+    if all_tbc:
+        # UNION of pictures, not intersection, and not lockstep's emission
+        # either: a picture readable on any capture is stacked from whichever
+        # captures carry it.  Intersection silently dropped pictures missing
+        # from even one capture, compressing the output timeline (~50 frames /
+        # 2s over a Domesday AIV side) and putting burnt-in timecodes out of
+        # step; lockstep drops any key sitting behind another capture's
+        # position, which on BGB_S1 lost the first 49 pictures outright.  An
+        # indexed source can be asked for any key, so ask for all of them.
         keysets = [s.keys() for s in sources]
         shared = sorted(set.union(*keysets))
-        n_all = len(set.intersection(*keysets))
         if max_frames:
             shared = shared[:max_frames]
-        log(f"[stack] parallel: {jobs} workers over {len(shared)} frames "
-            f"({len(shared) - n_all} present on only some captures)")
-        _WORKER_STATE = (sources, P)
-        try:
-            with ProcessPoolExecutor(
-                    max_workers=jobs,
-                    mp_context=mp.get_context("fork")) as ex:
-                _run(iter(shared),
-                     lambda key, h: ex.submit(_frame_by_key, (key, h)),
-                     HINT_LAG)
-        finally:
-            _WORKER_STATE = None
+        # counted over the frames actually being stacked, so --max-frames does
+        # not make it negative
+        everywhere = set.intersection(*keysets)
+        n_partial = sum(1 for k in shared if k not in everywhere)
+
+        def _fd_for(key):
+            return {s.name: s.get(key) for s in sources if key in s.keys()}
+
+        if jobs and jobs > 1:
+            # frames are independent -> fan the per-frame computation out over
+            # a fork pool (sources/P inherited copy-on-write, .tbc via memmap);
+            # the parent writes results in key order
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            global _WORKER_STATE
+            log(f"[stack] parallel: {jobs} workers over {len(shared)} frames "
+                f"({n_partial} present on only some captures)")
+            _WORKER_STATE = (sources, P)
+            try:
+                with ProcessPoolExecutor(
+                        max_workers=jobs,
+                        mp_context=mp.get_context("fork")) as ex:
+                    _run(iter(shared),
+                         lambda key, h: ex.submit(_frame_by_key, (key, h)),
+                         HINT_LAG)
+            finally:
+                _WORKER_STATE = None
+        else:
+            log(f"[stack] sequential over {len(shared)} frames "
+                f"({n_partial} present on only some captures)")
+            _run(iter(shared),
+                 lambda key, h: _Now(_compute_frame(_fd_for(key), P, h)),
+                 HINT_LAG)
     else:
+        # Streaming sources cannot be asked for a key twice, so the frames
+        # arrive in lockstep order and are stacked as they come.
         def _fds():
             for _key, fd in itertools.chain(head_buf, merged):
                 yield fd
 
         if jobs and jobs > 1:
-            # Streaming sources: the frames live in this process, so they are
-            # shipped to the workers rather than re-read.  Worth the pickling -
-            # measured on three captures the per-frame combine is 1.60s
-            # sequential against 0.44s at --jobs 22, and concurrent decodes
-            # feed lockstep faster than 0.62 fps, so a sequential combine would
-            # make the stack the bottleneck and waste the I/O streaming saves.
+            # the frames live in this process, so they are shipped to the
+            # workers rather than re-read.  Worth the pickling -- measured on
+            # three captures the per-frame combine is 1.60s sequential against
+            # 0.44s at --jobs 22, and concurrent decodes feed lockstep faster
+            # than 0.62 fps, so a sequential combine would make the stack the
+            # bottleneck and waste the I/O that streaming saves.
             import multiprocessing as mp
             from concurrent.futures import ProcessPoolExecutor
             log(f"[stack] parallel: {jobs} workers, streaming frames "
