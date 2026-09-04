@@ -43,13 +43,11 @@ from .dsp import concatenate_blocks
 # Worker-process state: one RFDecode per process, built by the pool
 # initializer to reproduce the parent's post-calibration filter state.
 _worker_rf = None
-_worker_filter_shm = None
 _worker_cfg = None
 
 
-def _demod_worker_init(rf_opts, decoder_params, field_cfg=None,
-                       filter_desc=None):
-    global _worker_rf, _worker_cfg, _worker_filter_shm
+def _demod_worker_init(rf_opts, decoder_params, field_cfg=None):
+    global _worker_rf, _worker_cfg
     import logging
     import os
     import time as _time
@@ -90,15 +88,6 @@ def _demod_worker_init(rf_opts, decoder_params, field_cfg=None,
     # calibrated during warm-up.
     _worker_rf.DecoderParams = copy.deepcopy(decoder_params)
     _worker_rf.computefilters()
-    # Drop this worker's private copies of the static filters in favour of
-    # read-only views on the parent's shared block (see filtershare.py).
-    if filter_desc is not None:
-        try:
-            from . import filtershare
-            _worker_filter_shm = filtershare.attach(_worker_rf.Filters,
-                                                    filter_desc)
-        except Exception:
-            _worker_filter_shm = None
     _worker_cfg = field_cfg
 
 
@@ -598,31 +587,11 @@ class DemodBlockCache:
             if k not in ("pipe_RF_TBC",)
         }
 
-        # The pool is a spawn pool, so each worker builds its own copy of the
-        # filter set - identical in every worker, but N copies through a shared
-        # L3.  Build the canonical set here (same rf_opts/DecoderParams the
-        # workers adopt) and publish the static 8.0 MB once; workers attach
-        # read-only views over the same physical pages.  Values are unchanged,
-        # so output stays bit-identical.  See filtershare.py.
-        self._filter_shm, filter_desc = None, None
-        try:
-            from .rfdecode import RFDecode
-            from . import filtershare
-            _canon = RFDecode(**rf_opts)
-            _canon.DecoderParams = copy.deepcopy(decoder_params)
-            _canon.computefilters()
-            self._filter_shm, filter_desc = filtershare.publish(_canon.Filters)
-            del _canon
-        except Exception:
-            # Sharing is an optimisation; a failure here must not stop a decode
-            self._filter_shm, filter_desc = None, None
-
         self._procs = ProcessPoolExecutor(
             max_workers=nprocs or self._nthreads,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_demod_worker_init,
-            initargs=(rf_opts, copy.deepcopy(decoder_params), field_cfg,
-                      filter_desc),
+            initargs=(rf_opts, copy.deepcopy(decoder_params), field_cfg),
         )
         procs = self._procs
         inflight = self._proc_inflight
@@ -647,23 +616,8 @@ class DemodBlockCache:
         if self._procs is not None:
             self._procs.shutdown(wait=False, cancel_futures=True)
             self._procs = None
-        # The servo respawns on every adoption; release the old shared filter
-        # block or each respawn leaks one (unlink only removes the name -
-        # workers still mapped keep their pages until they exit).
-        self._release_filter_shm()
         self.enable_processes(rf_opts, decoder_params, nprocs=nprocs,
                               field_cfg=field_cfg)
-
-    def _release_filter_shm(self):
-        shm = getattr(self, "_filter_shm", None)
-        if shm is None:
-            return
-        self._filter_shm = None
-        try:
-            shm.close()
-            shm.unlink()
-        except (FileNotFoundError, BufferError, OSError):
-            pass
 
     @property
     def process_executor(self):
@@ -708,7 +662,6 @@ class DemodBlockCache:
 
     def close(self):
         self.flush()
-        self._release_filter_shm()
         self._pool.shutdown(wait=False, cancel_futures=True)
         if self._procs is not None:
             procs = self._procs
