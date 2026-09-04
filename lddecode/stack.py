@@ -1031,9 +1031,21 @@ class StackWriter:
 # --------------------------------------------------------------------------- #
 def lockstep(sources):
     """Merge several frame iterators (each yielding Frames in increasing key
-    order) into a stream of (key, {name: Frame}) for keys present in ALL
-    sources.  Buffer is bounded by the inter-capture alignment skew, so full
-    discs stream without holding everything in RAM."""
+    order) into a stream of (key, {name: Frame}).
+
+    Emits the UNION of the captures' pictures, not the intersection: a picture
+    is emitted once every source has either buffered it or moved past it, with
+    whatever subset carries it.  Waiting for the point where ALL sources have
+    arrived (the largest of their smallest buffered keys) silently discarded
+    everything a capture carried below where the latest-starting one began -
+    and captures do start at very different pictures, so on a set starting at
+    1 and 50 the first 49 pictures were lost outright.  That is the same
+    frame loss the indexed path had, and there is no index here to fall back
+    on, so it has to be fixed in the merge itself.
+
+    Buffer is bounded by the inter-capture skew: a source that starts early
+    has its frames emitted as the frontier reaches them rather than held.
+    """
     its = {s.name: iter(s.frames()) for s in sources}
     buf = {n: {} for n in its}
     head = {n: -1 for n in its}
@@ -1054,15 +1066,16 @@ def lockstep(sources):
     while True:
         if all(done[n] and not buf[n] for n in its):
             return
-        # frontier = the largest of each source's smallest buffered key, so all
-        # could plausibly carry it
         mins = [min(buf[n]) for n in its if buf[n]]
         if len(mins) < sum(not done[n] or bool(buf[n]) for n in its):
             for n in its:
                 if not done[n] and not buf[n]:
                     adv(n)
             continue
-        frontier = max(mins)
+        # frontier = the smallest key any source is holding.  Every source
+        # still behind it is advanced until it has either produced that key or
+        # passed it; a source whose head is already beyond it never had it.
+        frontier = min(mins)
         for n in its:
             while not done[n] and head[n] < frontier:
                 adv(n)

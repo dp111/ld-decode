@@ -110,3 +110,48 @@ def test_dominant_run_prefers_the_longer_side_of_a_break():
     from lddecode.streamsource import dominant_run
     got = dominant_run(_pairs([10, 11, 12, 700, 701, 702, 703, 704, 705]))
     assert [k for _, k in got] == [700, 701, 702, 703, 704, 705]
+
+
+# --------------------------------------------------------------------------- #
+#  Merging captures
+# --------------------------------------------------------------------------- #
+class _Keys:
+    """A FrameSource that yields nothing but keys."""
+
+    def __init__(self, name, keys):
+        self.name = name
+        self._keys = keys
+
+    def frames(self):
+        for k in self._keys:
+            yield type("F", (), {"key": k})()
+
+
+@pytest.mark.parametrize("a,b", [
+    (range(50, 120), range(1, 120)),     # captures starting at different pictures
+    (range(1, 60), range(1, 60)),        # identical
+    ([1, 2, 5, 6, 7], [1, 2, 3, 4, 5, 6, 7]),   # one capture missing pictures
+    (range(1, 40), range(30, 70)),       # barely overlapping
+    ([], range(1, 10)),                  # one capture contributes nothing
+])
+def test_lockstep_emits_the_union(a, b):
+    """A picture readable on ANY capture must reach the stacker.
+
+    Merging up to the point where every source has arrived discards whatever
+    a capture carried below the latest-starting one's first picture - on
+    captures starting at 1 and 50, the first 49 pictures vanished.  Streaming
+    sources have no index to recover them from, so the merge itself has to be
+    right.
+    """
+    from lddecode.stack import lockstep
+    a, b = list(a), list(b)
+    got = [k for k, _ in lockstep([_Keys("A", a), _Keys("B", b)])]
+    assert got == sorted(set(a) | set(b))
+
+
+def test_lockstep_reports_which_captures_carry_each_picture():
+    from lddecode.stack import lockstep
+    out = dict(lockstep([_Keys("A", [1, 2]), _Keys("B", [2, 3])]))
+    assert sorted(out) == [1, 2, 3]
+    assert sorted(out[1]) == ["A"] and sorted(out[2]) == ["A", "B"] \
+        and sorted(out[3]) == ["B"]
