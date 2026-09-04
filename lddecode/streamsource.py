@@ -430,6 +430,16 @@ class ProcessStreamSource(FrameSource):
         if p is not None and p.is_alive():
             p.terminate()
             p.join(timeout=10)
+        # A Queue holds POSIX semaphores; a side has one of these per capture
+        # and a redo has many sides, so they have to go back explicitly or the
+        # run ends in a pile of leaked-semaphore warnings.
+        q = getattr(self, "_q", None)
+        if q is not None:
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
         d = getattr(self, "_worker_scratch", None)
         if d:
             import shutil
