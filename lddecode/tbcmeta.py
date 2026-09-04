@@ -17,9 +17,17 @@ CAPTURE_QUERY = (
 
 
 def video_parameters(row):
-    """Build the videoParameters dict from a CAPTURE_QUERY row."""
+    """Build the videoParameters dict from a CAPTURE_QUERY row.
+
+    A stacked output's capture row leaves the colour-burst columns NULL (the
+    stacker writes its own row and has no burst window of its own to record),
+    so those fall back to 0 rather than raising - reading a stacked .tbc.db
+    has to work.
+    """
     (system, git_branch, git_commit, srate, avs, ave, fw, fh, nfields,
      cbs, cbe, w16, b16, ismap, issub, iswide) = row
+    cbs = 0 if cbs is None else cbs
+    cbe = 0 if cbe is None else cbe
     return {
         "system": system,
         "isSourcePal": system != "NTSC",
