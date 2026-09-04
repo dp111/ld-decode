@@ -131,8 +131,7 @@ class GPUDemod:
         # V4300D coherent subtract, per block, entirely on the GPU: the
         # spectrum never goes back across the bus for it
         if self.v4_on:
-            rows = [self._v4300d(full[i]) for i in range(B)]
-            full = cp.stack(rows) if any(r is not full[i] for i, r in enumerate(rows)) else full
+            full = self._v4300d_batch(full)
 
         filt = full * self.d_rfvideo
         if use_fcutpal and self.d_fcutpal is not None:
@@ -269,3 +268,78 @@ class GPUDemod:
                 break
             subtract(k + sl.start)
         return X
+
+    def _v4300d_batch(self, Xb):
+        """V4300D over a whole batch.
+
+        The carrier guard and the anchored line detection are deterministic,
+        so they are evaluated for every block in one pass each instead of one
+        kernel launch per block per test.  Only the subtraction - which is
+        data-dependent, and which most blocks do not need at all - stays per
+        block.  Identical decisions to _v4300d(), just taken in bulk.
+        """
+        rf, B = self.rf, Xb.shape[0]
+        sl, t, nb, fh = self.v4_sl, self.v4_tol, self.v4_nbtol, self.v4_fh
+
+        amp = cp.abs(Xb[:, sl])                       # (B, W)
+        med = cp.median(amp, axis=1)                  # (B,)
+        carrier = cp.abs(Xb[:, self.v4_carrier]).max(axis=1)
+        active = (med > 0) & (carrier > rf.V4300D_MIN_CARRIER * med)
+
+        # anchored lines: peak, its bin, and the line-rate comb neighbours,
+        # for every block at once
+        hits = {}
+        main_ok = None
+        for ks in (0,) + tuple(rf.V4300D_SATELLITE_KS):
+            k0 = int(round((rf.V4300D_CLOCK_HZ + ks * rf.V4300D_SATELLITE_HZ)
+                           / self.fpb))
+            seg = cp.abs(Xb[:, k0 - t:k0 + t + 1])    # (B, 2t+1)
+            j = cp.argmax(seg, axis=1)
+            kk = k0 - t + j
+            peak = cp.take_along_axis(seg, j[:, None], axis=1)[:, 0]
+            # gather the +-fh_bins neighbourhoods around each block's own kk
+            off = cp.arange(-nb, nb + 1)
+            lo = cp.abs(cp.take_along_axis(
+                Xb, (kk[:, None] - fh + off[None, :]), axis=1)).max(axis=1)
+            hi = cp.abs(cp.take_along_axis(
+                Xb, (kk[:, None] + fh + off[None, :]), axis=1)).max(axis=1)
+            comb = cp.maximum(lo, hi)
+            mm, mc = ((rf.V4300D_MAIN_MIN_MED, rf.V4300D_MAIN_MIN_COMB) if ks == 0
+                      else (rf.V4300D_SAT_MIN_MED, rf.V4300D_SAT_MIN_COMB))
+            ok = active & (peak > mm * med) & (peak > mc * comb)
+            if ks == 0:
+                main_ok = ok
+            else:
+                ok = ok & main_ok            # satellites only after the main line
+            hits[ks] = (cp.asnumpy(ok), cp.asnumpy(kk))
+
+        out, changed = [], False
+        act = cp.asnumpy(active)
+        for i in range(B):
+            X = Xb[i]
+            if not act[i]:
+                out.append(X)
+                continue
+            lines = []
+            for ks in (0,) + tuple(rf.V4300D_SATELLITE_KS):
+                ok, kk = hits[ks]
+                if ok[i]:
+                    if X is Xb[i]:
+                        X = Xb[i].copy(); changed = True
+                    lines.append(self._refine_subtract(X, int(kk[i])))
+            # generic lone-tone hunt: sequential by nature, per block
+            while len(lines) < 10:
+                sq = cp.abs(X[sl])
+                m2 = float(cp.median(sq))
+                if m2 <= 0:
+                    break
+                k = int(cp.argmax(sq))
+                if float(sq[k]) / m2 <= 40 and not (
+                        any(abs((k + sl.start) * self.fpb - f) < 30e3 for f in lines)
+                        and float(sq[k]) / m2 > 5):
+                    break
+                if X is Xb[i]:
+                    X = Xb[i].copy(); changed = True
+                lines.append(self._refine_subtract(X, k + sl.start))
+            out.append(X)
+        return cp.stack(out) if changed else Xb
