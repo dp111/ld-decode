@@ -1169,13 +1169,18 @@ def average_efm(waves, weights):
     return (acc / max(ws, 1e-9)) if ws else acc
 
 
-def _compute_frame(fd, P):
-    """Stack one aligned frame dict {name: Frame} -> a writable result dict
-    (pure per-frame computation; no shared state, so it can run in a worker).
-    Returns None when no primary capture carries this frame."""
+def _compute_frame(fd, P, hints=None):
+    """Stack one aligned frame dict {name: Frame} -> a writable result dict.
+
+    Pure: `hints` (per (capture, field) registration start points) comes in
+    and the shifts actually measured go back out in the result, so nothing is
+    carried in module state and a worker's result does not depend on what it
+    happened to process before.  Returns None when no primary capture carries
+    this frame."""
     primary, fill_sources = P["primary"], P["fill_sources"]
     ra, ca, fh, fw = P["ra"], P["ca"], P["fh"], P["fw"]
     weights, sig = P["weights"], P["sig"]
+    out_shifts = {}
     present_primary = [n for n in primary if n in fd]
     present_fill = [n for n in fill_sources if n in fd] if P["cross_fill"] else []
     if not present_primary:
@@ -1253,8 +1258,8 @@ def _compute_frame(fd, P):
                     reg, shift = register_field(
                         getattr(fr, which).astype(np.float64), ref_field,
                         ra, ca, P["subpixel"], line_reg=P["line_reg"],
-                        hint=_SHIFT_HINT.get(hk) if WARM else None)
-                    _SHIFT_HINT[hk] = shift
+                        hint=(hints or {}).get(hk) if WARM else None)
+                    out_shifts[hk] = shift
                     if P["chroma_align"]:
                         reg = chroma_align_field(reg, ref_field, ca)
                 regs.append(reg)
@@ -1339,28 +1344,46 @@ def _compute_frame(fd, P):
             awts.append(weights[n])
         if aligned:
             audio_out = combine_audio(aligned, awts)
-    return {"fields": out_fields, "audio": audio_out, "filled": filled}
+    return {"fields": out_fields, "audio": audio_out, "filled": filled,
+            "shifts": out_shifts}
 
 
 _WORKER_STATE = None            # (sources, P) inherited by forked pool workers
-_SHIFT_HINT = {}                # (capture, field) -> last registration shift
+
+# How many frames back a registration hint comes from.
+#
+# register_field warm-starts its sub-pixel search from this capture's shift on
+# a nearby frame, which is worth ~9 field FFTs.  Taking it from the frame
+# immediately before makes the combine order-dependent - what a worker
+# processed previously changes where its search starts - so a stack came out
+# differently at different --jobs, which is no way to run a preservation
+# pipeline.  Taking it from a FIXED number of frames back instead makes the
+# hint a function of the frame's position alone, so every path and every
+# worker count agree, and it also sets how many frames may be in flight.
+#
+# Inter-capture offsets drift slowly, so a hint this stale is still inside the
+# warm window; when it is not, register_field's border test notices and falls
+# back to a cold search, which costs speed and never accuracy.
+HINT_LAG = int(os.environ.get("LDSTACK_HINT_LAG", "32"))
 
 
-def _frame_by_key(key):
+def _frame_by_key(args):
+    key, hints = args
     sources, P = _WORKER_STATE
     fd = {s.name: s.get(key) for s in sources if key in s.keys()}
-    return _compute_frame(fd, P)
+    return _compute_frame(fd, P, hints)
 
 
-def _frame_from_fd(fd):
+def _frame_from_fd(args):
     """Stack one frame the parent has already gathered.
 
     The indexed path lets each worker fetch its own frame by key, but a
     streaming source holds its frames in the parent's memory and cannot be
     asked twice, so here the frame travels to the worker instead.
     """
+    fd, hints = args
     _, P = _WORKER_STATE
-    return _compute_frame(fd, P)
+    return _compute_frame(fd, P, hints)
 
 
 def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
@@ -1490,23 +1513,52 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             log(f"  ... {nwritten} frames")
 
     all_tbc = all(isinstance(s, TBCFrameSource) for s in sources)
+
+    def _run(work, submit, depth):
+        """Drive the combine, retiring results in order at a fixed lag.
+
+        One shape for all three paths.  `work` yields the per-frame argument,
+        `submit(arg, hints)` returns something with .result(), and results are
+        retired `depth` frames behind submission - so the hint handed to frame
+        i is always the shift measured on frame i-depth, whatever is doing the
+        computing.  That is what makes the output independent of --jobs.
+        """
+        import collections
+        inflight = collections.deque()
+        hints = {}
+        nsub = 0
+        for arg in work:
+            # bounded on submissions, not on frames written: results trail
+            # submission by `depth`, so counting writes would overshoot
+            if max_frames and nsub >= max_frames:
+                break
+            nsub += 1
+            inflight.append(submit(arg, hints))
+            if len(inflight) >= depth:
+                r = inflight.popleft().result()
+                hints = r["shifts"] if r else hints
+                emit(r)
+        while inflight:
+            r = inflight.popleft().result()
+            hints = r["shifts"] if r else hints
+            emit(r)
+
+    class _Now:
+        """A completed 'future' for the sequential path."""
+        __slots__ = ("_v",)
+
+        def __init__(self, v):
+            self._v = v
+
+        def result(self):
+            return self._v
+
     if jobs and jobs > 1 and all_tbc:
         # frames are independent -> fan the per-frame computation out over a
         # fork pool (sources/P inherited copy-on-write, .tbc via memmap); the
         # parent writes results in key order.
-        #
-        # NOT byte-identical to the sequential path, despite what this said
-        # before: register_field warm-starts from the previous frame's shift
-        # through the module-global _SHIFT_HINT (5af8e09b), so each worker
-        # carries its own hint history and the sub-pixel search settles on a
-        # slightly different estimate.  Measured over 40 frames of BGB_S1,
-        # --jobs 8 against sequential: 78 of 80 fields differ, 15% of samples,
-        # mean 0.19 LSB.  Both registrations are valid - the warm window is
-        # a 3x3 grid at span 0.25 against the cold 5x5 at 0.5, and a hint that
-        # goes stale is caught by the border test - so this is approximation
-        # noise below a quarter pixel, not a quality regression.  It does mean
-        # a stack is reproducible only at a fixed worker count.
         import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
         global _WORKER_STATE
         # UNION of pictures, not intersection: a CAV picture readable on any
         # capture is stacked from whichever captures carry it. Intersection
@@ -1522,56 +1574,43 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             f"({len(shared) - n_all} present on only some captures)")
         _WORKER_STATE = (sources, P)
         try:
-            with mp.get_context("fork").Pool(jobs) as pool:
-                for r in pool.imap(_frame_by_key, shared, chunksize=CHUNK):
-                    emit(r)
-        finally:
-            _WORKER_STATE = None
-    elif jobs and jobs > 1:
-        # Streaming sources: the frames are in this process, so they are
-        # shipped to the workers rather than re-read.  Worth the pickling -
-        # measured on three captures, the per-frame combine is 1.60s
-        # sequential against 0.44s at --jobs 22, and concurrent decodes feed
-        # lockstep faster than 0.62 fps, so a sequential combine would make
-        # the stack the bottleneck and waste the I/O that streaming saves.
-        #
-        # Submission is bounded (imap would drain the whole disc into RAM),
-        # and futures are retired in submission order, so the output is the
-        # same as the sequential path's.
-        import collections
-        from concurrent.futures import ProcessPoolExecutor
-        import multiprocessing as mp
-
-        def _fds():
-            n = 0
-            for _key, fd in itertools.chain(head_buf, merged):
-                if max_frames and n >= max_frames:
-                    return
-                n += 1
-                yield fd
-
-        depth = max(2 * jobs, 8)
-        log(f"[stack] parallel: {jobs} workers, streaming frames "
-            f"({depth} in flight)")
-        _WORKER_STATE = (None, P)
-        try:
             with ProcessPoolExecutor(
                     max_workers=jobs,
                     mp_context=mp.get_context("fork")) as ex:
-                futs = collections.deque()
-                for fd in _fds():
-                    futs.append(ex.submit(_frame_from_fd, fd))
-                    if len(futs) >= depth:
-                        emit(futs.popleft().result())
-                while futs:
-                    emit(futs.popleft().result())
+                _run(iter(shared),
+                     lambda key, h: ex.submit(_frame_by_key, (key, h)),
+                     HINT_LAG)
         finally:
             _WORKER_STATE = None
     else:
-        for key, fd in itertools.chain(head_buf, merged):
-            if max_frames and nwritten >= max_frames:
-                break
-            emit(_compute_frame(fd, P))
+        def _fds():
+            for _key, fd in itertools.chain(head_buf, merged):
+                yield fd
+
+        if jobs and jobs > 1:
+            # Streaming sources: the frames live in this process, so they are
+            # shipped to the workers rather than re-read.  Worth the pickling -
+            # measured on three captures the per-frame combine is 1.60s
+            # sequential against 0.44s at --jobs 22, and concurrent decodes
+            # feed lockstep faster than 0.62 fps, so a sequential combine would
+            # make the stack the bottleneck and waste the I/O streaming saves.
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            log(f"[stack] parallel: {jobs} workers, streaming frames "
+                f"({HINT_LAG} in flight)")
+            _WORKER_STATE = (None, P)
+            try:
+                with ProcessPoolExecutor(
+                        max_workers=jobs,
+                        mp_context=mp.get_context("fork")) as ex:
+                    _run(_fds(),
+                         lambda fd, h: ex.submit(_frame_from_fd, (fd, h)),
+                         HINT_LAG)
+            finally:
+                _WORKER_STATE = None
+        else:
+            _run(_fds(), lambda fd, h: _Now(_compute_frame(fd, P, h)),
+                 HINT_LAG)
 
     efm_bytes = None
     efm_merged = False
