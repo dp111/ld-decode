@@ -197,6 +197,17 @@ FilterParams_PAL = {
     # so 14 MHz only admitted extra noise (13 vs 14: +0.1 dB wSNR on GGV, +0.4/
     # +1.7 dB wSNR/bPSNR on an EFM disc, multiburst/chroma unchanged).  Restore
     # the old edge with --video_bpf_high 14 on unusually wide-band chains.
+    #
+    # Re-checked after video_lpf_freq moved 5.8 -> 6.3 MHz, which widens the FM
+    # sideband (Carson, +/-0.571 MHz deviation about 7.329 MHz: upper edge
+    # 13.70 -> 14.20 MHz) and so might have been expected to want the wider
+    # edge back.  It does not - on DS8 CommunityNorth, 120 frames, VITS
+    # conformance: 13 MHz fails 2 of 40 checks, 14 MHz fails 3.  Going wider
+    # costs chroma (gain ratio 0.284 -> 0.273, out of band; 100% chroma bar
+    # 45.9 -> 44.3 IRE) and buys almost nothing back in luminance (the 4.8 MHz
+    # multiburst packet, the one check the extra bandwidth should help, moves
+    # 14.8 -> 15.6 IRE against a nominal 30).  That packet's deficit is a
+    # static-chain response limit, not an RF bandwidth one.
     "video_bpf_low": 2300000,
     "video_bpf_low_order": 3,
     "video_bpf_high": 13000000,

@@ -190,7 +190,6 @@ class TBCFrameSource(FrameSource):
             self._spf = len(self.pcm) // nframes
         prev = None
         raw = []
-        keep = []
         for fi in range(nframes):
             j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
             vbi = field_vbi(j0) + field_vbi(j1)
@@ -209,49 +208,7 @@ class TBCFrameSource(FrameSource):
                 prev = key
             if key is not None:
                 raw.append((fi, key))
-        # An isolated corrupt VBI read (weak inner-radius RF flipping a
-        # picture-number digit) can claim a far-away key and, via
-        # first-occurrence, SHADOW the real frame (EcoDisc S2: an early frame
-        # misreading as picture 2156 displaced the true one on all four
-        # captures). Reject keys that deviate wildly from the local trend of
-        # their neighbours before assigning slots.
-        for idx, (fi, key) in enumerate(raw):
-            lo, hi = max(0, idx - 2), min(len(raw), idx + 3)
-            neigh = [k for j, (_, k) in enumerate(raw[lo:hi], lo) if j != idx]
-            if neigh:
-                med = sorted(neigh)[len(neigh) // 2]
-                if abs(key - med) > 50:
-                    continue
-            keep.append((fi, key))
-        # A capture that starts mid-programme and then seeks back to the disc
-        # start sweeps the laser across tracks, and every frame it crosses
-        # carries a REAL picture number on garbage/black content (CommunitySouth
-        # ds1: ...389 390 390 390 340 290 240 190 90 30 1 1 2 3...). Those keys
-        # are not misreads, so no value test can spot them - but during genuine
-        # playback the picture number advances by one per frame. Accept a key
-        # only while it follows that progression, and require several
-        # consecutive consistent frames before trusting a new position (a real
-        # skip/seek in the middle of a capture).
-        expect = None
-        pending = []
-        for fi, key in keep:
-            if expect is None or abs(key - expect) <= SEQ_TOL:
-                expect = key + 1
-                pending = []
-            else:
-                pending.append((fi, key))
-                tail = pending[-SEQ_CONFIRM:]
-                if len(tail) >= SEQ_CONFIRM and all(
-                        b[1] - a[1] == 1 for a, b in zip(tail, tail[1:])):
-                    # a confirmed resync (the capture really is playing from a
-                    # new position): adopt the confirming run, discard the
-                    # transient frames that preceded it
-                    for pfi, pkey in tail:
-                        if pkey not in self._idx:
-                            self._idx[pkey] = pfi
-                    expect = key + 1
-                    pending = []
-                continue
+        for fi, key in sieve_keys(raw):
             if key not in self._idx:
                 self._idx[key] = fi
 
@@ -636,6 +593,75 @@ SEQ_TOL = int(os.environ.get("LDSTACK_SEQ_TOL", "2"))
 CHUNK = int(os.environ.get("LDSTACK_CHUNK", "48"))
 WARM = os.environ.get("LDSTACK_WARM", "1") not in ("0", "", "no")
 SEQ_CONFIRM = int(os.environ.get("LDSTACK_SEQ_CONFIRM", "4"))
+
+
+def sieve_keys(raw, seq_tol=None, seq_confirm=None, state=None,
+               nlo=0, nhi=0, return_state=False):
+    """Filter a capture's raw [(frame_index, key)] down to the frames whose
+    keys can be trusted, and yield them in order.
+
+    Shared by the indexed .tbc reader and the streaming decode source so both
+    agree on which frames a capture really contributes.
+
+    A stream sieves a window at a time, which needs two things beyond the
+    whole-list call.  ``nlo``/``nhi`` mark leading and trailing entries that
+    are present only to give the median test its neighbours: they are judged
+    but never emitted, and the next window emits them for real.  ``state``
+    carries the sequence pass's position across windows - both what key it
+    expects next and any part-built resync run - so a window boundary is not
+    mistaken for a seek.  Pass the returned state back in with
+    ``return_state=True``.
+    """
+    tol = SEQ_TOL if seq_tol is None else seq_tol
+    confirm = SEQ_CONFIRM if seq_confirm is None else seq_confirm
+    keep = []
+    out = []
+    expect0, pending0 = state if state else (None, [])
+    # An isolated corrupt VBI read (weak inner-radius RF flipping a
+    # picture-number digit) can claim a far-away key and, via
+    # first-occurrence, SHADOW the real frame (EcoDisc S2: an early frame
+    # misreading as picture 2156 displaced the true one on all four
+    # captures). Reject keys that deviate wildly from the local trend of
+    # their neighbours before assigning slots.
+    for idx in range(nlo, len(raw) - nhi):
+        fi, key = raw[idx]
+        lo, hi = max(0, idx - 2), min(len(raw), idx + 3)
+        neigh = [k for j, (_, k) in enumerate(raw[lo:hi], lo) if j != idx]
+        if neigh:
+            med = sorted(neigh)[len(neigh) // 2]
+            if abs(key - med) > 50:
+                continue
+        keep.append((fi, key))
+    # A capture that starts mid-programme and then seeks back to the disc
+    # start sweeps the laser across tracks, and every frame it crosses
+    # carries a REAL picture number on garbage/black content (CommunitySouth
+    # ds1: ...389 390 390 390 340 290 240 190 90 30 1 1 2 3...). Those keys
+    # are not misreads, so no value test can spot them - but during genuine
+    # playback the picture number advances by one per frame. Accept a key
+    # only while it follows that progression, and require several
+    # consecutive consistent frames before trusting a new position (a real
+    # skip/seek in the middle of a capture).
+    expect = expect0
+    pending = list(pending0)
+    for fi, key in keep:
+        if expect is None or abs(key - expect) <= tol:
+            expect = key + 1
+            pending = []
+        else:
+            pending.append((fi, key))
+            tail = pending[-confirm:]
+            if len(tail) >= confirm and all(
+                    b[1] - a[1] == 1 for a, b in zip(tail, tail[1:])):
+                # a confirmed resync (the capture really is playing from a
+                # new position): adopt the confirming run, discard the
+                # transient frames that preceded it
+                out.extend(tail)
+                expect = key + 1
+                pending = []
+            continue
+        out.append((fi, key))
+    return (out, (expect, pending)) if return_state else out
+
 # a capture's frame is dropped when its level is this many robust sigmas from
 # the consensus of the captures for that frame (catches seek/scan frames)
 FRAME_LEVEL_K = float(os.environ.get("LDSTACK_FRAME_LEVEL_K", "8.0"))
@@ -812,7 +838,8 @@ def combine_audio(aligned, weights, reject=6.0):
 # --------------------------------------------------------------------------- #
 #  Quality + master clustering
 # --------------------------------------------------------------------------- #
-def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0):
+def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0,
+            allow_noise_drop=True):
     """Estimate per-capture noise and cluster captures by master.
 
     frame_dicts: list of {name: Frame} for a sample of aligned frames.
@@ -875,7 +902,7 @@ def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0):
         elif info[n].get("master", -1) != 0:
             info[n]["keep"], info[n]["reason"] = \
                 False, "different master (dx=%+.2f)" % info[n]["dx"]
-        elif info[n]["noise"] > cutoff:
+        elif allow_noise_drop and info[n]["noise"] > cutoff:
             info[n]["keep"], info[n]["reason"] = False, "noise outlier"
         else:
             info[n]["keep"], info[n]["reason"] = True, "ok"
@@ -1366,10 +1393,26 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             pick = span[::max(1, len(span) // sample)][:sample]
             asample = [{s.name: s.get(k) for s in sources if k in s.keys()}
                        for k in pick]
+    indexed = asample is not None
     if not asample:
         step = max(1, len(head_buf) // sample)
         asample = [fd for _, fd in head_buf[::step][:sample]]
-    info = analyse(asample, ra, ca)
+    # Which of analyse()'s two decisions the sample can support.  Clustering by
+    # sub-pixel dx is content-independent - it measures where the master laid
+    # the active video down relative to sync - so the head window is as good as
+    # any.  The noise level is not: on an AIV disc the opening frames are often
+    # a near-identical still, inter-capture differences there collapse, and the
+    # 4x-median cutoff turns hair-trigger.  That is exactly how NationalA threw
+    # away two good captures (794 and 1385 against a 37-41 head baseline, where
+    # all six measure 1015-1286 sampled across the disc).  So a streaming
+    # source, which can only offer its opening, clusters but never drops: a
+    # capture that really is noisy is down-weighted by 1/noise^2 and by the
+    # per-frame registration confidence, which is the graceful version of the
+    # same judgement.
+    info = analyse(asample, ra, ca, allow_noise_drop=indexed)
+    if not indexed:
+        log("[stack] streaming sources: master clustering from the opening "
+            "window, noise used for weighting only (no noise-outlier drop)")
     if masters:
         # explicit master grouping (e.g. from the disc PP/NP/AK marks); group 0
         # is the primary, the rest are alt-master fill sources.  Tokens are
@@ -1544,12 +1587,18 @@ def _git_commit():
 
 
 def open_source(path, system, seek=None, length=None, extra_options=None,
-                cav=True, scratch_dir=None):
+                cav=True, scratch_dir=None, stream=False, threads=4):
     if path.endswith(".tbc"):
         return TBCFrameSource(path[:-4], cav=cav)
     if path.endswith(".tbc.json"):
         return TBCFrameSource(path[:-9], cav=cav)
     if path.endswith(".ldf") or path.endswith(".lds"):
+        if stream:
+            from .streamsource import ProcessStreamSource
+            return ProcessStreamSource(
+                path, system=system, seek=seek, length=length, cav=cav,
+                extra_options=extra_options, scratch_dir=scratch_dir,
+                threads=threads)
         return LDFFrameSource(path, system=system, seek=seek, length=length,
                               cav=cav, extra_options=extra_options,
                               scratch_dir=scratch_dir)
@@ -1623,6 +1672,21 @@ def main(argv=None):
                    "subtraction (recommended for Domesday/EFM PAL captures)")
     p.add_argument("--rf_echo", type=str, default=None,
                    help="(.ldf) RF echo cancellation, e.g. 26:0.035,38:0.018")
+    p.add_argument("--stream", action="store_true",
+                   help="(.ldf) decode every capture concurrently, one process "
+                   "each, and stack the frames as they are produced instead of "
+                   "decoding each to its own .tbc first.  One file is written "
+                   "instead of N+1, and the stacking overlaps the decoding.  "
+                   "Note the analysis sample is then the opening window only, "
+                   "so captures are clustered by master but never dropped as "
+                   "noise outliers (they are weighted instead).")
+    p.add_argument("--decode-threads", type=int, default=4,
+                   help="(--stream) decoder threads per capture (default 4)")
+    p.add_argument("--read-buffer-mb", type=int, default=None,
+                   help="(--stream) per-capture .ldf read-ahead buffer in MB.  "
+                   "With several captures decoding at once the drive is "
+                   "servicing that many interleaved read streams; a large "
+                   "buffer turns each into long sequential bursts (e.g. 2048).")
     p.add_argument("--jobs", type=int, default=0,
                    help="parallelise the per-frame stacking over this many "
                    "worker processes (all-.tbc inputs only; output is "
@@ -1634,6 +1698,9 @@ def main(argv=None):
                    "written.  Falls back to the input directory.")
     args = p.parse_args(argv)
     system = args.system or "PAL"
+    if args.read_buffer_mb:
+        # read by the file reader in each decode process (spawn inherits env)
+        os.environ["LDDECODE_READ_BUFFER_MB"] = str(int(args.read_buffer_mb))
 
     decode_opts = {}
     if system == "PAL" and args.V4300D_coherent_subtract:
@@ -1654,7 +1721,8 @@ def main(argv=None):
                 sources.append(open_source(
                     path, system, seek=args.seek, length=args.length,
                     extra_options=decode_opts, cav=not args.clv,
-                    scratch_dir=args.scratch_dir))
+                    scratch_dir=args.scratch_dir, stream=args.stream,
+                    threads=args.decode_threads))
             except SystemExit as e:
                 print("WARNING: skipping capture (decode failed): %s (%s)"
                       % (path, e), file=sys.stderr)

@@ -7,41 +7,18 @@ Usage: db2json.py <base.tbc.db> [...]   ->  writes <base>.tbc.json next to it.
 """
 import json, sqlite3, sys, os
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lddecode.tbcmeta import CAPTURE_QUERY, video_parameters
+
 
 def convert(db_path):
     out_path = db_path[:-3] + ".json" if db_path.endswith(".tbc.db") \
         else db_path + ".tbc.json"
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    cap = db.execute(
-        "SELECT system, git_branch, git_commit, video_sample_rate,"
-        " active_video_start, active_video_end, field_width, field_height,"
-        " number_of_sequential_fields, colour_burst_start, colour_burst_end,"
-        " white_16b_ire, black_16b_ire, is_mapped, is_subcarrier_locked,"
-        " is_widescreen FROM capture LIMIT 1").fetchone()
+    cap = db.execute(CAPTURE_QUERY).fetchone()
     if cap is None:
         raise SystemExit(f"{db_path}: empty capture table (decode incomplete?)")
-    (system, git_branch, git_commit, srate, avs, ave, fw, fh, nfields,
-     cbs, cbe, w16, b16, ismap, issub, iswide) = cap
-
-    vp = {
-        "system": system,
-        "isSourcePal": system != "NTSC",
-        "gitBranch": git_branch or "",
-        "gitCommit": git_commit or "",
-        "numberOfSequentialFields": int(nfields),
-        "sampleRate": float(srate),
-        "fieldWidth": int(fw),
-        "fieldHeight": int(fh),
-        "activeVideoStart": int(avs),
-        "activeVideoEnd": int(ave),
-        "colourBurstStart": int(cbs),
-        "colourBurstEnd": int(cbe),
-        "white16bIre": int(round(w16)),
-        "black16bIre": int(round(b16)),
-        "isMapped": bool(ismap),
-        "isSubcarrierLocked": bool(issub),
-        "isWidescreen": bool(iswide),
-    }
+    vp = video_parameters(cap)
 
     pcm = db.execute("SELECT bits, is_little_endian, is_signed, sample_rate"
                      " FROM pcm_audio_parameters LIMIT 1").fetchone()
@@ -98,6 +75,7 @@ def convert(db_path):
             fj["dropOuts"] = drops[fid]
         fields.append(fj)
 
+    nfields = vp["numberOfSequentialFields"]
     if len(fields) != nfields:
         print(f"  warning: {db_path}: capture says {nfields} fields,"
               f" field_record has {len(fields)}", file=sys.stderr)
