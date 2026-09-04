@@ -29,6 +29,7 @@ Correctness invariants:
   count.
 """
 
+import os
 import copy
 import multiprocessing
 import signal
@@ -43,6 +44,36 @@ from .dsp import concatenate_blocks
 # Worker-process state: one RFDecode per process, built by the pool
 # initializer to reproduce the parent's post-calibration filter state.
 _worker_rf = None
+_worker_gpu_obj = "unset"       # "unset" -> not yet tried; None -> unavailable
+
+
+def _worker_gpu():
+    """This worker's GPUDemod, or None when the GPU path cannot serve it.
+
+    Refused when the decode needs analog audio, EFM or echo cancellation,
+    because gpudemod does not produce those yet.  Set LDDECODE_NO_GPU=1 to
+    force the CPU path.
+    """
+    global _worker_gpu_obj
+    if _worker_gpu_obj != "unset":
+        return _worker_gpu_obj
+    _worker_gpu_obj = None
+    rf = _worker_rf
+    # OPT-IN ONLY.  The GPU path still differs from the CPU in a full decode
+    # (last measured 35% of samples after fixing two staleness bugs) and is not
+    # trusted; it must never be reachable by an ordinary decode.
+    if rf is None or not os.environ.get("LDDECODE_GPU"):
+        return None
+    if (rf.decode_analog_audio or rf.decode_digital_audio
+            or getattr(rf, "rf_echo_cancel", False)):
+        return None
+    try:
+        from .gpudemod import GPUDemod, HAVE_GPU
+        if HAVE_GPU:
+            _worker_gpu_obj = GPUDemod(rf)
+    except Exception:
+        _worker_gpu_obj = None
+    return _worker_gpu_obj
 _worker_cfg = None
 
 
@@ -162,19 +193,35 @@ def _decode_field_worker(seq, start, raw_span, span_begin, mtf_level,
 
         # demod_read()'s per-block assembly, verbatim
         t = {"input": [], "video": [], "audio": [], "efm": [], "rfhpf": []}
+        raws = []
         for b in range(begin // dbs, ((begin + length) // dbs) + 1):
             off = b * dbs - span_begin
             rawinput = raw_span[off : off + rf.blocklen]
             if off < 0 or len(rawinput) < rf.blocklen:
                 return {"seq": seq, "eof": True}
+            raws.append(rawinput)
 
-            demod = rf.demodblock(
-                data=rawinput, mtf_level=mtf_level, cut=True,
-            )
-            t["input"].append(rawinput[rf.blockcut : -rf.blockcut_end])
-            for k in ("video", "audio", "efm", "rfhpf"):
-                if k in demod:
-                    t[k].append(demod[k])
+        # A field spans ~50 blocks - a natural batch for the GPU, which wants
+        # 16-32 to amortise the transfer.  Only taken when nothing in this
+        # decode needs an output the GPU path does not produce (analog audio,
+        # EFM, echo cancellation); otherwise the per-block CPU path runs.
+        gd = _worker_gpu()
+        if gd is not None:
+            for demod, rawinput in zip(
+                    gd.demod_batch(np.stack(raws), mtf_level=mtf_level, cut=True),
+                    raws):
+                t["input"].append(rawinput[rf.blockcut : -rf.blockcut_end])
+                t["video"].append(demod["video"])
+                t["rfhpf"].append(demod["rfhpf"])
+        else:
+            for rawinput in raws:
+                demod = rf.demodblock(
+                    data=rawinput, mtf_level=mtf_level, cut=True,
+                )
+                t["input"].append(rawinput[rf.blockcut : -rf.blockcut_end])
+                for k in ("video", "audio", "efm", "rfhpf"):
+                    if k in demod:
+                        t[k].append(demod[k])
 
         rv = {}
         for k in t.keys():

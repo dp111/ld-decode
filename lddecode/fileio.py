@@ -3,6 +3,7 @@
 Split verbatim out of utils.py (see that module's compatibility shim).
 """
 
+import os
 import subprocess
 import threading
 import traceback
@@ -388,7 +389,17 @@ class LoadLDF:
         # Soft cap on the decode buffer, to bound memory use.  The reader thread
         # pauses once the buffer grows past this -- unless a single read needs
         # more than this many bytes (see _read_data), to avoid a deadlock.
-        self._max_buffer = 64 * 1024 * 1024
+        #
+        # Raise it when several decodes run at once: each reader that pauses
+        # here yields the drive to another capture's stream, so a small cap
+        # turns N concurrent decodes into N interleaved read patterns.  A large
+        # buffer lets each one read in long sequential bursts instead, which is
+        # what a spinning disc wants (this drive averages ~3 s access).
+        # LDDECODE_READ_BUFFER_MB sets it; 2048 (2 GB per capture) is a
+        # sensible figure for streaming a whole disc set at once, at the cost
+        # of that much RAM per decode.
+        self._max_buffer = int(
+            os.environ.get("LDDECODE_READ_BUFFER_MB", "64")) * 1024 * 1024
 
         self._container = None
         self._buffer = bytearray()

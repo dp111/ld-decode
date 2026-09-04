@@ -73,6 +73,52 @@ class GPUDemod:
         self.d_rfvideo = cp.asarray(SF["RFVideo"])
         self.d_frfhpf = cp.asarray(SF["Frfhpf_half"])
         self.d_fvideo = cp.asarray(SF["FVideo_rfft"])
+        # recompute_fvideo() REPLACES this array whenever the chroma servo
+        # adopts a new inverse-MTF strength, and _sync_worker_veq() does the
+        # same for the video EQ.  Holding a stale copy on the GPU silently
+        # decodes later fields under the filter the servo has already left
+        # behind, so track the array's identity and re-upload when it moves.
+        # ...and computefilters() rebuilds ALL of them on an AGC adoption, so
+        # every resident copy has to be revalidated, not just this one.
+        self._ids = {}
+        self._snap()
+
+    _TRACKED = ("RFVideo", "Frfhpf_half", "FVideo_rfft", "MTF", "FcutPAL")
+
+    def _snap(self):
+        # Hold the array OBJECTS, not their ids.  CPython reuses an id once the
+        # old object is freed, so an id comparison can silently miss a filter
+        # that was replaced - keeping a reference makes the identity test sound
+        # (and costs a few MB).
+        SF = self.rf.Filters
+        self._ids = {k: SF[k] for k in self._TRACKED if k in SF}
+
+    def _resync(self):
+        """Re-upload any filter the decoder has replaced since we last looked.
+
+        recompute_fvideo() replaces FVideo_rfft on a chroma-servo adoption and
+        computefilters() replaces everything on an AGC one.  Holding stale
+        copies silently decodes under filters the CPU has already moved past -
+        measured as 91% of samples differing, from field 6 onward, when only
+        FVideo_rfft was tracked."""
+        SF = self.rf.Filters
+        for k in self._TRACKED:
+            if k not in SF:
+                continue
+            if self._ids.get(k) is not SF[k]:
+                dev = cp.asarray(SF[k])
+                if k == "RFVideo":
+                    self.d_rfvideo = dev
+                elif k == "Frfhpf_half":
+                    self.d_frfhpf = dev
+                elif k == "FVideo_rfft":
+                    self.d_fvideo = dev
+                elif k == "MTF":
+                    self.d_mtf = dev
+                    self._mtf_cache.clear()
+                elif k == "FcutPAL":
+                    self.d_fcutpal = dev
+                self._ids[k] = SF[k]
         self.d_mtf = cp.asarray(SF["MTF"])
         self.d_fcutpal = cp.asarray(SF["FcutPAL"]) if "FcutPAL" in SF else None
         # demodblock slices rfhpf offset by the measured rot delay
@@ -111,6 +157,7 @@ class GPUDemod:
         (a structured array matching demodblock's) and "rfhpf".
         """
         bl = self.blocklen
+        self._resync()
         x = cp.asarray(np.ascontiguousarray(blocks, dtype=np.float64))
         B = x.shape[0]
 
