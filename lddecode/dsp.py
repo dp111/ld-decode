@@ -8,6 +8,7 @@ from math import tau
 
 import numpy as np
 from numba import njit
+from scipy.special import i0
 
 
 # This runs a cubic scaler on a line.
@@ -51,55 +52,51 @@ def scale(buf, begin, end, tgtlen, mult=1):
 # (more ringing))
 # Large Beta = less sharpness / less ringing (wide main lobe (less sharp), more side lobe cutoff
 # (less ringing))
-# kaiser_beta = 5
+kaiser_beta = 5
 sinc_tap_count = 16  # must be multiple of 2
-sinc_phase_count = 2**16
 
-# @njit
-# def sinc(x):
-#     if x == 0.0:
-#         return 1.0
-#     x_pi = np.pi * x
-#     return math.sin(x_pi) / x_pi
-
-
-# def kaiser_window(x, a, beta, i0_beta):
-#     r = x / a
-#     if r < -1.0 or r > 1.0:
-#         return 0.0
-#
-#     t = math.sqrt(1.0 - r * r)
-#     return i0(beta * t) / i0_beta
+#: Tabulated fractional positions between one input sample and the next.  Both
+#: resampling kernels interpolate between adjacent rows, which recovers a phase
+#: resolution far finer than the step, so the table is sized to sit in L1d
+#: beside the signal rather than to resolve the phase on its own: 257 rows of
+#: 16 float32 weights is 16 KiB.
+sinc_phase_count = 256
 
 
 # https://ccrma.stanford.edu/~jos/sasp/Kaiser_Windows_Transforms.html
-# def build_kaiser_lut(beta, taps, phases):
-#     a = taps // 2
-#
-#     offsets = np.arange(a - 1, -a - 1, -1)
-#     offsets_len = len(offsets)
-#
-#     table = np.zeros((phases + 1, taps), dtype=np.float32)
-#     weights = np.empty(offsets_len, dtype=np.float32)
-#     i0_beta = i0(beta)
-#
-#     for i in range(phases):
-#         phase = i / phases
-#
-#         s = 0.0
-#         for j in range(offsets_len):
-#             x = offsets[j] + phase
-#             weight = sinc(x) * kaiser_window(x, a, beta, i0_beta)
-#
-#             weights[j] = weight
-#             s += weight
-#
-#         table[i, :] = weights / s
-#
-#     # copy the last phase to avoid bounds checking later on when we do linear interpolation
-#     table[phases] = table[phases - 1]
-#
-#     return table
+def build_kaiser_lut(beta, taps, phases):
+    """Build the fractional-delay filter bank the resamplers read.
+
+    Row ``i`` is the ``taps``-weight windowed-sinc filter that reconstructs a
+    sample ``i / phases`` of the way from one input sample to the next,
+    normalised to unit gain at DC.  The table has ``phases + 1`` rows: the last
+    is the phase-1.0 filter, which is both what the top bucket interpolates
+    towards and what lets the kernels read ``phase + 1`` without a bounds
+    check.  It must be the real filter and not a copy of its neighbour --
+    duplicating it biases every position in the top 1/phases of the range, by
+    an amount the coarse table no longer makes negligible.
+
+    ``scripts/build_sinc_lut.py`` writes the result to ``lddecode/sinc_lut.npz``,
+    which is what a decode loads; the tests rebuild it here to check that file.
+    """
+    half_taps = taps // 2
+
+    # Tap offsets from the sample below the fractional position, so that phase
+    # zero puts the peak of the sinc on tap half_taps - 1 -- the tap the
+    # kernels align with the truncated position.
+    offsets = np.arange(half_taps - 1, -half_taps - 1, -1, dtype=np.float64)
+    phase = np.arange(phases + 1, dtype=np.float64) / phases
+    x = offsets[np.newaxis, :] + phase[:, np.newaxis]
+
+    # Kaiser window on the same grid.  |x| never exceeds half_taps for these
+    # offsets, so the clamp is only there to keep the square root in domain.
+    r = x / half_taps
+    window = i0(beta * np.sqrt(np.maximum(1.0 - r * r, 0.0))) / i0(beta)
+
+    table = np.sinc(x) * window
+    table /= table.sum(axis=1, keepdims=True)
+
+    return table.astype(np.float32)
 
 
 @njit(nogil=True, cache=True, fastmath=True)
@@ -149,19 +146,23 @@ def scale_field(
         # fractional phase
         frac = coord - coord_int
 
-        # sinc_phase_count is 2**16, so the nearest tabulated phase is already
-        # accurate far below float32 precision. Interpolating between two
-        # adjacent phases would double LUT reads and add per-tap math in the
-        # innermost loop of the decoder for no change in output.
-        # If the LUT gets smaller, consider adding linear interpolation.
-        phase = int(frac * sinc_phase_count + np.float32(0.5))
-        w = sinc_lut[phase]
+        # The table is coarse enough to stay in L1d, so take the two phases
+        # either side of the position and interpolate between them.
+        # scale_positions resolves the phase the same way, and the two kernels
+        # must return the same sample for the same position.
+        phase_pos = frac * sinc_phase_count
+        phase_start = int(phase_pos)
+        phase_alpha = np.float32(phase_pos - phase_start)
+
+        w_start = sinc_lut[phase_start]
+        w_end = sinc_lut[phase_start + 1]
 
         start = coord_int - half_taps_m1
 
         result = 0.0
         for t in range(sinc_tap_count):
-            result += buf[start + t] * w[t]
+            ws = w_start[t]
+            result += buf[start + t] * (ws + phase_alpha * (w_end[t] - ws))
 
         dsout[i - dsout_start] = level_adjust * result
 
@@ -200,16 +201,19 @@ def scale_positions(buf, dsout, pixel_locs, wowfactors, sinc_lut,
         coord_int = int(coord)
         frac = coord - coord_int
 
-        # Nearest tabulated phase; see scale_field for why interpolating
-        # between phases is unnecessary at sinc_phase_count = 2**16.
-        phase = int(frac * sinc_phase_count + np.float32(0.5))
-        w = sinc_lut[phase]
+        phase_pos = frac * sinc_phase_count
+        phase_start = int(phase_pos)
+        phase_alpha = np.float32(phase_pos - phase_start)
+
+        w_start = sinc_lut[phase_start]
+        w_end = sinc_lut[phase_start + 1]
 
         start = coord_int - half_taps_m1
 
         result = 0.0
         for t in range(sinc_tap_count):
-            result += buf[start + t] * w[t]
+            ws = w_start[t]
+            result += buf[start + t] * (ws + phase_alpha * (w_end[t] - ws))
 
         dsout[i] = level_adjusts[i] * result
 
@@ -317,106 +321,6 @@ def nb_median(m):
 @njit(cache=True,nogil=True)
 def nb_round(m):
     return int(np.round(m))
-
-
-@njit(cache=True, nogil=True)
-def compute_linelocs_kernel(
-    p_start, p_type, p_valid, line0loc, lastlineloc, meanlinelen,
-    linecount, proclines, skipdetected, hsync_tolerance, outlinecount, inlinelen,
-):
-    """ Body of Field.compute_linelocs lifted to numba: per-pulse line-number
-    assignment (keep-closest), then gap fill.  Reproduces the dict-based Python
-    original exactly using arrays indexed by rounded line number.
-
-    Returns (status, linelocs0, linelocs_filled, rv_err).  status==1 signals the
-    two early-exit cases (both return the same fdoffset in the Python wrapper).
-    """
-    filled = np.full(proclines, -1.0)
-    has = np.zeros(proclines, dtype=np.bool_)
-    dist = np.zeros(proclines)
-
-    n = p_start.shape[0]
-    for k in range(n):
-        ps = p_start[k]
-        lineloc = (ps - line0loc) / meanlinelen
-        rlineloc = nb_round(lineloc)
-        lineloc_distance = abs(lineloc - rlineloc)
-
-        if skipdetected:
-            lineloc_end = linecount - ((lastlineloc - ps) / meanlinelen)
-            rlineloc_end = nb_round(lineloc_end)
-            lineloc_end_distance = abs(lineloc_end - rlineloc_end)
-
-            if p_type[k] == 0 and rlineloc > 23 and lineloc_end_distance < lineloc_distance:
-                lineloc = lineloc_end
-                rlineloc = rlineloc_end
-                lineloc_distance = lineloc_end_distance
-
-        # rounded line numbers outside [0, proclines) are stored in the original
-        # dict but never read back, so they can't affect the output -- skip them.
-        if rlineloc < 0 or rlineloc >= proclines:
-            continue
-
-        if lineloc_distance > hsync_tolerance or (
-            has[rlineloc] and lineloc_distance > dist[rlineloc]
-        ):
-            continue
-
-        if rlineloc > 0 and not p_valid[k]:
-            if p_type[k] > 0 or (p_type[k] == 0 and rlineloc < 10):
-                continue
-
-        filled[rlineloc] = ps
-        has[rlineloc] = True
-        dist[rlineloc] = lineloc_distance
-
-    linelocs0 = filled.copy()
-    linelocs_filled = filled.copy()
-    rv_err = np.zeros(proclines, dtype=np.bool_)
-
-    # Searches below read the ORIGINAL filled array (matching the Python code,
-    # which searches `linelocs` while writing `linelocs_filled`).
-    if linelocs_filled[0] < 0:
-        next_valid = -1
-        for i in range(0, outlinecount + 1):
-            if filled[i] > 0:
-                next_valid = i
-                break
-
-        if next_valid == -1:
-            return 1, linelocs0, linelocs_filled, rv_err
-
-        linelocs_filled[0] = filled[next_valid] - (next_valid * meanlinelen)
-
-        if linelocs_filled[0] < inlinelen:
-            return 1, linelocs0, linelocs_filled, rv_err
-
-    for l in range(1, proclines):
-        if linelocs_filled[l] < 0:
-            rv_err[l] = True
-
-            prev_valid = -1
-            next_valid = -1
-            for i in range(l, -1, -1):
-                if filled[i] > 0:
-                    prev_valid = i
-                    break
-            for i in range(l, outlinecount + 1):
-                if filled[i] > 0:
-                    next_valid = i
-                    break
-
-            if prev_valid == -1:
-                avglen = inlinelen
-                linelocs_filled[l] = filled[next_valid] - (avglen * (next_valid - l))
-            elif next_valid != -1:
-                avglen = (filled[next_valid] - filled[prev_valid]) / (next_valid - prev_valid)
-                linelocs_filled[l] = filled[prev_valid] + (avglen * (l - prev_valid))
-            else:
-                avglen = inlinelen
-                linelocs_filled[l] = filled[prev_valid] + (avglen * (l - prev_valid))
-
-    return 0, linelocs0, linelocs_filled, rv_err
 
 
 @njit(cache=True, nogil=True)
@@ -627,6 +531,95 @@ def _calczc_do(data, _start_offset, target, edge=0, count=16):
 
 
 @njit(cache=True, nogil=True)
+def compute_linelocs_kernel(
+    p_start, p_type, p_valid, line0loc, lastlineloc, meanlinelen,
+    linecount, proclines, skipdetected, hsync_tolerance, outlinecount, inlinelen,
+):
+    filled = np.full(proclines, -1.0)
+    has = np.zeros(proclines, dtype=np.bool_)
+    dist = np.zeros(proclines)
+
+    n = p_start.shape[0]
+    for k in range(n):
+        ps = p_start[k]
+        lineloc = (ps - line0loc) / meanlinelen
+        rlineloc = nb_round(lineloc)
+        lineloc_distance = abs(lineloc - rlineloc)
+
+        if skipdetected:
+            lineloc_end = linecount - ((lastlineloc - ps) / meanlinelen)
+            rlineloc_end = nb_round(lineloc_end)
+            lineloc_end_distance = abs(lineloc_end - rlineloc_end)
+
+            if p_type[k] == 0 and rlineloc > 23 and lineloc_end_distance < lineloc_distance:
+                lineloc = lineloc_end
+                rlineloc = rlineloc_end
+                lineloc_distance = lineloc_end_distance
+
+        if rlineloc < 0 or rlineloc >= proclines:
+            continue
+
+        if lineloc_distance > hsync_tolerance or (
+            has[rlineloc] and lineloc_distance > dist[rlineloc]
+        ):
+            continue
+
+        if rlineloc > 0 and not p_valid[k]:
+            if p_type[k] > 0 or (p_type[k] == 0 and rlineloc < 10):
+                continue
+
+        filled[rlineloc] = ps
+        has[rlineloc] = True
+        dist[rlineloc] = lineloc_distance
+
+    linelocs0 = filled.copy()
+    linelocs_filled = filled.copy()
+    rv_err = np.zeros(proclines, dtype=np.bool_)
+
+    if linelocs_filled[0] < 0:
+        next_valid = -1
+        for i in range(0, outlinecount + 1):
+            if filled[i] > 0:
+                next_valid = i
+                break
+
+        if next_valid == -1:
+            return 1, linelocs0, linelocs_filled, rv_err
+
+        linelocs_filled[0] = filled[next_valid] - (next_valid * meanlinelen)
+
+        if linelocs_filled[0] < inlinelen:
+            return 1, linelocs0, linelocs_filled, rv_err
+
+    for l in range(1, proclines):
+        if linelocs_filled[l] < 0:
+            rv_err[l] = True
+
+            prev_valid = -1
+            next_valid = -1
+            for i in range(l, -1, -1):
+                if filled[i] > 0:
+                    prev_valid = i
+                    break
+            for i in range(l, outlinecount + 1):
+                if filled[i] > 0:
+                    next_valid = i
+                    break
+
+            if prev_valid == -1:
+                avglen = inlinelen
+                linelocs_filled[l] = filled[next_valid] - (avglen * (next_valid - l))
+            elif next_valid != -1:
+                avglen = (filled[next_valid] - filled[prev_valid]) / (next_valid - prev_valid)
+                linelocs_filled[l] = filled[prev_valid] + (avglen * (l - prev_valid))
+            else:
+                avglen = inlinelen
+                linelocs_filled[l] = filled[prev_valid] + (avglen * (l - prev_valid))
+
+    return 0, linelocs0, linelocs_filled, rv_err
+
+
+@njit(cache=True, nogil=True)
 def refine_hsync_zcs(
     demod_05, linelocs1, linebad, n, is_pal, freq,
     vsync_target, neg55, pos30,
@@ -709,6 +702,85 @@ def refine_pilot_zcs(demod_pilot, linelocs, n, length_px, freq, linelen, pilot_m
         prev = zcs[l]
 
     return zcs, plen
+
+
+# ---------------------------------------------------------------------------
+# Chroma differential gain and phase correction
+# ---------------------------------------------------------------------------
+#
+# The corrector itself lives in field.py (_correct_chroma_vs_luma), which
+# separates the subcarrier band and the luminance it rides on with a pair of
+# zero-phase frequency windows.  These are the three passes it makes over the
+# whole field: the windowing of the spectrum and the two forms of the final
+# combination.  Each is one loop with no temporaries, so a field costs one
+# read and one write of itself rather than the eight whole-field arrays the
+# same arithmetic spelled in numpy allocates.
+
+
+@njit(cache=True, nogil=True)
+def select_band(spectrum, window, lo, hi, out, quadrature):
+    """Write `spectrum` through `window` over bins [lo, hi) into `out`.
+
+    A window is zero outside its own band, so only that band's bins are
+    touched and `out` keeps whatever it held elsewhere - it comes in zeroed,
+    so the inverse transform sees the windowed spectrum and nothing else.
+
+    With `quadrature` set each bin is multiplied by -1j, which is the Hilbert
+    transform's -1j*sgn(f) on a half spectrum: the inverse real transform
+    then returns the band's quadrature component instead of the band itself,
+    and the two together are its analytic signal.  Reaching the analytic
+    signal that way costs a second real transform rather than one complex
+    transform of twice the width, and never builds the doubled full-length
+    complex spectrum.
+    """
+    if quadrature:
+        for i in range(lo, hi):
+            v = spectrum[i] * window[i]
+            out[i] = complex(v.imag, -v.real)
+    else:
+        for i in range(lo, hi):
+            out[i] = spectrum[i] * window[i]
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def equalise_chroma_gain(ire, luma, chroma, slope, anchor):
+    """composite + (G(luma) - 1) * chroma, the real differential gain path.
+
+    G(L) = (1 + slope*anchor) / (1 + slope*max(L, 0)): the gain that flattens
+    a chroma amplitude rising `slope` per IRE of luminance, holding the level
+    at `anchor` where it is.  Sync and blanking are below the clip, so they
+    all take G(0) and nothing about the luminance staircase moves.
+    """
+    n = ire.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    numerator = 1.0 + slope * anchor
+    for i in range(n):
+        level = luma[i]
+        if level < 0.0:
+            level = 0.0
+        out[i] = ire[i] + (numerator / (1.0 + slope * level) - 1.0) * chroma[i]
+    return out
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def equalise_chroma_gain_phase(ire, level, cos_rotation, sin_rotation,
+                               chroma, quadrature, slope, anchor):
+    """composite + Re[(G(luma) - 1) * chroma_analytic] with G complex.
+
+    The rotation cos/sin pair is passed in already evaluated over the
+    clipped luminance `level`: they are two vectorised transcendental passes
+    over the field, which numpy does in SIMD and this loop's libm would not.
+    The analytic chroma arrives as its own two components (see select_band),
+    so the real part of the product is written out directly.
+    """
+    n = ire.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    numerator = 1.0 + slope * anchor
+    for i in range(n):
+        gain = numerator / (1.0 + slope * level[i])
+        out[i] = (ire[i] + (gain * cos_rotation[i] - 1.0) * chroma[i]
+                  - gain * sin_rotation[i] * quadrature[i])
+    return out
 
 
 if __name__ == "__main__":
