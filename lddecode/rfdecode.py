@@ -1455,20 +1455,32 @@ class RFDecode:
         # demodblock filters the same channel - single precision, centred
         # on blanking, the stack's own row - because the start finder's
         # answer has to be the sync channel a real decode would produce,
-        # and test_start_finder holds the two to bit equality.
+        # and test_start_finder holds the two to float32 precision (not bit
+        # equality: demodblock filters four channels in one batched transform
+        # and this filters one, which rounds differently).
         centre = self.Filters["FVideo_rfft_centre"]
         clipped = np.empty(self.blocklen, dtype=np.float32)
         np.subtract(np.clip(demod, 1500000, self.freq_hz * 0.75), centre,
                     out=clipped)
-        sync = npfft.irfft(
+        filtered = npfft.irfft(
             npfft.rfft(clipped) * self.Filters["FVideo_rfft32"][1],
             n=self.blocklen,
         )
-        sync += self.Filters["FVideo_rfft_dc"][1]
+        # Take the DC term back on the way into float32, exactly as demodblock
+        # does on the copy into its record array.  Adding it in float64 and
+        # rounding once at the end instead rounds differently, by one or two
+        # ULP on about 16% of samples -- immaterial to sync detection, but the
+        # two paths are held to bit equality and this is where they parted.
+        sync = np.empty(self.blocklen, dtype=np.float32)
+        dc = self.Filters["FVideo_rfft_dc"][1]
+        if dc:
+            np.add(filtered, dc, out=sync)
+        else:
+            sync[:] = filtered
 
         if cut:
             sync = sync[self.blockcut : -self.blockcut_end]
-        return sync.astype(np.float32)
+        return sync
 
     def demodblock_cpu(self, *args, **kwargs):
         """Monolith-API alias: core.py dispatched demodblock() to a CPU/GPU

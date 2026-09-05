@@ -28,6 +28,16 @@ def test_file_frame_conversion_matches_start_seek_units():
 
 
 def test_sync_only_demodulation_matches_the_normal_sync_path():
+    """The start finder must see the sync channel a real decode produces.
+
+    To float32 precision, not bit for bit.  demodblock() filters all four
+    video channels in one batched transform, and the sync path filters the
+    one channel it needs in a single transform; the two round differently
+    (measured: up to 0.00195 out of values around 9.5e6, on about 16% of
+    samples, from the transform alone with identical inputs).  Holding this
+    to bit equality would mean making the cheap probe do four channels'
+    work, which is the cost it exists to avoid.
+    """
     rf = RFDecode(system="NTSC", blocklen=32768)
     raw = np.random.default_rng(0).integers(
         -32768, 32767, size=rf.blocklen, dtype=np.int16
@@ -36,7 +46,9 @@ def test_sync_only_demodulation_matches_the_normal_sync_path():
     full = rf.demodblock(data=raw, cut=True)["video"]["demod_05"]
     sync = rf.demodblock_sync(data=raw, cut=True)
 
-    np.testing.assert_array_equal(sync, full)
+    assert sync.dtype == full.dtype == np.float32
+    # a few float32 ULP at this magnitude; sync detection works in IRE
+    np.testing.assert_allclose(sync, full, rtol=1e-6, atol=4)
 
 
 def test_vbi_run_requires_contiguous_addresses_of_one_disk_type():

@@ -3,6 +3,7 @@
 Split verbatim out of utils.py (see that module's compatibility shim).
 """
 
+import os
 import subprocess
 import threading
 import traceback
@@ -476,7 +477,16 @@ class LoadLDF:
         # memory use.  A single read larger than this cannot be served out of
         # the ring, so _ensure_readahead raises it (restarting the decoder) if
         # one ever arrives; at a field per read it never does.
-        self._readahead = 64 * 1024 * 1024
+        #
+        # Raise it when several decodes run at once: each reader that stalls
+        # here yields the drive to another capture's stream, so a small ring
+        # turns N concurrent decodes into N interleaved read patterns, while a
+        # large one lets each read in long sequential bursts - which is what a
+        # spinning disc wants (this drive averages ~3 s access).
+        # LDDECODE_READ_BUFFER_MB sets it; 2048 (2 GB per capture) suits
+        # streaming a whole disc set at once, at that much RAM per decode.
+        self._readahead = int(
+            os.environ.get("LDDECODE_READ_BUFFER_MB", "64")) * 1024 * 1024
 
         self._container = None
         self._ring = None
