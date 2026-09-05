@@ -94,7 +94,7 @@ ceiling = 1.36
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
-# dolby-surround-side1-outer (NTSC): 1 of its checks fail.
+# dolby-surround-side1-outer (NTSC): 2 of its checks fail.
 
 [[deviation]]
 capture = "dolby-surround-side1-outer"
@@ -107,6 +107,18 @@ band_used = 4.18
 ceiling = 4.60
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
+
+[[deviation]]
+capture = "dolby-surround-side1-outer"
+check = "ntsc-ntc7-composite/pulse_12t5_luma"
+field_line = 20
+parity = "first"
+measured = 48.481
+unit = "IRE"
+band_used = 1.01
+ceiling = 1.11
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The 12.5T modulated pulse's luminance component: the same sine-squared pulse measurement as pulse_2t above, on the same line of the same cut. The fault is already recorded one radius in, at 1.24x on dolby-surround-side1-middle; this cut has read within a fiftieth of its limit for as long as the sweep has measured it (0.99x, 48.512 IRE) and has now crossed. See docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
 
 # domesday-ds1-community-north-outer (PAL): 4 of its checks fail.
