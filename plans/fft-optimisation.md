@@ -249,17 +249,51 @@ The lane is better than the tree this work started from, not merely better than 
 fix: `gain_ratio` was 0.273 before the round and failed low. The now-passing entry for that cut is
 deleted from `analysis/vits_known_deviations.toml`, as that file's contract requires.
 
-**The two `-outer` entries are deliberately not deleted.** They pass because this tree does not
-engage the servo there, where the pre-round tree does — the scatter-gate knife-edge above, which
-this fix does not touch. That file already records the same servo flipping once before: the
-`differential_gain` entry's own reason says "the 2T servo adopts −0.724 here, where it adopted
-nothing before", written when the PAL MTF rotation-rate fix flipped it on the same cut. The
-pre-round tree also fails this cut at four of six start offsets with no decoder change at all.
-Deleting the entries would assert these checks must pass forever and hand the next change that
-flips the servo back a red lane with nothing to explain it.
+**The two `-outer` entries are deleted as well, and that took a measurement to justify.** They pass
+because this tree does not engage the 2T servo on that cut, where the pre-round tree does. Deleting
+an entry asserts the check must keep passing, so the question was whether that non-engagement is a
+property of this tree or a coin flip — the same file already records this servo flipping once
+before, when the PAL MTF rotation-rate fix landed. Instrumenting the gate across all 21 radius cuts
+settles it: on `-outer` **none of the 63 evaluations falls under the gate**, minimum 0.3594 against
+a gate of 0.3500. There is no marginal evaluation there to turn over. The alternative — leaving a
+lane permanently red on a contract violation the runner is designed to force — is worse than an
+entry that may one day need writing again with a fresh reason, which is what that file is for.
 
-The scatter gate itself was also left alone on purpose. Making engagement rarer would have left the
-stale-bound fault latent for every capture under 100 fields, which is most of the radius corpus.
+With those two gone the whole VITS radius lane is green: **96 of 96 CTest, 48 of 48 in the lane
+itself, and every other one of the 1,323 conformance checks across the 21 cuts reads exactly what
+it read before.**
+
+### 4.5 Making the gate itself robust: built, measured, rejected
+
+The remaining complaint about the gate is that engagement latches on a single evaluation, so one
+under-gate reading decides every frame that follows. Instrumented across the lane, that is real:
+on `domesday-ds1-community-north-outer` only 5 of 96 evaluations fall under the gate, the longest
+run is 4, and the servo engages on the first of them. Discs that carry a usable ITS look nothing
+like that:
+
+| population | consecutive under-gate runs |
+|---|---|
+| discs the servo should drive (10 cuts) | 42, 42, 44, 70, 70, 79, 79, 94, 94, 182 |
+| the two marginal Domesday cuts | 4 (of 96 evaluations), 11 (of 66) |
+| cuts carrying no usable ITS (7) | the gate is never reached |
+
+The populations are four times apart, so requiring *n* consecutive under-gate evaluations before
+the first engagement separates them cleanly, with n=16 sitting between them rather than at either
+edge. **It was built and measured, and it turns one red lane into eight.** Delaying engagement by
+15 fields costs the warmup, which is exactly where the servo has to converge before the adoption
+rate limit slows it to one step per 100 fields:
+
+| cut | cost of the delayed engagement |
+|---|---|
+| `ggv1011-side1-inner` | **6 real failures** — both chroma bars, three multiburst packets, `gain_ratio` |
+| `industrial-lv-side1-middle`, `-outer` | `pulse_2t` fails |
+| `dolby-surround-side1-inner` | `pulse_2t` fails |
+| `domesday-ds2-...-middle` | `gain_ratio` 0.299 → 0.273, undoing §4.2 |
+| `domesday-ds1-...-outer` | `gain_ratio` 0.285 → 0.272 |
+
+Engaging early is not incidental to this servo; it is what lets it converge at all. **The latch is
+the price of that, and on this evidence it is worth paying** — the one cut where a short run
+engages the servo spuriously passes its lane regardless. The gate keeps its shipped form.
 
 ## 5. What was built, measured and reverted
 
@@ -282,6 +316,7 @@ on 3.14t, so the interpreter itself is free — this can be revisited if SciPy e
 | Block length 16384 | +0.2% NTSC, −0.9% PAL; 68 MB less peak RSS | inside the spread both ways; no reason to move |
 | Block length 8192 | −3.2% NTSC, **−6.6% PAL**; 89 MB less peak RSS | the only sweep figure outside the threshold, and in the wrong direction |
 | Retiring the `full_rate_demod` escape hatch | 11 branches in `rfdecode.py` | it is the control arm the half-rate equivalence tests are held against |
+| Requiring *n* consecutive clean evaluations before the 2T servo engages | separates the marginal cuts from the good ones four times over | costs the warmup: 1 red lane becomes **8**, six of them real failures on one cut (§4.5) |
 
 Each block length was also checked with `cvbs_verify`, since block length is a filter-design
 parameter and not just a buffer size: all three pass. **The default stays 32768.**
@@ -299,8 +334,10 @@ one Domesday cut's `.cvbs` and `.dropouts.meta` at `-t 1`, `-t 4` and under
 **Bit-identity across thread counts.** Every `compare-*-parallel-*` test passes, so the guarantee
 in `AGENTS.md` §4.4 — a `-t N` decode is bit-identical to the serial decode — holds throughout.
 
-**Conformance.** The full CTest suite passes but for one VITS lane, and that one is the bookkeeping
-question in §4.4, not a measurement failure. No tolerance was widened and no assertion removed.
+**Conformance.** The full CTest suite passes, **96 of 96**, with the VITS radius lane green on all
+21 cuts. No tolerance was widened and no assertion removed; the three known-deviation entries this
+work deletes are deleted because their checks now pass, which is what that file's contract asks
+for.
 
 **What could not be measured.** The long reference captures live on a NAS mount that is empty on
 this box, and nothing in `testdata/` is more than 90 frames. The PAL cells at `-t 4` and `-t 6` are
