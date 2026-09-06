@@ -84,11 +84,16 @@ def positions():
 
 
 def resample_nearest(buf, locs, lut, phases):
-    """What the kernels used to do: the nearest tabulated phase, no blend."""
-    coords = locs.astype(np.float32)
+    """What the kernels used to do: the nearest tabulated phase, no blend.
+
+    The position itself is kept exact (float64), as the kernels now keep it:
+    narrowing it to float32 costs ~1e-4 samples even at these short offsets,
+    which is more than the interpolation error this reference is meant to
+    isolate."""
+    coords = locs.astype(np.float64)
     ints = coords.astype(np.int64)
     frac = coords - ints
-    rows = lut[(frac * phases + np.float32(0.5)).astype(np.int64)]
+    rows = lut[(frac * phases + 0.5).astype(np.int64)]
     starts = ints - (sinc_tap_count // 2 - 1)
     taps = buf[starts[:, None] + np.arange(sinc_tap_count)[None, :]]
     return np.einsum("ij,ij->i", taps, rows.astype(np.float64))

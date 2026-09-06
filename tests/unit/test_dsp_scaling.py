@@ -126,8 +126,8 @@ def test_scale_field_resamples_at_the_requested_positions(linear_lut):
     scale_field(buf, dsout, pixel_locs, wowfactors, linear_lut, lineoffset, outwidth)
 
     expected = 2.0 * (positions * 3.0 + 7.0)
-    # scale_field narrows the coordinate to float32 and picks the nearest of
-    # 65536 tabulated phases, so the position it actually interpolates at is
+    # scale_field blends the two tabulated phases either side of the position
+    # with a float32 weight, so the position it actually interpolates at is
     # within about 1e-5 samples of the one asked for.  On a slope of 3 units
     # per sample that is well under 1e-3 units of output, i.e. far below one
     # LSB of the 16-bit sample this feeds.
@@ -417,3 +417,28 @@ def test_audio_rescale_returns_an_int():
     # This value is packed straight into a PCM sample; a float here would be
     # silently truncated somewhere further down instead.
     assert isinstance(dsa_rescale_and_clip(12345.0), int)
+
+
+def test_scale_positions_keeps_its_precision_deep_into_the_buffer(linear_lut):
+    # The same fractional positions resampled near the start of a buffer and
+    # ~2^20 samples into it must give the same values.  A field buffer runs to
+    # about 1e6 samples, and a position rounded to float32 there is only good
+    # to 1/16 of a sample, which turned a sub-1e-5-sample change in a line
+    # location into whole-step jumps at sparse pixels; the position has to
+    # stay float64 until its integer part is split off.
+    n = 64
+    frac = np.linspace(0.0, 0.99, n)
+    far = 2 ** 20
+    buf = np.zeros(far + 128, dtype=np.float32)
+    # a ramp of slope 3 at both sites, so the linear LUT's answer is 3 * p + c
+    buf[:128] = np.arange(128) * 3.0
+    buf[far - 64:far + 64] = np.arange(128) * 3.0
+    near_locs = 40.0 + frac
+    far_locs = float(far - 64 + 40) + frac
+    ones = np.ones(n)
+    out_near = np.zeros(n); out_far = np.zeros(n)
+    scale_positions(buf, out_near, near_locs, ones, linear_lut, 100)
+    scale_positions(buf, out_far, far_locs, ones, linear_lut, 100)
+    # identical fractional positions on identical ramps: any difference is
+    # position precision, and 1/16 of a sample on slope 3 would be ~0.19
+    assert np.abs(out_near - out_far).max() < 1e-3

@@ -139,8 +139,12 @@ def scale_field(
         level_adjust = level_adjusts[i]
 
         # reconstructs the waveform at the proper fractional sample position, undoing wow-induced
-        # timing variations
-        coord = np.float32(interpolated_pixel_locs[i])
+        # timing variations.  The position stays float64 until its integer
+        # part is split off: a field buffer runs to ~1e6 samples, where a
+        # float32 step is 1/16 of a sample, and rounding the position there
+        # quantised every pixel's phase to that step (and made a 1e-5-sample
+        # change in a line location flip sparse pixels by a whole step).
+        coord = interpolated_pixel_locs[i]
         coord_int = int(coord)
 
         # fractional phase
@@ -197,7 +201,7 @@ def scale_positions(buf, dsout, pixel_locs, wowfactors, sinc_lut,
     half_taps_m1 = (sinc_tap_count // 2) - 1
 
     for i in range(len(dsout)):
-        coord = np.float32(pixel_locs[i])
+        coord = pixel_locs[i]            # float64: see scale_field
         coord_int = int(coord)
         frac = coord - coord_int
 
