@@ -65,7 +65,8 @@ def _worker_gpu():
     if rf is None or not os.environ.get("LDDECODE_GPU"):
         return None
     if (rf.decode_analog_audio or rf.decode_digital_audio
-            or getattr(rf, "rf_echo_cancel", False)):
+            or getattr(rf, "rf_echo_cancel", False)
+            or getattr(rf, "fm_pll", False)):
         return None
     try:
         from .gpudemod import GPUDemod, HAVE_GPU

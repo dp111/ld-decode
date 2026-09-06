@@ -1,43 +1,42 @@
-"""PROTOTYPE: batched demodulation on the GPU.
+"""PROTOTYPE: batched demodulation on the GPU.  Opt-in (LDDECODE_GPU=1).
 
-demodblock() is ~52% of a decode worker's time and is almost entirely FFTs and
-elementwise products over 32768-point blocks - work a GPU does far faster than
-a CPU.  The catch is transfer: one block at a time PCIe round-trip is 76% of
-the call and the GPU *loses* (0.78x).  Batched, it amortises away.
+demodblock() is FFTs and elementwise products over 32768-point blocks, and a
+field is ~50 blocks - a natural batch.  Batched, the PCIe round trip
+amortises away; one block at a time it is 76% of the call and the GPU loses.
 
-Measured on real Domesday RF (CommunityNorth ds8), RTX 3060, blocklen 32768:
+This mirrors demodblock() stage for stage, on the same filters, uploaded
+once and re-uploaded only when the decoder replaces them (a chroma-servo
+adoption rebuilds FVideo_rfft32 through recompute_fvideo(); an AGC
+adoption rebuilds every filter through computefilters()).  Holding a stale
+copy silently decodes later fields under a filter the CPU has already left
+behind - measured as 91% of samples differing from field 6 onward when only
+FVideo was tracked - so the resident copies are keyed on the array OBJECTS,
+not their ids (CPython reuses an id once the old array is freed).
 
-    CPU demodblock          2.281 ms/block
-    GPU batch 4             0.705        3.24x
-    GPU batch 8             0.836        2.73x
-    GPU batch 16            0.738        3.09x
+Parity with demodblock(), in the order the CPU applies them:
+  * rfft of the real block, mirrored to the full spectrum;
+  * the rfhpf dropout reference, sliced by the measured rot delay;
+  * V4300D coherent subtract (per block, on the GPU, see below);
+  * RFVideo, then FcutPAL only on blocks whose analog audio carriers are
+    detected (pal_audio_carriers_present, the same band-power test);
+  * MTF ** level, the level scaled by mtf_mult / mtf_offset / MTF_basemult
+    exactly as demodblock does (raw_mtf=True skips that, as there);
+  * the conjugate-product discriminator in its historical [0, tau)
+    convention;
+  * the four (PAL: five) video products in single precision, centred on
+    blanking before the cast and given their DC back afterwards, off the
+    same FVideo_rfft32 / _centre / _dc the CPU uses.
 
-(a synthetic chain reaches 7x; the real one moves more data per block, so take
-~3x.)  With the demod chain at ~52% of worker time that projects to ~1.5x on
-the decode as a whole.
+The video products cannot be bit-identical to the CPU: the float32 transform
+is cuFFT's, not pocketfft's, so they agree to float32 rounding (about 1 Hz
+at the carrier, well under a 16-bit output LSB) rather than exactly.  The
+float64 stages (rfhpf, demod_raw) match to ~1e-11.
 
-Output is BIT-IDENTICAL to demodblock() for all five video products; rfhpf
-agrees to 9.7e-12 in float64 and is cast to float32 downstream.  So unlike the
-float32 experiment, this is not a quality trade.
-
-What this covers: input rfft, the rfhpf dropout reference (including its
-rotdelay slice), the RF filter chain (RFVideo / FcutPAL / MTF**level), the
-Hilbert transform, the conjugate-product FM discriminator in its historical
-[0, tau) convention, and the batched four-product video irfft.
-
-NOT yet covered - a block needing any of these must use the CPU path:
-  * V4300D coherent subtract.  This matters: every decode in the Domesday
-    campaign passes --V4300D_coherent_subtract, so the prototype cannot serve
-    them as it stands.  Its work is frequency-domain and cheap but iterative
-    and data-dependent per block, so it needs a per-block loop inside the
-    batch rather than a batched kernel.
-  * EFM and analog audio (two more inverse transforms each).
-  * rf_echo_cancel.
-
-Also unbuilt: the pipeline currently demodulates one block at a time, so
-something has to buffer blocks into groups of 4-16 before dispatch, and with
-several worker processes they would contend for one GPU - the natural shape is
-one GPU demod stage feeding several CPU field-processing workers.
+NOT covered - a block needing any of these must use the CPU path, and
+parallel._worker_gpu() refuses the GPU for such decodes:
+  * EFM and analog audio (two more inverse transforms each);
+  * rf_echo_cancel;
+  * the --fm_pll discriminator.
 
 Requires cupy (plus CUDA toolkit headers); imports cleanly without it.
 """
@@ -61,83 +60,79 @@ class GPUDemod:
     crosses the bus in, and the demodulated products out.
     """
 
+    # Every filter demodblock() reads, by the Filters key the decoder rebuilds
+    # it under.  FVideo_rfft32 is rebuilt together with its centre and dc
+    # constants (build_video_rfft_stack), so tracking it covers all three.
+    _TRACKED = ("RFVideo", "Frfhpf_half", "FVideo_rfft32", "MTF", "FcutPAL")
+
     def __init__(self, rf):
         if not HAVE_GPU:
             raise RuntimeError("cupy not available")
         self.rf = rf
+        self._rs_bases = {}
         self.blocklen = rf.blocklen
         self.blockcut = rf.blockcut
         self.blockcut_end = rf.blockcut_end
         self.system = rf.system
-        SF = rf.Filters
-        self.d_rfvideo = cp.asarray(SF["RFVideo"])
-        self.d_frfhpf = cp.asarray(SF["Frfhpf_half"])
-        self.d_fvideo = cp.asarray(SF["FVideo_rfft"])
-        # recompute_fvideo() REPLACES this array whenever the chroma servo
-        # adopts a new inverse-MTF strength, and _sync_worker_veq() does the
-        # same for the video EQ.  Holding a stale copy on the GPU silently
-        # decodes later fields under the filter the servo has already left
-        # behind, so track the array's identity and re-upload when it moves.
-        # ...and computefilters() rebuilds ALL of them on an AGC adoption, so
-        # every resident copy has to be revalidated, not just this one.
         self._ids = {}
-        self._snap()
-
-    _TRACKED = ("RFVideo", "Frfhpf_half", "FVideo_rfft", "MTF", "FcutPAL")
-
-    def _snap(self):
-        # Hold the array OBJECTS, not their ids.  CPython reuses an id once the
-        # old object is freed, so an id comparison can silently miss a filter
-        # that was replaced - keeping a reference makes the identity test sound
-        # (and costs a few MB).
-        SF = self.rf.Filters
-        self._ids = {k: SF[k] for k in self._TRACKED if k in SF}
-
-    def _resync(self):
-        """Re-upload any filter the decoder has replaced since we last looked.
-
-        recompute_fvideo() replaces FVideo_rfft on a chroma-servo adoption and
-        computefilters() replaces everything on an AGC one.  Holding stale
-        copies silently decodes under filters the CPU has already moved past -
-        measured as 91% of samples differing, from field 6 onward, when only
-        FVideo_rfft was tracked."""
-        SF = self.rf.Filters
+        self._mtf_cache = {}
+        self.d_fcutpal = None
         for k in self._TRACKED:
-            if k not in SF:
-                continue
-            if self._ids.get(k) is not SF[k]:
-                dev = cp.asarray(SF[k])
-                if k == "RFVideo":
-                    self.d_rfvideo = dev
-                elif k == "Frfhpf_half":
-                    self.d_frfhpf = dev
-                elif k == "FVideo_rfft":
-                    self.d_fvideo = dev
-                elif k == "MTF":
-                    self.d_mtf = dev
-                    self._mtf_cache.clear()
-                elif k == "FcutPAL":
-                    self.d_fcutpal = dev
-                self._ids[k] = SF[k]
-        self.d_mtf = cp.asarray(SF["MTF"])
-        self.d_fcutpal = cp.asarray(SF["FcutPAL"]) if "FcutPAL" in SF else None
-        # demodblock slices rfhpf offset by the measured rot delay
-        d = getattr(rf, "delays", None)
-        self.rotdelay = int(d["video_rot"]) if d and "video_rot" in d else 0
+            if k in rf.Filters:
+                self._upload(k)
+
+        bl, freq = rf.blocklen, rf.freq
+        self.fpb = rf.freq_hz / bl
+
+        # --- PAL analog audio carrier detection (pal_audio_carriers_present):
+        # the same bin ranges, evaluated for every block of the batch at once
+        self._carrier_slices = []
+        if "FcutPAL" in rf.Filters:
+            def band(f0, width):
+                return (int((f0 - width) / self.fpb),
+                        int((f0 + width) / self.fpb) + 1)
+            for fc in (rf.SysParams["audio_lfreq"], rf.SysParams["audio_rfreq"]):
+                self._carrier_slices.append(
+                    (band(fc, 40e3), band(fc - 175e3, 75e3), band(fc + 175e3, 75e3)))
 
         # --- V4300D coherent subtract state (mirrors rfdecode's) ------------
-        bl, freq = rf.blocklen, rf.freq
         self.v4_on = bool(getattr(rf, "PAL_V4300D_CoherentSubtract", False))
         self.v4_sl = slice(int(bl * (rf.V4300D_WINDOW_MHZ[0] / freq)),
                            int(1 + bl * (rf.V4300D_WINDOW_MHZ[1] / freq)))
         self.v4_carrier = slice(int(bl * (rf.V4300D_CARRIER_MHZ[0] / freq)),
                                 int(bl * (rf.V4300D_CARRIER_MHZ[1] / freq)))
-        self.fpb = rf.freq_hz / bl
         self.v4_tol = max(2, int(round(rf.V4300D_ANCHOR_TOL_HZ / self.fpb)))
         self.v4_nbtol = max(1, self.v4_tol // 2)
         self.v4_fh = int(round((1e6 / rf.SysParams["line_period"]) / self.fpb))
         self.d_bins = cp.arange(bl, dtype=cp.float64)
-        self._mtf_cache = {}
+
+    def _upload(self, k):
+        SF = self.rf.Filters
+        dev = cp.asarray(SF[k])
+        if k == "RFVideo":
+            self.d_rfvideo = dev
+        elif k == "Frfhpf_half":
+            self.d_frfhpf = dev
+        elif k == "FVideo_rfft32":
+            self.d_fvideo32 = dev                        # (P, nr) complex64
+            self.centre = float(SF["FVideo_rfft_centre"])
+            self.d_dc = cp.asarray(SF["FVideo_rfft_dc"])  # (P,) float32
+        elif k == "MTF":
+            self.d_mtf = dev
+            self._mtf_cache.clear()
+        elif k == "FcutPAL":
+            self.d_fcutpal = dev
+        # Hold the array OBJECT, not its id: CPython reuses an id once the old
+        # object is freed, so an id comparison can silently miss a filter that
+        # was replaced.  Keeping the reference makes the identity test sound.
+        self._ids[k] = SF[k]
+
+    def _resync(self):
+        """Re-upload any filter the decoder has replaced since we last looked."""
+        SF = self.rf.Filters
+        for k in self._TRACKED:
+            if k in SF and self._ids.get(k) is not SF[k]:
+                self._upload(k)
 
     def _mtf_pow(self, level):
         """MTF ** level, cached: level changes rarely (only on servo adoption)."""
@@ -150,13 +145,27 @@ class GPUDemod:
             self._mtf_cache[key] = p
         return p
 
-    def demod_batch(self, blocks, mtf_level=0.0, cut=False, use_fcutpal=False):
+    def _carriers_present(self, X):
+        """pal_audio_carriers_present() over a batch: (B,) bool."""
+        ok = cp.ones(X.shape[0], dtype=bool)
+        for (clo, chi), (l1, h1), (l2, h2) in self._carrier_slices:
+            carrier = cp.mean(cp.abs(X[:, clo:chi]) ** 2, axis=1)
+            flank = (cp.mean(cp.abs(X[:, l1:h1]) ** 2, axis=1)
+                     + cp.mean(cp.abs(X[:, l2:h2]) ** 2, axis=1)) / 2
+            ok &= ~(carrier < 5.0 * flank)
+        return ok
+
+    def demod_batch(self, blocks, mtf_level=0.0, cut=False, raw_mtf=False):
         """Demodulate a batch of raw blocks.
 
         blocks: (B, blocklen) real.  Returns a list of B dicts with "video"
         (a structured array matching demodblock's) and "rfhpf".
         """
+        rf = self.rf
         bl = self.blocklen
+        if not raw_mtf:
+            mtf_level = ((mtf_level * rf.mtf_mult + rf.mtf_offset)
+                         * rf.DecoderParams["MTF_basemult"])
         self._resync()
         x = cp.asarray(np.ascontiguousarray(blocks, dtype=np.float64))
         B = x.shape[0]
@@ -170,10 +179,15 @@ class GPUDemod:
         full[:, nr:] = cp.conj(half[:, 1:bl - nr + 1])[:, ::-1]
 
         # dropout reference: real filter x real input, so the half-spectrum
-        # inverse is exact
+        # inverse is exact.  demodblock slices it by the measured rot delay,
+        # which the decoder can recalibrate, so read it per call.
+        rotdelay = 0
+        d = getattr(rf, "delays", None)
+        if d is not None and "video_rot" in d:
+            rotdelay = int(d["video_rot"])
         rfhpf = cfft.irfft(half * self.d_frfhpf, n=bl, axis=-1)
-        rd = self.rotdelay
-        rfhpf = rfhpf[:, self.blockcut - rd:bl - self.blockcut_end - rd].astype(cp.float32)
+        rfhpf = rfhpf[:, self.blockcut - rotdelay:
+                      bl - self.blockcut_end - rotdelay].astype(cp.float32)
 
         # V4300D coherent subtract, per block, entirely on the GPU: the
         # spectrum never goes back across the bus for it
@@ -181,8 +195,12 @@ class GPUDemod:
             full = self._v4300d_batch(full)
 
         filt = full * self.d_rfvideo
-        if use_fcutpal and self.d_fcutpal is not None:
-            filt = filt * self.d_fcutpal
+        # PAL: notch the analog audio carriers out of the video path, but only
+        # on blocks where they are actually present (see demodblock)
+        if self.d_fcutpal is not None and self._carrier_slices:
+            mask = self._carriers_present(full)
+            if bool(mask.any()):
+                filt = cp.where(mask[:, None], filt * self.d_fcutpal, filt)
         if mtf_level != 0:
             filt = filt * self._mtf_pow(mtf_level)
 
@@ -197,18 +215,19 @@ class GPUDemod:
         tau = 2.0 * np.pi
         d = cp.where(d < 0.0, d + tau, d)
         demod = cp.empty((B, bl), dtype=cp.float64)
-        demod[:, 1:] = d * (self.rf.freq_hz / tau)
+        demod[:, 1:] = d * (rf.freq_hz / tau)
         demod[:, 0] = 0.0
 
-        clipped = cp.clip(demod, 1500000, self.rf.freq_hz * 0.75)
-        dfft = cfft.rfft(clipped, axis=-1)
-        # (B, 1, nr) x (P, nr) -> (B, P, bl): all video products in one call
-        vids = cfft.irfft(dfft[:, None, :] * self.d_fvideo, n=bl, axis=-1)
-
-        vids = cp.ascontiguousarray(vids.astype(cp.float32))
-        demod32 = demod.astype(cp.float32)
-        v_host = cp.asnumpy(vids)
-        d_host = cp.asnumpy(demod32)
+        # video products in single precision, as demodblock: clip, centre on
+        # blanking in float64, cast, transform, and give each channel its DC
+        # gain back on the float32 result
+        clipped = (cp.clip(demod, 1500000, rf.freq_hz * 0.75)
+                   - self.centre).astype(cp.float32)
+        dfft = cfft.rfft(clipped, axis=-1)                       # complex64
+        vids = cfft.irfft(dfft[:, None, :] * self.d_fvideo32, n=bl, axis=-1)
+        vids = vids + self.d_dc[None, :, None]                   # float32
+        v_host = cp.asnumpy(cp.ascontiguousarray(vids))
+        d_host = cp.asnumpy(demod.astype(cp.float32))
         r_host = cp.asnumpy(rfhpf)
 
         names = (["demod", "demod_raw", "demod_05", "demod_burst", "demod_pilot"]
@@ -233,6 +252,16 @@ class GPUDemod:
     # even with a kernel launch per operation this stays cheaper than sending
     # the spectrum back to the CPU and returning it.
 
+    def _rs_base(self, fit_bins, cut_bins):
+        """Cached (arange(-fit..fit), arange(-cut..cut)) for _refine_subtract."""
+        key = (fit_bins, cut_bins)
+        b = self._rs_bases.get(key)
+        if b is None:
+            b = (cp.arange(-fit_bins, fit_bins + 1),
+                 cp.arange(-cut_bins, cut_bins + 1))
+            self._rs_bases[key] = b
+        return b
+
     def _dirichlet(self, delta, N):
         """Rectangular-window transform of a unit tone at bin offset delta."""
         d = cp.asarray(delta, dtype=cp.float64)
@@ -244,22 +273,31 @@ class GPUDemod:
 
     def _refine_subtract(self, X, k, fit_bins=64, cut_bins=2048):
         N = self.blocklen
-        m = cp.arange(k - fit_bins, k + fit_bins + 1)
+        # Bases are allocated once and shifted by k: cp.arange() per call was
+        # two kernel launches per line, and this runs ~150 times per batch.
+        base = self._rs_base(fit_bins, cut_bins)
+        m = base[0] + k
         Xw = X[m]
-        grid = k + cp.linspace(-0.6, 0.6, 9)
-        E = self._dirichlet(grid[:, None] - m[None, :], N)
+        # The 9-point grid is deterministic, so host numpy gives bit-identical
+        # values without a device round trip.
+        grid_h = k + np.linspace(-0.6, 0.6, 9)
+        E = self._dirichlet(cp.asarray(grid_h)[:, None] - m[None, :], N)
         num = E.conj() @ Xw
         den = cp.sum(E.real ** 2 + E.imag ** 2, axis=1)
         mag = (num.real ** 2 + num.imag ** 2) / den
-        g = int(cp.argmax(mag))
+        # One 9-element D2H copy replaces five separate host syncs
+        # (argmax, d2, clip, grid[g], grid step).  Same float64 arithmetic,
+        # just done on the host where it costs nothing.
+        mag_h = cp.asnumpy(mag)
+        g = int(np.argmax(mag_h))
         if 0 < g < 8:
-            d2 = mag[g - 1] - 2 * mag[g] + mag[g + 1]
-            frac = float(cp.clip(0.5 * (mag[g - 1] - mag[g + 1]) / d2, -1.0, 1.0)) \
-                if float(d2) != 0.0 else 0.0
+            d2 = mag_h[g - 1] - 2 * mag_h[g] + mag_h[g + 1]
+            frac = float(np.clip(0.5 * (mag_h[g - 1] - mag_h[g + 1]) / d2,
+                                  -1.0, 1.0)) if d2 != 0.0 else 0.0
         else:
             frac = 0.0
-        fbin = float(grid[g]) + frac * float(grid[1] - grid[0])
-        mc = cp.arange(k - cut_bins, k + cut_bins + 1)
+        fbin = float(grid_h[g]) + frac * float(grid_h[1] - grid_h[0])
+        mc = base[1] + k
         Ef = self._dirichlet(fbin - m, N)
         c = cp.dot(Ef.conj(), Xw) / cp.sum(Ef.real ** 2 + Ef.imag ** 2)
         X[mc] -= c * self._dirichlet(fbin - mc, N)
