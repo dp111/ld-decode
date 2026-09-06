@@ -1417,7 +1417,17 @@ class RFDecode:
         # removable singularity at integer multiples of N (delta = 0 here)
         with np.errstate(invalid="ignore", divide="ignore"):
             mag = np.where(np.abs(den) > 1e-12, num / den, float(N))
-        return mag * np.exp(1j * np.pi * d * (N - 1) / N)
+        # exp(1j t) written as cos t + 1j sin t, straight into the result's
+        # real/imag views: bit-identical to np.exp on a pure-imaginary
+        # argument, without its complex temporaries (this kernel is built
+        # over cut_bins points per subtracted line, so it is the stage's
+        # single hottest expression)
+        theta = np.pi * d * (N - 1) / N
+        out = np.empty(theta.shape, dtype=np.complex128)
+        np.cos(theta, out=out.real)
+        np.sin(theta, out=out.imag)
+        out *= mag
+        return out
 
     def _v4300d_bases(self, fit_bins, cut_bins):
         """Cached k-independent offsets for _v4300d_refine_subtract:
