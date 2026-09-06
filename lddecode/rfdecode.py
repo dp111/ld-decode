@@ -900,7 +900,6 @@ class RFDecode:
         SF["FVideo"] = SF["FVideo"] * SF["FVideoGD"]
         self.build_video_rfft_stack()
 
-        self.build_video_rfft_stack()
 
     def build_video_eq(self, points):
         """Zero-phase magnitude EQ from (freq_hz, gain_db) anchor points.
