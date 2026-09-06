@@ -129,6 +129,7 @@ class RFDecode:
         self.downscale_sinc_lut = np.load(sinc_lut_path)["downscale_sinc_lut"]
 
         self.blocklen     = blocklen
+        self._v4300d_base_cache = {}
         self.blockcut     = 1024
         self.blockcut_end = 0
 
@@ -1046,6 +1047,18 @@ class RFDecode:
             mag = np.where(np.abs(den) > 1e-12, num / den, float(N))
         return mag * np.exp(1j * np.pi * d * (N - 1) / N)
 
+    def _v4300d_bases(self, fit_bins, cut_bins):
+        """Cached k-independent offsets for _v4300d_refine_subtract:
+        (arange(-fit..fit), arange(-cut..cut), linspace(-0.6, 0.6, 9))."""
+        key = (fit_bins, cut_bins)
+        b = self._v4300d_base_cache.get(key)
+        if b is None:
+            b = (np.arange(-fit_bins, fit_bins + 1),
+                 np.arange(-cut_bins, cut_bins + 1),
+                 np.linspace(-0.6, 0.6, 9))
+            self._v4300d_base_cache[key] = b
+        return b
+
     def _v4300d_refine_subtract(self, X, k, fit_bins=64, cut_bins=2048):
         """Refine the frequency of the tone near FFT bin k, estimate its
         complex amplitude, and subtract its spectral footprint from X in
@@ -1072,16 +1085,21 @@ class RFDecode:
         tone away from DC/Nyquist by more than cut_bins."""
         N = self.blocklen
         fpb = self.freq_hz / N
-        m = np.arange(k - fit_bins, k + fit_bins + 1)
-        Xw = X[m]
+        # The offset bases do not depend on k, so they are built once: this
+        # runs a few times per block on a V4300D capture, and np.arange of
+        # 2*cut_bins+1 per call is pure allocation.
+        base_m, base_mc, lin = self._v4300d_bases(fit_bins, cut_bins)
+        m = k + base_m
+        # A slice is a view; X[m] with an index array allocates the indices
+        # and gathers 2*fit_bins+1 complex128 out of X for no reason.
+        Xw = X[k - fit_bins : k + fit_bins + 1]
 
         # normalised least-squares projection c(f) = <X, E(f-m)> / ||E||^2
         # evaluated on a fine grid bracketing the argmax bin
-        grid = k + np.linspace(-0.6, 0.6, 9)
+        grid = k + lin
         E = self._v4300d_dirichlet(grid[:, np.newaxis] - m[np.newaxis, :])
         num = E.conj() @ Xw
         den = np.sum(E.real**2 + E.imag**2, axis=1)
-        c = num / den
         mag = (num.real**2 + num.imag**2) / den  # captured tone energy
         g = int(np.argmax(mag))
         if 0 < g < len(grid) - 1:
@@ -1092,12 +1110,15 @@ class RFDecode:
         fbin = grid[g] + frac * (grid[1] - grid[0])
 
         # amplitude at the refined frequency, then subtract its footprint
-        mc = np.arange(k - cut_bins, k + cut_bins + 1)
         Ef = self._v4300d_dirichlet(fbin - m)
         c = np.dot(Ef.conj(), Xw) / np.sum(Ef.real**2 + Ef.imag**2)
-        X[mc] -= c * self._v4300d_dirichlet(fbin - mc)
+        # Both halves are contiguous runs, so slice them in place rather than
+        # gathering and scattering through an index array; the negative-
+        # frequency half is the same run reversed.
+        cut = X[k - cut_bins : k + cut_bins + 1]
+        cut -= c * self._v4300d_dirichlet(fbin - (k + base_mc))
         # keep the spectrum that of a real signal
-        X[N - mc] = np.conj(X[mc])
+        X[N - k - cut_bins : N - k + cut_bins + 1][::-1] = np.conj(cut)
         return fbin * fpb
 
     def v4300d_coherent_subtract(self, indata_fft, maxlines=10):
