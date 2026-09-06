@@ -145,7 +145,10 @@ class TBCFrameSource(FrameSource):
         self.base = base
         self.name = os.path.basename(base)
         self.cav = cav
-        j = json.load(open(base + ".tbc.json"))
+        # .tbc.json if it is there, .tbc.db otherwise: the decoder stopped
+        # writing the JSON sidecar (bdb9865d) but decodes made either side of
+        # that are both still in circulation, so this has to take either.
+        j = _tbcmeta().load_decode_metadata(base)
         self.videoParameters = j["videoParameters"]
         self.fields = j["fields"]
         fw = self.videoParameters["fieldWidth"]
@@ -321,7 +324,8 @@ class LDFFrameSource(FrameSource):
         env = dict(os.environ, PYTHONPATH=repo)
         with open(base + ".decode.log", "wb") as log:
             subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
-        if not os.path.exists(base + ".tbc.json"):
+        if not (os.path.exists(base + ".tbc.json")
+                or os.path.exists(base + ".tbc.db")):
             # decode failed -- clean our scratch dir before bailing so a failed
             # capture doesn't leak RAM (the caller never gets to call close())
             import shutil
@@ -1150,6 +1154,16 @@ def merge_efm_sectors(efm_paths, out_data, scratch_dir=None, log=print):
         return int(np.count_nonzero(merged)), best, len(bins)
     finally:
         import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _tbcmeta():
+    """Import tbcmeta whether stack.py is run as a module (lddecode.stack) or
+    as a bare script, as _efm_pll_class does for the same reason."""
+    try:
+        from . import tbcmeta
+    except ImportError:
+        import tbcmeta
+    return tbcmeta
 
 
 def _efm_pll_class():
