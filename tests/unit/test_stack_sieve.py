@@ -155,3 +155,44 @@ def test_lockstep_reports_which_captures_carry_each_picture():
     assert sorted(out) == [1, 2, 3]
     assert sorted(out[1]) == ["A"] and sorted(out[2]) == ["A", "B"] \
         and sorted(out[3]) == ["B"]
+
+
+# ---- head window for the streaming analysis sample ------------------------
+from lddecode.stack import head_window, head_sample
+
+
+def _merged(starts, n=200):
+    """A lockstep-shaped union: (key, {name: frame}) with each capture present
+    from its own start picture."""
+    for key in range(1, n + 1):
+        fd = {name: f"{name}@{key}" for name, s in starts.items() if key >= s}
+        if fd:
+            yield key, fd
+
+
+@pytest.mark.unit
+def test_head_window_runs_until_every_capture_is_carried():
+    starts = {"a": 1, "b": 50}
+    head, nfull = head_window(_merged(starts), 2, aw=8)
+    assert nfull == 8
+    # the window extends past the single-capture opening to 8 full frames
+    assert [k for k, _ in head][-1] == 57
+    assert [k for k, _ in head][0] == 1        # and keeps the union's start
+
+
+@pytest.mark.unit
+def test_head_sample_is_drawn_only_from_fully_carried_frames():
+    starts = {"a": 1, "b": 50}
+    head, _ = head_window(_merged(starts), 2, aw=8)
+    sample = head_sample(head, 4)
+    assert len(sample) == 4
+    assert all(set(fd) == {"a", "b"} for fd in sample)
+
+
+@pytest.mark.unit
+def test_head_window_is_capped_when_captures_never_all_overlap():
+    starts = {"a": 1, "b": 10_000}
+    head, nfull = head_window(_merged(starts, n=600), 2, aw=8, cap=40)
+    assert nfull == 0 and len(head) == 40
+    # nothing better than single-capture frames exists: sample from those
+    assert len(head_sample(head, 4)) == 4

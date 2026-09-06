@@ -1399,6 +1399,47 @@ def _frame_from_fd(args):
     return _compute_frame(fd, P, hints)
 
 
+HEAD_WINDOW_CAP = 512
+
+
+def head_window(merged, nsources, aw, cap=HEAD_WINDOW_CAP):
+    """Pull the opening frames of a lockstep merge for the quality / master
+    analysis.  Returns ([(key, fd), ...], n_full).
+
+    lockstep() emits the UNION of the captures' pictures, and captures start
+    at very different pictures (1 and 50, or 222 and 385, in this collection),
+    so the first frames out of it are typically carried by the earliest
+    starting capture alone.  analyse() registers each capture against a
+    reference, which needs frames carried by at least two, and it should see
+    every capture, so the window runs until ``aw`` frames carried by ALL
+    ``nsources`` have arrived.  ``cap`` bounds the buffer (frames are held in
+    memory until the analysis is done) for a set whose captures never all
+    overlap; the window then holds whatever it has and the sample is drawn
+    from the best-covered frames in it.
+    """
+    head_buf = []
+    nfull = 0
+    for key, fd in merged:
+        head_buf.append((key, fd))
+        if len(fd) >= nsources:
+            nfull += 1
+        if nfull >= aw or len(head_buf) >= cap:
+            break
+    return head_buf, nfull
+
+
+def head_sample(head_buf, sample):
+    """Evenly spaced analysis sample from the head window, taken from the
+    frames carried by the most captures: a frame carried by one capture alone
+    can be neither registered nor scored."""
+    if not head_buf:
+        return []
+    best = max(len(fd) for _, fd in head_buf)
+    pool = [fd for _, fd in head_buf if len(fd) == best]
+    step = max(1, len(pool) // sample)
+    return pool[::step][:sample]
+
+
 def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
           cross_fill=True, masters=None, sample=24, analysis_window=None,
           max_frames=None,
@@ -1410,13 +1451,13 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
     # ---- buffer an initial window for the quality / master analysis ----
     # (live .ldf sources only know their geometry once decoding has started, so
     # pull frames first, then read videoParameters)
-    head_buf = []
-    for key, fd in merged:
-        head_buf.append((key, fd))
-        if len(head_buf) >= aw:
-            break
+    head_buf, nfull = head_window(merged, len(sources), aw)
     if not head_buf:
         raise SystemExit("no frames shared across all captures")
+    if nfull < aw:
+        log(f"[stack] head window: only {nfull} of the first {len(head_buf)} "
+            f"frames are carried by every capture (captures start at "
+            f"different pictures); analysing those")
     vp = next((s.videoParameters for s in sources
                if s.videoParameters is not None), None)
     if vp is None:
@@ -1442,8 +1483,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
                        for k in pick]
     indexed = asample is not None
     if not asample:
-        step = max(1, len(head_buf) // sample)
-        asample = [fd for _, fd in head_buf[::step][:sample]]
+        asample = head_sample(head_buf, sample)
     # Which of analyse()'s two decisions the sample can support.  Clustering by
     # sub-pixel dx is content-independent - it measures where the master laid
     # the active video down relative to sync - so the head window is as good as
