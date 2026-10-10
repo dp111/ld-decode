@@ -2909,7 +2909,7 @@ class LDdecode:
 
         acceptable_diff = 2 if self.fields_written else 0.5
 
-        if max((ire0_diff, sync_ire_diff)) > acceptable_diff:
+        if max((whitediff, ire0_diff, sync_ire_diff)) > acceptable_diff:
             hz_ire = (ire100_hz - ire0_hz) / 100
             vsync_ire = (sync_hz - ire0_hz) / hz_ire
 
