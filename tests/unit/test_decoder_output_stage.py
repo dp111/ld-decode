@@ -289,7 +289,9 @@ def test_previous_frame_metrics_are_computed_inline_without_a_pool(fp_metrics):
 
 
 def test_the_output_stage_collects_the_metrics_before_the_row(corrector):
-    it = efm_decoder()
+    it = stub_decoder(cvbs=object())  # upstream: efm_decoder() (7d6cd046, not picked)
+    it.outfile_efm = it.outfile_pre_efm = it.outfile_ac3sym = None
+    it._writeout_data = lambda *args: None
     it.digital_audio = False
     it.dbconn = object()
     rows = []

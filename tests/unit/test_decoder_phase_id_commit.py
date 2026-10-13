@@ -31,7 +31,7 @@ def commit(field, committed, phases=8):
     """commit_field up to its metadata, after the committed fields
     `committed` [(fileLoc, fieldPhaseID), ...]."""
     it = types.SimpleNamespace(
-        fname_out="out", lastvalidfield={True: None, False: None},
+        fname_out="out", lastvalidfield={True: None, False: None}, field_reg=False,
         fieldinfo=[{"fileLoc": loc, "fieldPhaseID": p} for loc, p in committed],
         rf=types.SimpleNamespace(SysParams={"fieldPhases": phases}),
         # a filler request returns before anything is written
