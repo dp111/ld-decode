@@ -3,7 +3,8 @@
 import numpy as np
 
 from .filters import inrange
-from .dsp import nb_mean, nb_median, rms, roundfloat
+from .dsp import (carrier_amplitude, nb_mean, nb_median, rms, roundfloat,
+                  tone_sideband_powers)
 
 
 def detect_levels(rf, field, output_lines):
@@ -296,6 +297,125 @@ def _metrics_fp_ntsc(metrics, f, fp):
     return metrics
 
 
+#: The FM sideband readings (burst_sideband_ratio, pilot_sideband_ratio):
+#: the lines they pool, past the vertical interval; how far in from each
+#: end of the tone the window stops, clear of its envelope's rise and fall;
+#: and how strong each sideband must stand against its noise floor (power
+#: ratio) for the field's reading to count.
+SIDEBAND_LINES = (20, 250)
+SIDEBAND_TRIM_US = 0.2
+SIDEBAND_MIN_SNR = 1.0
+
+#: Where the PAL pilot burst sits, in us from the line's sync edge: it
+#: rides the sync tip (IEC 60856-1986 9.1.2) and starts after the edge.
+PILOT_WINDOW_US = (0.8, 4.3)
+
+
+def _tone_sideband_ratio(rf, f, window_us, carrier_hz, tone_hz):
+    """H(carrier - tone) / H(carrier + tone) from a tone's two first FM
+    sidebands over the field's lines (dsp.tone_sideband_powers), or None
+    when either sideband does not clear its noise floor."""
+    b0, b1 = window_us
+    delay = int(rf.delays["video_sync"])
+    segs = []
+    for line in range(*SIDEBAND_LINES):
+        if line + f.lineoffset >= len(f.linelocs):
+            break
+        sl = f.lineslice(line, b0, b1 - b0)
+        start, stop = sl.start - delay, sl.stop - delay
+        if start >= 0 and stop <= len(f.rawdata):
+            segs.append(f.rawdata[start:stop])
+    if not segs:
+        return None
+    n = min(len(s) for s in segs)
+    powers = tone_sideband_powers(
+        np.stack([s[:n] for s in segs]), rf.freq_hz, carrier_hz, tone_hz)
+    if powers is None:
+        return None
+    lower, upper, lower_noise, upper_noise = powers
+    if (lower < SIDEBAND_MIN_SNR * lower_noise
+            or upper < SIDEBAND_MIN_SNR * upper_noise):
+        return None
+    return float(np.sqrt(lower / upper))
+
+
+def burst_sideband_ratio(rf, f):
+    """The channel's H(blanking - fsc) / H(blanking + fsc) from the colour
+    burst's two first FM sidebands, or None.
+
+    The burst is a subcarrier tone riding the blanking carrier, so its
+    sidebands stand in the readout's ratio at those two frequencies
+    whatever the burst's recorded amplitude (dsp.tone_sideband_powers):
+    the readout model's cutoff measurement (decoder checkMTF).  The upper
+    sideband lies beyond the cutoff on the innermost PAL radii, and close
+    to it on some NTSC discs; a field whose upper sideband does not clear
+    its noise floor gives no reading."""
+    b0, b1 = rf.SysParams["colorBurstUS"]
+    return _tone_sideband_ratio(
+        rf, f, (b0 + SIDEBAND_TRIM_US, b1 - SIDEBAND_TRIM_US),
+        rf.DecoderParams["ire0"], rf.SysParams["fsc_mhz"] * 1e6)
+
+
+def pilot_sideband_ratio(rf, f):
+    """The channel's H(tip - 3.75 MHz) / H(tip + 3.75 MHz) from the PAL
+    pilot burst's two first FM sidebands, or None (NTSC has no pilot).
+
+    The pilot rides the sync tip, 0.34 MHz below blanking, and is a lower
+    tone than the colour subcarrier, so its upper sideband (10.5 MHz)
+    stays under the readout's cutoff on inner radii where the burst's
+    (11.5 MHz) is gone - Domesday DD86 and the Industrial disc at 5 % of
+    their band, which the burst cannot read at all.  Its recorded
+    amplitude varies by some 3 dB between discs, which the ratio of its
+    sidebands does not see."""
+    if rf.system != "PAL":
+        return None
+    DP = rf.DecoderParams
+    return _tone_sideband_ratio(
+        rf, f, PILOT_WINDOW_US, rf.iretohz(DP["vsync_ire"]),
+        rf.SysParams["pilot_mhz"] * 1e6)
+
+
+#: Burst levels at or below this are no reading (a field with no burst,
+#: or one lost to dropouts) - the floor checkAutoDeemp already uses.
+MIN_USABLE_BURST_IRE = 5.0
+
+
+def chroma_correction_note(record, nominal_ire, db_per_unit_at_fsc, auto):
+    """The capture-notes record of the chroma level correction.
+
+    `record` is (burst IRE as written, inverse-MTF strength decoded
+    under) per written field; `db_per_unit_at_fsc` is what the inverse-MTF
+    filter adds at the subcarrier per unit of strength.  The correction is
+    written into the samples, so the notes say what it was and what the
+    burst read without it - the burst over the filter's gain at the
+    subcarrier, field by field - and the gain that would bring the burst
+    as written to nominal, for a reader that wants to apply or take out a
+    chroma gain of its own.  Medians over the usable fields; key=value
+    pairs joined by "; ", as the CVBS capture notes already are.
+    """
+    usable = [(float(b), float(s)) for b, s in record
+              if b is not None and np.isfinite(b) and b > MIN_USABLE_BURST_IRE]
+    parts = [f"chroma_correction={'auto' if auto else 'off'}"]
+    if not usable:
+        return "; ".join(parts)
+    bursts = np.array([b for b, _ in usable])
+    strengths = np.array([s for _, s in usable])
+    written = float(np.median(bursts))
+    uncorrected = float(np.median(
+        bursts / 10.0 ** (strengths * db_per_unit_at_fsc / 20.0)))
+    if auto:
+        strength = float(np.median(strengths))
+        parts.append(f"inverse_mtf_strength={strength:.3f} "
+                     f"({strengths.min():.3f}..{strengths.max():.3f})")
+        parts.append(f"inverse_mtf_gain_at_fsc_db={strength * db_per_unit_at_fsc:.2f}")
+    parts.append(f"median_burst_ire={written:.2f}")
+    if auto:
+        parts.append(f"median_burst_ire_uncorrected={uncorrected:.2f}")
+    parts.append(f"nominal_burst_ire={nominal_ire:.2f}")
+    parts.append(f"chroma_gain_to_nominal={nominal_ire / written:.4f}")
+    return "; ".join(parts)
+
+
 def computeMetrics(rf, f, fp=None, verbose=False, verboseVITS=False):
     system = f.rf.system
     if verboseVITS:
@@ -310,6 +430,7 @@ def computeMetrics(rf, f, fp=None, verbose=False, verboseVITS=False):
 
     # FIXME: these should probably be computed in the Field class
     f.whitesnr_slice = None
+    white_carrier = None
 
     for wl in f.rf.SysParams["LD_VITS_whitelocs"]:
         wl_slice = f.lineslice_tbc(*wl)
@@ -328,6 +449,7 @@ def computeMetrics(rf, f, fp=None, verbose=False, verboseVITS=False):
                 - int(rf.delays["video_white"])
             ]
             metrics["whiteRFLevel"] = np.std(rawdata)
+            white_carrier = carrier_amplitude(rawdata, rf.freq_hz)
 
             break
 
@@ -337,6 +459,7 @@ def computeMetrics(rf, f, fp=None, verbose=False, verboseVITS=False):
     delay = int(rf.delays["video_sync"])
     bl_sliceraw = slice(bl_slice.start - delay, bl_slice.stop - delay)
     metrics["blackLineRFLevel"] = np.std(f.rawdata[bl_sliceraw])
+    black_carrier = carrier_amplitude(f.rawdata[bl_sliceraw], rf.freq_hz)
 
     metrics["blackLinePreTBCIRE"] = rf.hztoire(
         np.mean(f.data["video"]["demod"][bl_slice])
@@ -354,6 +477,19 @@ def computeMetrics(rf, f, fp=None, verbose=False, verboseVITS=False):
         metrics["blackToWhiteRFRatio"] = (
             metrics["blackLineRFLevel"] / metrics["whiteRFLevel"]
         )
+        # The same ratio from the carrier alone (noise, the audio carriers
+        # and EFM taken out), which is the readout's own tilt between the
+        # blanking and white carriers: the readout MTF model's measure of
+        # the disc's cutoff (decoder.checkMTF).
+        if white_carrier and black_carrier:
+            metrics["carrierTiltRatio"] = black_carrier / white_carrier
+
+    if getattr(rf, "mtf_model", "poles") == "readout":
+        for key, reading in (("burstSidebandRatio", burst_sideband_ratio),
+                             ("pilotSidebandRatio", pilot_sideband_ratio)):
+            ratio = reading(rf, f)
+            if ratio is not None:
+                metrics[key] = ratio
 
     return _round_metrics(
         metrics, metrics.keys() if verbose else DEFAULT_OUTPUT_KEYS
@@ -414,12 +550,15 @@ def computeMetricsFP(rf, f, fp, base_metrics, verbose=False):
 ITS_FLATNESS_FRACTION = 0.15
 
 # 2T reference layouts: (bar, baseline, pulse) windows in us and the VITS
-# lines to search.  PAL: CCIR ITS (line 19, both parities).  NTSC: NTC-7
-# composite (line 20, first fields; the second-field combination signal at
-# the same line has no full bar and is rejected by the validity checks).
+# lines to search, in order.  PAL: CCIR ITS (line 19, both parities).
+# NTSC: NTC-7 composite (line 20, first fields; the second-field
+# combination signal at the same line has no full bar and is rejected by
+# the validity checks).  Pioneer's GGV discs carry NTC-7 on line 13
+# instead, searched last so that it is only read when lines 20 and 19
+# have no 2T pulse to give.
 _VITS_2T_LAYOUT = {
     "PAL": ((13.0, 19.0), (22.2, 24.4), (24.4, 26.4), (19, 18, 20)),
-    "NTSC": ((18.0, 28.0), (31.0, 33.0), (33.0, 35.0), (20, 19)),
+    "NTSC": ((18.0, 28.0), (31.0, 33.0), (33.0, 35.0), (20, 19, 13)),
 }
 
 
@@ -510,6 +649,37 @@ def measure_its_2t_ratio(field, lines=None):
     return None
 
 
+#: The ITS / NTC-7 white bar's level above blanking, in IRE (100 IRE is
+#: the PAL ITS's 700 mV as well as NTC-7's white reference).
+ITS_WHITE_NOMINAL_IRE = 100.0
+
+
+def measure_its_white_level(field, lines=None):
+    """The insertion test signal's white bar above its blanking baseline,
+    in IRE, or None.
+
+    Read only from the line measure_its_2t_ratio accepts as the ITS (a
+    flat bar over a blanking baseline with an isolated 2T pulse after
+    it), so a bright content line cannot pass for it, and from the same
+    bar and baseline windows (_VITS_2T_LAYOUT).  The baseline is
+    subtracted, so a blanking-level offset does not read as a gain.
+
+    Returns (level_ire, line) on success, else None.
+    """
+    found = measure_its_2t_ratio(field, lines)
+    if found is None:
+        return None
+    line = found[1]
+    bar_win, base_win, _, _ = _VITS_2T_LAYOUT[field.rf.system]
+
+    def median(a, b):
+        sl = field.lineslice_tbc(line, a, b - a)
+        return float(np.median(field.output_to_ire(
+            field.dspicture[sl].astype(np.float64))))
+
+    return median(*bar_win) - median(*base_win), line
+
+
 def _multiburst_window_scan(y, fs_mhz, W, step):
     """Single-tone windows along a VBI line: (freq_hz, amp_ire_pp, start).
 
@@ -552,24 +722,92 @@ def _multiburst_window_scan(y, fs_mhz, W, step):
     return list(zip(freqs.tolist(), pp.tolist(), starts.tolist()))
 
 
+def _packet_interior(y, freq_hz, fs_mhz, lo, hi):
+    """(start, stop) of the steady part of the freq_hz packet in y[lo:hi].
+
+    The windows the scan accepts for a packet run past both its ends -
+    a window hanging into the gap after it is still mostly tone - so
+    their span is not the packet.  The packet is where its own envelope
+    is: the line demodulated at freq_hz and averaged over whole cycles
+    (about 12 samples), the longest run at 70 % or more of the envelope's
+    90th percentile, less an eighth of its length (and half the averaging
+    length) at each end for the edges' transients.  None if under 16
+    samples are left.  Fitting over the accepted windows' span less a
+    fifth at each end took in the gap after short packets: NTSC FCC's
+    2.0 MHz packet read 0.7 dB low against its 1.25 MHz reference, and
+    its 4.1 MHz packet up to 2 dB low.
+    """
+    lo, hi = max(0, lo), min(len(y), hi)
+    seg = y[lo:hi]
+    if len(seg) < 16:
+        return None
+    per = fs_mhz * 1e6 / freq_hz
+    length = max(4, int(round(per * max(1, round(12 / per)))))
+    n = np.arange(lo, hi)
+    bb = (seg - np.median(seg)) * np.exp(-2j * np.pi * freq_hz / (fs_mhz * 1e6) * n)
+    env = 2.0 * np.abs(np.convolve(bb, np.ones(length) / length, "same"))
+    on = env >= 0.7 * np.percentile(env, 90)
+    best = (0, 0, 0)
+    run = start = 0
+    for i, v in enumerate(on):
+        if v:
+            if run == 0:
+                start = i
+            run += 1
+            if run > best[0]:
+                best = (run, start, i + 1)
+        else:
+            run = 0
+    run, a, b = best
+    trim = max(length // 2, run // 8)
+    a, b = a + trim, b - trim
+    return (lo + a, lo + b) if b - a >= 16 else None
+
+
+def _rising_run(fitted):
+    """The longest subsequence of (position, freq, amp), in line order,
+    whose frequency rises strictly: a multiburst's packets.  Returned as
+    (freq, amp) pairs.  Earliest wins a tie."""
+    n = len(fitted)
+    if not n:
+        return []
+    length, prev = [1] * n, [-1] * n
+    for i in range(n):
+        for j in range(i):
+            if fitted[j][1] < fitted[i][1] and length[j] + 1 > length[i]:
+                length[i], prev[i] = length[j] + 1, j
+    i = max(range(n), key=lambda k: (length[k], -k))
+    out = []
+    while i >= 0:
+        out.append((fitted[i][1], fitted[i][2]))
+        i = prev[i]
+    return out[::-1]
+
+
 def measure_vits_multiburst(field, lines=None):
     """One-line VITS multiburst from a VBI line, or None.
 
     PAL (first fields): GGV carries one on line 13 (0.5-5.8 MHz
-    packets), the Louvre disc on line 20 (0.6-5.9 MHz).  NTSC (both
-    parities): the FCC multiburst some discs carry on line 22
-    (1.25-4.1 MHz).  The NTC-7 combination multiburst (line 20 second
-    fields) is deliberately NOT used: its packets are only ~3 us — as
-    short as the scan window at NTSC 4fsc — so nearly every window
-    straddles a packet edge and the amplitude fit under-reads by up to
-    2.5 dB (measured on he010/issue176), with the wrong sign vs the
-    averaged-field analysis measurement.  Returns (packets, line)
-    where packets is a list of
-    (freq_hz, amp_ire_pp) for at least 4 packets at monotonically
-    increasing frequencies including a reference packet near 1 MHz.
-    Validity checks reject picture content and plain reference lines,
-    so discs without a multiburst line yield None and the EQ servo
-    stays inactive.
+    packets), the Louvre disc on line 20 (0.6-5.9 MHz).  NTSC: the FCC
+    multiburst some discs carry on line 22 (1.25-4.1 MHz, both
+    parities), and failing that the NTC-7 combination multiburst
+    (0.5-4.2 MHz, second fields, on line 13 or 20).  Returns
+    (packets, line) where packets is a list of (freq_hz, amp_ire_pp)
+    for at least 4 packets at monotonically increasing frequencies
+    including a reference packet near 1 MHz.  Validity checks reject
+    picture content and plain reference lines, so discs without a
+    multiburst line yield None and the EQ servo stays inactive.
+
+    The packets taken are the longest run along the line that rises in
+    frequency (_rising_run): NTC-7's three-level chrominance follows its
+    4.2 MHz packet at the subcarrier frequency, and without that its
+    largest bar was taken for the 3.58 MHz packet (+4 dB).  The NTC-7
+    line had been left out because the fit over the scan windows' span
+    under-read its ~3 us packets by up to 2.5 dB; over their own
+    interiors its 2.0-4.2 MHz packets agree with the conformance checker
+    to 0.3 dB on the GGV and Video Essentials pressings.  The ~2.5 us
+    packets of some discs (dolby-surround) leave under 16 samples of
+    interior and are refused.
     """
     if field.dspicture is None:
         return None
@@ -579,7 +817,8 @@ def measure_vits_multiburst(field, lines=None):
         if lines is None:
             lines = (13, 20)
     elif lines is None:
-        lines = (22,)
+        lines = ((22,) if getattr(field, "isFirstField", True)
+                 else (22, 13, 20))
     fs_mhz = field.rf.SysParams["outfreq"]
     for line in lines:
         try:
@@ -598,26 +837,40 @@ def measure_vits_multiburst(field, lines=None):
         cands.sort()
         groups = []
         for f, a, i0 in cands:
-            if groups and f - groups[-1][0][-1] < 0.3e6:
+            # Against the group's median, not its last member: windows
+            # straddling the gap between two packets read a frequency in
+            # between, and chained one packet into the next (NTSC FCC's
+            # 3.58 and 4.1 MHz fitted as one 4.05 MHz packet across the
+            # gap, 2 dB low).
+            if groups and abs(f - np.median(groups[-1][0])) < 0.3e6:
                 groups[-1][0].append(f)
                 groups[-1][2].append(i0)
             else:
                 groups.append(([f], a, [i0]))
-        packets = []
+        # A group's windows split where they stop being contiguous along
+        # the line: one frequency can occur twice (NTC-7's subcarrier
+        # packet and its chrominance bars).
+        runs = []
         for fl, _, il in groups:
-            if len(fl) < 2:
-                continue
+            order = np.argsort(il)
+            fl = [fl[i] for i in order]
+            il = [il[i] for i in order]
+            start = 0
+            for k in range(1, len(il) + 1):
+                if k == len(il) or il[k] - il[k - 1] > W:
+                    if k - start >= 2:
+                        runs.append((fl[start:k], il[start:k]))
+                    start = k
+        fitted = []
+        for fl, il in runs:
             fmed = float(np.median(fl))
             # amplitude from a least-squares sine fit over the packet's
-            # central span: unbiased for any (non-integer) cycle count,
+            # steady interior: unbiased for any (non-integer) cycle count,
             # unlike the per-window rms the scan uses
-            lo, hi = min(il), max(il) + W
-            span = hi - lo
-            lo += span // 5
-            hi -= span // 5
-            seg = y[lo:hi]
-            if len(seg) < 24:
+            extent = _packet_interior(y, fmed, fs_mhz, min(il), max(il) + W)
+            if extent is None:
                 continue
+            seg = y[extent[0]:extent[1]]
             t = 2 * np.pi * fmed / (fs_mhz * 1e6) * np.arange(len(seg))
             A = np.column_stack([np.sin(t), np.cos(t), np.ones(len(seg))])
             coef, *_ = np.linalg.lstsq(A, seg, rcond=None)
@@ -626,7 +879,8 @@ def measure_vits_multiburst(field, lines=None):
             resid = seg - A @ coef
             if np.var(resid) > 0.35 * np.var(seg - seg.mean()):
                 continue
-            packets.append((fmed, amp))
+            fitted.append((extent[0], fmed, amp))
+        packets = _rising_run(sorted(fitted))
         if len(packets) < 4:
             continue
         freqs = [p[0] for p in packets]

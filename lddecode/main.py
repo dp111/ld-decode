@@ -107,6 +107,25 @@ def build_parser():
         help="sample encoding preset for CVBS output "
         "(default: CVBS_U10_4FSC for PAL, CVBS_U16_4FSC for NTSC)",
     )
+    # The legacy origin is the default for now, while readers built to
+    # that layout catch up with the spec's 0H-aligned frames.
+    parser.add_argument(
+        "--cvbs-legacy-origin",
+        dest="cvbs_legacy_origin",
+        action="store_true",
+        default=True,
+        help="keep the decoder's own line origin in CVBS output, as written "
+        "before frames were 0H-aligned (NTSC 0H 0.3-1.9 samples after "
+        "sample 0), for readers built to that layout; not spec compliant, "
+        "and noted in the .meta capture_notes (default)",
+    )
+    parser.add_argument(
+        "--cvbs-spec-origin",
+        dest="cvbs_legacy_origin",
+        action="store_false",
+        help="0H-align CVBS frames as the specification requires: 0H of "
+        "each frame's line 0 in the sample before sample 0",
+    )
     # parser.add_argument('-c', '--cut', dest='cut', action='store_true', help='cut (to r16) instead of decode')
     parser.add_argument(
         "-m",
@@ -122,6 +141,23 @@ def build_parser():
         type=float,
         default=0,
         help="mtf compensation offset",
+    )
+    parser.add_argument(
+        "--no_mtf_servo",
+        action="store_true",
+        help="Do not adapt the MTF level from the 2T pulse; keep the level the "
+        "RF black-to-white ratio gives (the readout MTF model, NTSC's "
+        "default, never runs the servo)",
+    )
+    parser.add_argument(
+        "--calibration_frames",
+        metavar="frames",
+        type=int,
+        default=0,
+        help="Run a calibration pass: decode at least this many frames ahead "
+        "to settle the calibration servos (MTF, chroma, video EQ, chroma DG) "
+        "before the first frame is written; 10 is a good choice (default 0: "
+        "no pass, write as soon as they are stable)",
     )
     parser.add_argument(
         "-t",
@@ -318,14 +354,40 @@ def build_parser():
              "(on by default; they flatten the multiburst response markedly "
              "on Domesday - see decoder.py)",
     )
+
+    parser.add_argument(
+        "--no_auto_chroma",
+        dest="auto_chroma",
+        action="store_false",
+        default=True,
+        help="Disable the automatic chroma level correction (the inverse-MTF "
+             "chroma filter, its strength set from the colour burst and "
+             "bounded by the VITS multiburst).  The chroma is then written as "
+             "the filter chain demodulates it, and the burst level measured "
+             "is recorded in the output's capture notes either way",
+    )
+
+    parser.add_argument(
+        "--vits_white_level",
+        dest="vits_white_level",
+        action="store_true",
+        default=False,
+        help="Scale the luminance so that the VITS white bar (the PAL ITS's, "
+             "NTSC's NTC-7) reads 100 IRE: corrects a disc mastered a "
+             "percent or so hot or cold.  Applied at write time to the "
+             "TBC and CVBS outputs; sync, burst and chroma are left as "
+             "they are.  No effect on discs without that bar",
+    )
+
     parser.add_argument(
         "--no_chroma_dg",
         dest="chroma_dg",
         action="store_false",
         default=True,
         help="Disable the chroma differential gain/phase servo (measured "
-             "from the VITS modulated staircase, corrected on the TBC and "
-             "CVBS outputs at write time; PAL only)",
+             "from the VITS modulated staircase - the PAL ITS, NTSC's NTC-7 "
+             "composite - and corrected on the TBC and CVBS outputs at "
+             "write time)",
     )
 
     parser.add_argument(
@@ -355,6 +417,16 @@ def build_parser():
         help="Coherently estimate and subtract the LD-V4300D's 8.4672mhz "
         "digital-audio clock spur and its +-88.2khz satellites. "
         "Self-disabling on captures without the spur. PAL only.",
+    )
+
+    parser.add_argument(
+        "--audio_carrier_cancel",
+        dest="audio_carrier_cancel",
+        action="store_true",
+        default=False,
+        help="Prototype: subtract the analog audio carriers' intermodulation "
+        "lines (2.30 and 2.81 MHz) from NTSC video, fitted per block to the "
+        "carriers' own phase.  NTSC only.",
     )
 
     parser.add_argument(
@@ -404,7 +476,9 @@ def build_parser():
         metavar="deemp_str",
         type=float,
         default=None,
-        help="Strength of deemphasis (default: 1.0; disables auto inverse-MTF chroma calibration)",
+        help="Strength of deemphasis (default: NTSC 0.96, PAL 1.0; giving one "
+             "also stops the burst from setting the inverse-MTF chroma "
+             "strength, see --no_auto_chroma)",
     )
 
     parser.add_argument(
@@ -572,10 +646,14 @@ def build_options(args):
         "efm_eq_taps": args.efm_eq_taps,
         "deemp_coeff": (args.deemp_low, args.deemp_high),
         "deemp_str": args.deemp_strength if args.deemp_strength is not None else (1.0 if args.pal else 0.96),
-        "auto_deemp": args.deemp_strength is None,
+        "auto_deemp": args.auto_chroma and args.deemp_strength is None,
+        "auto_chroma": args.auto_chroma,
         "chroma_dg": args.chroma_dg,
+        "calibration_frames": max(0, args.calibration_frames),
+        "vits_white_level": args.vits_white_level,
         "MTF_level": args.MTF,
         "MTF_offset": args.MTF_offset,
+        "mtf_servo": not args.no_mtf_servo,
         # parse_frequency gives MHz; the audio filters take Hz
         "audio_filterwidth": (
             args.audio_filterwidth * 1000000 if args.audio_filterwidth is not None else None
@@ -600,6 +678,9 @@ def build_options(args):
         # deferral unnecessary, so both switches enable the same filter and
         # parallel demod stays available.
         extra_options["PAL_V4300D_CoherentSubtract"] = True
+
+    if vid_standard == "NTSC" and args.audio_carrier_cancel:
+        extra_options["AudioCarrierCancel"] = True
 
     if vid_standard == "PAL" and args.AC3:
         print("ERROR: AC3 audio decoding is only supported for NTSC")
@@ -631,6 +712,7 @@ def build_options(args):
             extra_options["cvbs_black_level"] = 240
         if args.cvbs_encoding:
             extra_options["cvbs_encoding"] = args.cvbs_encoding
+        extra_options["cvbs_legacy_origin"] = args.cvbs_legacy_origin
 
     DecoderParamsOverride = {}
     if args.vbpf_low is not None:

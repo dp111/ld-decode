@@ -123,6 +123,12 @@ def test_the_cvbs_encoding_is_passed_through():
     assert exit_info.value.code == 2
 
 
+def test_cvbs_keeps_the_legacy_line_origin_unless_asked_for_the_spec_one():
+    assert extra("--cvbs")["cvbs_legacy_origin"] is True
+    assert extra("--cvbs", "--cvbs-legacy-origin")["cvbs_legacy_origin"] is True
+    assert extra("--cvbs", "--cvbs-spec-origin")["cvbs_legacy_origin"] is False
+
+
 # --- system selection ---------------------------------------------------
 
 
@@ -235,6 +241,23 @@ def test_an_explicit_deemphasis_strength_disarms_the_servo():
     assert result["auto_deemp"] is False
 
 
+def test_the_chroma_correction_is_on_unless_turned_off():
+    """--no_auto_chroma stops the inverse-MTF chroma correction outright -
+    the burst servo and the multiburst's bound on it - and leaves the
+    de-emphasis strength at its default."""
+    assert extra()["auto_chroma"] is True
+    assert extra()["auto_deemp"] is True
+
+    off = extra("--no_auto_chroma")
+    assert off["auto_chroma"] is False
+    assert off["auto_deemp"] is False
+    assert off["deemp_str"] == 0.96
+
+    # an explicit strength still disarms the burst servo alone
+    chosen = extra("--deemp_strength", "0.8")
+    assert chosen["auto_chroma"] is True and chosen["auto_deemp"] is False
+
+
 def test_the_deemphasis_time_constants_are_passed_as_a_pair():
     result = extra("--deemp_low", "1.3", "--deemp_high", "4.7")
 
@@ -298,6 +321,24 @@ def test_the_colour_notch_filter_applies_to_ntsc_only():
     assert "NTSC_ColorNotchFilter" not in extra("-p", "-N")
 
 
+def test_the_audio_carrier_canceller_is_opt_in_and_ntsc_only():
+    assert "AudioCarrierCancel" not in extra()
+    assert extra("--audio_carrier_cancel")["AudioCarrierCancel"] is True
+    assert "AudioCarrierCancel" not in extra("-p", "--audio_carrier_cancel")
+
+
+def test_the_vits_white_level_servo_is_opt_in():
+    assert extra()["vits_white_level"] is False
+    assert extra("--vits_white_level")["vits_white_level"] is True
+
+
+def test_the_calibration_pass_is_off_unless_asked_for():
+    assert extra()["calibration_frames"] == 0
+    assert extra("--calibration_frames", "10")["calibration_frames"] == 10
+    assert extra("--calibration_frames", "25")["calibration_frames"] == 25
+    assert extra("--calibration_frames", "-3")["calibration_frames"] == 0
+
+
 def test_lowband_selects_the_reduced_bandwidth_parameter_set():
     assert "lowband" not in extra()
     assert extra("--lowband")["lowband"] is True
@@ -350,6 +391,11 @@ def test_the_mtf_controls_reach_the_decoder():
 
     assert result["MTF_level"] == 1.4
     assert result["MTF_offset"] == 0.5
+
+
+def test_the_mtf_servo_runs_unless_switched_off():
+    assert extra()["mtf_servo"] is True
+    assert extra("--no_mtf_servo")["mtf_servo"] is False
 
 
 def test_the_diagnostic_outputs_are_off_by_default():

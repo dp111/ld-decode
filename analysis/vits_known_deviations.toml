@@ -39,33 +39,19 @@
 # with the same flag the sweep uses, or the ceilings will not survive the
 # journey; see cmake_modules/LdDecodeTests.cmake.
 
-
-# dolby-surround-side1-inner (NTSC): 2 of its checks fail.
+# dolby-surround-side1-inner (NTSC): 1 of its checks fails.
 
 [[deviation]]
 capture = "dolby-surround-side1-inner"
 check = "ntsc-ntc7-composite/pulse_2t"
 field_line = 20
 parity = "first"
-measured = 96.339
+measured = 90.537
 unit = "IRE"
-band_used = 1.83
-ceiling = 2.01
+band_used = 4.73
+ceiling = 5.20
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-
-
-[[deviation]]
-capture = "dolby-surround-side1-inner"
-check = "gain_ratio/NTSC"
-parity = "first"
-measured = 0.216
-unit = "ratio"
-band_used = 1.58
-ceiling = 1.74
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
 
 
 # dolby-surround-side1-middle (NTSC): 2 of its checks fail.
@@ -75,10 +61,10 @@ capture = "dolby-surround-side1-middle"
 check = "ntsc-ntc7-composite/pulse_2t"
 field_line = 20
 parity = "first"
-measured = 92.154
+measured = 91.997
 unit = "IRE"
-band_used = 3.92
-ceiling = 4.32
+band_used = 4.00
+ceiling = 4.40
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
@@ -87,39 +73,51 @@ capture = "dolby-surround-side1-middle"
 check = "ntsc-ntc7-composite/pulse_12t5_luma"
 field_line = 20
 parity = "first"
-measured = 48.140
+measured = 48.239
 unit = "IRE"
-band_used = 1.24
-ceiling = 1.36
+band_used = 1.17
+ceiling = 1.29
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
-# dolby-surround-side1-outer (NTSC): 1 of its checks fails.
+
+# dolby-surround-side1-outer (NTSC): 2 of its checks fail.
 
 [[deviation]]
 capture = "dolby-surround-side1-outer"
 check = "ntsc-ntc7-composite/pulse_2t"
 field_line = 20
 parity = "first"
-measured = 91.630
+measured = 91.200
 unit = "IRE"
-band_used = 4.18
-ceiling = 4.60
+band_used = 4.40
+ceiling = 4.84
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
+[[deviation]]
+capture = "dolby-surround-side1-outer"
+check = "gain_ratio/NTSC"
+parity = "first"
+measured = 0.187
+unit = "ratio"
+band_used = 1.34
+ceiling = 1.48
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
 
-# domesday-ds1-community-north-outer (PAL): 4 of its checks fail.
+
+# domesday-ds1-community-north-outer (PAL): 5 of its checks fail.
 
 [[deviation]]
 capture = "domesday-ds1-community-north-outer"
 check = "pal-its-field1/pulse_2t"
 field_line = 19
 parity = "first"
-measured = 88.166
+measured = 88.599
 unit = "IRE"
-band_used = 4.15
-ceiling = 4.57
+band_used = 3.98
+ceiling = 4.38
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
@@ -128,10 +126,10 @@ capture = "domesday-ds1-community-north-outer"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 11.706
+measured = 12.397
 unit = "IRE"
-band_used = 4.25
-ceiling = 4.68
+band_used = 4.09
+ceiling = 4.50
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -140,48 +138,49 @@ capture = "domesday-ds1-community-north-outer"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -7.432
+measured = -6.976
 unit = "dB"
-band_used = 5.95
-ceiling = 6.54
+band_used = 5.58
+ceiling = 6.14
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
+
+[[deviation]]
+capture = "domesday-ds1-community-north-outer"
+check = "pal-multiburst-field1/packet_4/response"
+field_line = 20
+parity = "first"
+measured = 1.381
+unit = "dB"
+band_used = 1.11
+ceiling = 1.22
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Where in the opening fields the 2T servo takes its second step.  The warm-up now writes once the fields decoded at the servo's level agree with it - 7 frames here, where it used to run its 20-frame budget - and the first frame goes out with the same parameters as before (MTF -0.610, chroma strength 0.000).  The pool the decode then carries is smaller, so the servo's step to -1.0 lands at field 6 rather than field 12, inside the four fields per parity the conformance average reads, and the extra HF lift reads at 4.0 MHz (1.07 dB before).  See docs/technical/vits-servos.md, \"Calibrating before the first frame\"."
 
 [[deviation]]
 capture = "domesday-ds1-community-north-outer"
 check = "pal-its-field2/pulse_2t"
 field_line = 19
 parity = "second"
-measured = 92.814
+measured = 92.417
 unit = "IRE"
-band_used = 2.29
-ceiling = 2.52
+band_used = 2.45
+ceiling = 2.69
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
 
-
-[[deviation]]
-capture = "domesday-ds2-community-north-inner"
-check = "pal-multiburst-field1/packet_5"
-field_line = 20
-parity = "first"
-measured = 43.890
-unit = "IRE"
-band_used = 3.23
-ceiling = 3.55
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+# domesday-ds2-community-north-inner (PAL): 3 of its checks fail.
 
 [[deviation]]
 capture = "domesday-ds2-community-north-inner"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 8.412
+measured = 8.682
 unit = "IRE"
-band_used = 5.02
-ceiling = 5.52
+band_used = 4.96
+ceiling = 5.45
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md.  Re-recorded when the chroma blowout on this capture was fixed: the earlier figure was read off a decode whose whole chroma band ran +3.6 dB at 4.0 MHz and +4.0 dB at 4.8, and the same boost was lifting this packet by about 6 dB with it.  With the band levelled (packets 1-5 now flat within 0.6 dB) what is left is the disc's own band-edge loss, unflattered; the correction that levelled the band is measured at the subcarrier and the inverse-MTF curve it rides deepens above it, so 5.8 MHz gets 7.8 dB of a cut worth 4.6 dB at 4.43."
 
@@ -190,52 +189,37 @@ capture = "domesday-ds2-community-north-inner"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -10.292
+measured = -10.067
 unit = "dB"
-band_used = 8.23
-ceiling = 9.06
+band_used = 8.05
+ceiling = 8.86
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\".  Re-recorded when the chroma blowout on this capture was fixed: the earlier figure was read off a decode whose whole chroma band ran +3.6 dB at 4.0 MHz and +4.0 dB at 4.8, and the same boost was lifting this packet by about 6 dB with it.  With the band levelled (packets 1-5 now flat within 0.6 dB) what is left is the disc's own band-edge loss, unflattered; the correction that levelled the band is measured at the subcarrier and the inverse-MTF curve it rides deepens above it, so 5.8 MHz gets 7.8 dB of a cut worth 4.6 dB at 4.43."
 
-
-
-[[deviation]]
-capture = "domesday-ds2-community-north-inner"
-check = "pal-its-field2/pulse_2t"
-field_line = 19
-parity = "second"
-measured = 97.928
-unit = "IRE"
-band_used = 1.19
-ceiling = 1.31
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\".  Listed when the chroma blowout on this capture was fixed: the inverse-MTF cut that levelled the band lowers a 2T pulse as surely as a boost lifts one, and the servo divides the filter's effect out of its own measurement rather than out of the output.  The pair is better centred than it was - the two fields read 100.95 and 97.93 against a 7.5 IRE spread before - but the second field now sits just outside its band rather than just inside."
 
 [[deviation]]
 capture = "domesday-ds2-community-north-inner"
 check = "pal-multiburst-field2/chroma_bar_100"
 field_line = 20
 parity = "second"
-measured = 65.926
+measured = 42.695
 unit = "IRE"
-band_used = 2.45
-ceiling = 2.70
+band_used = 1.12
+ceiling = 1.24
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+reason = "The chroma strength the first frame is written at.  The warm-up now waits for the 2T servo to settle at -1.0 and writes after 14.5 frames, with the multiburst chroma-band ceiling at -1.428; the 20-frame warm-up it replaced let the ceiling trim on to -1.293 first, and the bar read 43.84.  The ceiling relaxes to -1.359 a few fields into the decode, inside the fields the conformance average reads.  See docs/technical/vits-servos.md, \"Calibrating before the first frame\"."
 
-
-
-# domesday-ds2-community-north-middle (PAL): 5 of its checks fail.
+# domesday-ds2-community-north-middle (PAL): 9 of its checks fail.
 
 [[deviation]]
 capture = "domesday-ds2-community-north-middle"
 check = "pal-its-field1/pulse_2t"
 field_line = 19
 parity = "first"
-measured = 80.278
+measured = 88.212
 unit = "IRE"
-band_used = 8.11
-ceiling = 8.92
+band_used = 4.93
+ceiling = 5.42
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\". Worst of the family: the optical MTF curve correction costs the 2T pulse about a third more band on the Domesday PAL cuts that carry this line, 3.19 to 4.15 on ds1-outer and 5.97 to 8.11 here; see docs/technical/vits-servos.md, \"The curve the correction rides\"."
 
@@ -244,62 +228,108 @@ capture = "domesday-ds2-community-north-middle"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 12.633
+measured = 14.020
 unit = "IRE"
-band_used = 4.04
-ceiling = 4.44
+band_used = 3.72
+ceiling = 4.09
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "domesday-ds2-community-north-middle"
+check = "pal-multiburst-field1/packet_4/response"
+field_line = 20
+parity = "first"
+measured = 1.715
+unit = "dB"
+band_used = 1.37
+ceiling = 1.51
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "BBC Domesday DD86-DS2 sits at the thresholds of three coupled loops - the 2T servo's MTF level, the multiburst EQ and the inverse-MTF chroma-band ceiling.  Reading the multiburst packets over their own steady interior (metrics._packet_interior) moves the EQ's 2 MHz anchor and the ceiling by a few hundredths of a dB here, and that is enough to send the 2T servo to its -1.0 limit at middle radius (the extra pre-demod HF lift reads at 4-4.8 MHz and in the chrominance) and the ceiling 0.03 strength units lower at outer radius.  The inner cut moves the other way and passes three checks it failed.  See docs/technical/vits-servos.md."
+
+[[deviation]]
+capture = "domesday-ds2-community-north-middle"
+check = "pal-multiburst-field1/packet_5/response"
+field_line = 20
+parity = "first"
+measured = 1.513
+unit = "dB"
+band_used = 1.21
+ceiling = 1.33
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The 2T servo, the multiburst EQ and the inverse-MTF chroma-band ceiling are three coupled loops on BBC Domesday DD86-DS2, and the 4.0 and 4.8 MHz packets straddling the subcarrier read with the chrominance.  With each field pooled once (decoder.pool_reading) the 2T servo stops at -0.86 at middle radius, where it used to run to its -1.0 limit, and the chroma strength fed forward with it leaves the chroma band 0.47 dB higher: the 4.8 MHz packet reads 1.51 dB over the 1 MHz reference where it read 1.06.  See docs/technical/vits-servos.md."
 
 [[deviation]]
 capture = "domesday-ds2-community-north-middle"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -6.45
+measured = -5.651
 unit = "dB"
-band_used = 5.16
-ceiling = 5.68
+band_used = 4.52
+ceiling = 4.97
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
 
 [[deviation]]
 capture = "domesday-ds2-community-north-middle"
-check = "pal-its-field2/pulse_2t"
+check = "pal-its-field2/staircase_subcarrier/differential_gain"
 field_line = 19
 parity = "second"
-measured = 95.716
-unit = "IRE"
-band_used = 1.98
-ceiling = 2.17
+measured = 0.119
+unit = "fraction"
+band_used = 1.13
+ceiling = 1.24
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 2"
+reason = "The DG corrector's PAL estimator reads this cut's slope at +0.0012 to +0.0013/IRE, under the 0.0015 at which PAL engages, so it is left uncorrected; the conformance checker's own fit puts it nearer the limit, the under-read the engage threshold allows for on GGV1011.  It passed only while each servo's pool held the calibration pass's fields twice, which carried the median over the line.  See docs/technical/vits-servos.md, \"4. Chroma differential gain and phase\"."
+
+[[deviation]]
+capture = "domesday-ds2-community-north-middle"
+check = "pal-multiburst-field2/ceiling/saturation"
+field_line = 20
+parity = "second"
+measured = 108.339
+unit = "percent"
+band_used = 1.07
+ceiling = 1.18
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-
+reason = "BBC Domesday DD86-DS2 sits at the thresholds of three coupled loops - the 2T servo's MTF level, the multiburst EQ and the inverse-MTF chroma-band ceiling.  Reading the multiburst packets over their own steady interior (metrics._packet_interior) moves the EQ's 2 MHz anchor and the ceiling by a few hundredths of a dB here, and that is enough to send the 2T servo to its -1.0 limit at middle radius (the extra pre-demod HF lift reads at 4-4.8 MHz and in the chrominance) and the ceiling 0.03 strength units lower at outer radius.  The inner cut moves the other way and passes three checks it failed.  See docs/technical/vits-servos.md."
 
 [[deviation]]
 capture = "domesday-ds2-community-north-middle"
 check = "pal-multiburst-field2/chroma_nonlinearity"
 field_line = 20
 parity = "second"
-measured = 0.111
+measured = 0.123
 unit = "fraction"
-band_used = 1.11
-ceiling = 1.22
+band_used = 1.23
+ceiling = 1.35
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 2"
 reason = "Chrominance gain is not constant across the amplitudes the multiburst presents."
 
-# domesday-ds2-community-north-outer (PAL): 7 of its checks fail.
+[[deviation]]
+capture = "domesday-ds2-community-north-middle"
+check = "gain_ratio/PAL"
+parity = "second"
+measured = 0.328
+unit = "ratio"
+band_used = 1.29
+ceiling = 1.42
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The 2T servo, the multiburst EQ and the inverse-MTF chroma-band ceiling are three coupled loops on BBC Domesday DD86-DS2, and the colour bars against the luminance bar read where they settle.  With each field pooled once (decoder.pool_reading) the 2T servo stops at -0.86 at middle radius, where it used to run to its -1.0 limit; the chroma strength takes 3.23 dB per MTF unit fed forward at every adoption, so the 0.14 it no longer travels leaves the chrominance 0.47 dB higher, 0.311 to 0.328 against the 0.300 nominal.  See docs/technical/vits-servos.md."
+
+
+# domesday-ds2-community-north-outer (PAL): 8 of its checks fail.
 
 [[deviation]]
 capture = "domesday-ds2-community-north-outer"
 check = "pal-its-field1/pulse_2t"
 field_line = 19
 parity = "first"
-measured = 92.369
+measured = 92.268
 unit = "IRE"
-band_used = 2.60
-ceiling = 2.86
+band_used = 2.64
+ceiling = 2.90
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
@@ -308,10 +338,10 @@ capture = "domesday-ds2-community-north-outer"
 check = "pal-its-field1/pulse_20t_luma"
 field_line = 19
 parity = "first"
-measured = 55.096
+measured = 53.683
 unit = "IRE"
-band_used = 2.27
-ceiling = 2.5
+band_used = 1.70
+ceiling = 1.87
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
@@ -320,10 +350,10 @@ capture = "domesday-ds2-community-north-outer"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 16.295
+measured = 16.382
 unit = "IRE"
-band_used = 3.19
-ceiling = 3.51
+band_used = 3.17
+ceiling = 3.48
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -332,10 +362,10 @@ capture = "domesday-ds2-community-north-outer"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -4.295
+measured = -4.249
 unit = "dB"
-band_used = 3.44
-ceiling = 3.78
+band_used = 3.40
+ceiling = 3.74
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
 
@@ -344,21 +374,31 @@ capture = "domesday-ds2-community-north-outer"
 check = "pal-its-field2/pulse_2t"
 field_line = 19
 parity = "second"
-measured = 87.844
+measured = 87.501
 unit = "IRE"
-band_used = 4.45
-ceiling = 4.90
+band_used = 4.59
+ceiling = 5.04
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
-
+[[deviation]]
+capture = "domesday-ds2-community-north-outer"
+check = "pal-multiburst-field2/chroma_bar_60"
+field_line = 20
+parity = "second"
+measured = 25.361
+unit = "IRE"
+band_used = 1.03
+ceiling = 1.13
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "BBC Domesday DD86-DS2 sits at the thresholds of three coupled loops - the 2T servo's MTF level, the multiburst EQ and the inverse-MTF chroma-band ceiling.  Reading the multiburst packets over their own steady interior (metrics._packet_interior) moves the EQ's 2 MHz anchor and the ceiling by a few hundredths of a dB here, and that is enough to send the 2T servo to its -1.0 limit at middle radius (the extra pre-demod HF lift reads at 4-4.8 MHz and in the chrominance) and the ceiling 0.03 strength units lower at outer radius.  The inner cut moves the other way and passes three checks it failed.  See docs/technical/vits-servos.md."
 
 [[deviation]]
 capture = "domesday-ds2-community-north-outer"
 check = "pal-multiburst-field2/chroma_bar_100"
 field_line = 20
 parity = "second"
-measured = 41.364
+measured = 41.377
 unit = "IRE"
 band_used = 1.33
 ceiling = 1.46
@@ -371,8 +411,8 @@ check = "gain_ratio/PAL"
 parity = "second"
 measured = 0.262
 unit = "ratio"
-band_used = 1.75
-ceiling = 1.92
+band_used = 1.78
+ceiling = 1.96
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
 
@@ -384,10 +424,10 @@ capture = "ggv1011-side1-inner"
 check = "pal-multiburst-field1/packet_6"
 field_line = 13
 parity = "first"
-measured = 11.211
+measured = 10.782
 unit = "IRE"
-band_used = 4.37
-ceiling = 4.81
+band_used = 4.47
+ceiling = 4.92
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -396,10 +436,10 @@ capture = "ggv1011-side1-inner"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 13
 parity = "first"
-measured = -7.686
+measured = -8.025
 unit = "dB"
-band_used = 6.15
-ceiling = 6.76
+band_used = 6.42
+ceiling = 7.06
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
 
@@ -408,7 +448,7 @@ capture = "ggv1011-side1-inner"
 check = "pal-blanked-field1/blanked"
 field_line = 22
 parity = "first"
-measured = 1.105
+measured = 1.107
 unit = "IRE"
 band_used = 1.11
 ceiling = 1.22
@@ -420,10 +460,10 @@ capture = "ggv1011-side1-inner"
 check = "pal-its-field2/staircase_subcarrier/differential_gain"
 field_line = 19
 parity = "second"
-measured = 0.134
+measured = 0.106
 unit = "fraction"
-band_used = 1.28
-ceiling = 1.40
+band_used = 1.01
+ceiling = 1.11
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 2"
 reason = "Chrominance amplitude varies with the luminance it rides on, measured on the modulated staircase."
 
@@ -432,7 +472,7 @@ capture = "ggv1011-side1-inner"
 check = "pal-blanked-field2/blanked"
 field_line = 22
 parity = "second"
-measured = 1.165
+measured = 1.166
 unit = "IRE"
 band_used = 1.17
 ceiling = 1.28
@@ -447,10 +487,10 @@ capture = "ggv1011-side1-middle"
 check = "pal-multiburst-field1/packet_6"
 field_line = 13
 parity = "first"
-measured = 10.544
+measured = 10.156
 unit = "IRE"
-band_used = 4.52
-ceiling = 4.98
+band_used = 4.61
+ceiling = 5.08
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -459,10 +499,10 @@ capture = "ggv1011-side1-middle"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 13
 parity = "first"
-measured = -8.401
+measured = -8.725
 unit = "dB"
-band_used = 6.72
-ceiling = 7.39
+band_used = 6.98
+ceiling = 7.68
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
 
@@ -471,7 +511,7 @@ capture = "ggv1011-side1-middle"
 check = "pal-its-field1/white_reference_bar"
 field_line = 19
 parity = "first"
-measured = 97.375
+measured = 97.370
 unit = "IRE"
 band_used = 1.05
 ceiling = 1.16
@@ -483,7 +523,7 @@ capture = "ggv1011-side1-middle"
 check = "pal-blanked-field1/blanked"
 field_line = 22
 parity = "first"
-measured = 1.095
+measured = 1.093
 unit = "IRE"
 band_used = 1.09
 ceiling = 1.20
@@ -495,7 +535,7 @@ capture = "ggv1011-side1-middle"
 check = "pal-its-field2/white_reference_bar"
 field_line = 19
 parity = "second"
-measured = 97.430
+measured = 97.428
 unit = "IRE"
 band_used = 1.03
 ceiling = 1.13
@@ -507,7 +547,7 @@ capture = "ggv1011-side1-middle"
 check = "pal-blanked-field2/blanked"
 field_line = 22
 parity = "second"
-measured = 1.082
+measured = 1.085
 unit = "IRE"
 band_used = 1.08
 ceiling = 1.19
@@ -522,10 +562,10 @@ capture = "ggv1011-side1-outer"
 check = "pal-multiburst-field1/packet_6"
 field_line = 13
 parity = "first"
-measured = 10.679
+measured = 10.561
 unit = "IRE"
-band_used = 4.49
-ceiling = 4.94
+band_used = 4.52
+ceiling = 4.97
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -534,10 +574,10 @@ capture = "ggv1011-side1-outer"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 13
 parity = "first"
-measured = -8.426
+measured = -8.523
 unit = "dB"
-band_used = 6.74
-ceiling = 7.42
+band_used = 6.82
+ceiling = 7.50
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
 
@@ -558,10 +598,10 @@ capture = "ggv1011-side1-outer"
 check = "pal-its-field2/white_reference_bar"
 field_line = 19
 parity = "second"
-measured = 97.416
+measured = 97.422
 unit = "IRE"
 band_used = 1.03
-ceiling = 1.14
+ceiling = 1.13
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
 
@@ -570,7 +610,7 @@ capture = "ggv1011-side1-outer"
 check = "pal-blanked-field2/blanked"
 field_line = 22
 parity = "second"
-measured = 1.101
+measured = 1.099
 unit = "IRE"
 band_used = 1.10
 ceiling = 1.21
@@ -578,228 +618,356 @@ owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 2"
 reason = "Content is left on lines IEC 60856-1986 9.1.3 requires blanked, around 1.1 IRE of it."
 
 
-# ggv1069-side1-inner (NTSC): 7 of its checks fail.
+# ggv1069-side1-inner (NTSC): 17 of its checks fail.
 
 [[deviation]]
 capture = "ggv1069-side1-inner"
-check = "ntsc-ntc7-composite/pulse_2t"
-field_line = 13
-parity = "first"
-measured = 105.499
-unit = "IRE"
-band_used = 2.75
-ceiling = 3.02
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-
-
-[[deviation]]
-capture = "ggv1069-side1-inner"
-check = "ntsc-fcc-multiburst/packet_6"
+check = "ntsc-fcc-multiburst/packet_3"
 field_line = 22
 parity = "first"
-measured = 25.965
-unit = "IRE"
-band_used = 1.01
-ceiling = 1.11
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
-
-[[deviation]]
-capture = "ggv1069-side1-inner"
-check = "ntsc-fcc-multiburst/packet_6"
-field_line = 23
-parity = "first"
-measured = 25.937
-unit = "IRE"
-band_used = 1.02
-ceiling = 1.12
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
-
-[[deviation]]
-capture = "ggv1069-side1-inner"
-check = "ntsc-fcc-multiburst/packet_6"
-field_line = 24
-parity = "first"
-measured = 25.973
-unit = "IRE"
-band_used = 1.01
-ceiling = 1.11
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
-
-[[deviation]]
-capture = "ggv1069-side1-inner"
-check = "gain_ratio/NTSC"
-parity = "first"
-measured = 0.214
-unit = "ratio"
-band_used = 1.42
-ceiling = 1.56
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
-
-[[deviation]]
-capture = "ggv1069-side1-inner"
-check = "ntsc-fcc-multiburst/packet_6"
-field_line = 22
-parity = "second"
-measured = 25.912
-unit = "IRE"
-band_used = 1.02
-ceiling = 1.12
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
-
-[[deviation]]
-capture = "ggv1069-side1-inner"
-check = "ntsc-fcc-multiburst/packet_6"
-field_line = 23
-parity = "second"
-measured = 25.546
-unit = "IRE"
-band_used = 1.11
-ceiling = 1.22
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
-
-
-# ggv1069-side1-middle (NTSC): 2 of its checks fail.
-
-[[deviation]]
-capture = "ggv1069-side1-middle"
-check = "ntsc-ntc7-composite/pulse_2t"
-field_line = 13
-parity = "first"
-measured = 103.046
-unit = "IRE"
-band_used = 1.52
-ceiling = 1.68
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-[[deviation]]
-capture = "ggv1069-side1-middle"
-check = "gain_ratio/NTSC"
-parity = "first"
-measured = 0.218
-unit = "ratio"
-band_used = 1.75
-ceiling = 1.93
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
-
-
-# ggv1069-side1-outer (NTSC): 2 of its checks fail.
-
-[[deviation]]
-capture = "ggv1069-side1-outer"
-check = "ntsc-ntc7-composite/pulse_2t"
-field_line = 13
-parity = "first"
-measured = 103.284
-unit = "IRE"
-band_used = 1.64
-ceiling = 1.81
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-[[deviation]]
-capture = "ggv1069-side1-outer"
-check = "gain_ratio/NTSC"
-parity = "first"
-measured = 0.218
-unit = "ratio"
-band_used = 1.80
-ceiling = 1.98
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
-
-
-# ggv1069-side1-ldv4300d-inner (NTSC): 10 of its checks fail.
-
-[[deviation]]
-capture = "ggv1069-side1-ldv4300d-inner"
-check = "ntsc-ntc7-composite/pulse_2t"
-field_line = 13
-parity = "first"
-measured = 105.842
-unit = "IRE"
-band_used = 2.92
-ceiling = 3.21
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-[[deviation]]
-capture = "ggv1069-side1-ldv4300d-inner"
-check = "ntsc-ntc7-composite/chroma_reference/differential_phase"
-field_line = 13
-parity = "first"
-measured = 5.368
-unit = "degrees"
-band_used = 1.07
-ceiling = 1.18
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 2"
-reason = "Chrominance phase varies with the luminance it rides on, measured on the modulated staircase."
-
-[[deviation]]
-capture = "ggv1069-side1-ldv4300d-inner"
-check = "ntsc-fcc-multiburst/packet_6"
-field_line = 22
-parity = "first"
-measured = 25.787
+measured = 25.789
 unit = "IRE"
 band_used = 1.05
 ceiling = 1.16
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 22
+parity = "first"
+measured = 25.536
+unit = "IRE"
+band_used = 1.12
+ceiling = 1.23
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 22
+parity = "first"
+measured = 25.228
+unit = "IRE"
+band_used = 1.19
+ceiling = 1.31
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 23
+parity = "first"
+measured = 25.870
+unit = "IRE"
+band_used = 1.03
+ceiling = 1.14
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 23
+parity = "first"
+measured = 25.245
+unit = "IRE"
+band_used = 1.19
+ceiling = 1.31
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 24
+parity = "first"
+measured = 25.951
+unit = "IRE"
+band_used = 1.01
+ceiling = 1.11
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 24
+parity = "first"
+measured = 25.810
+unit = "IRE"
+band_used = 1.05
+ceiling = 1.15
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 24
+parity = "first"
+measured = 25.196
+unit = "IRE"
+band_used = 1.20
+ceiling = 1.32
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 22
+parity = "second"
+measured = 25.881
+unit = "IRE"
+band_used = 1.03
+ceiling = 1.13
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 22
+parity = "second"
+measured = 25.219
+unit = "IRE"
+band_used = 1.20
+ceiling = 1.31
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 23
+parity = "second"
+measured = 25.786
+unit = "IRE"
+band_used = 1.05
+ceiling = 1.16
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 23
+parity = "second"
+measured = 25.352
+unit = "IRE"
+band_used = 1.16
+ceiling = 1.28
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 23
+parity = "second"
+measured = 24.757
+unit = "IRE"
+band_used = 1.31
+ceiling = 1.44
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_2"
+field_line = 24
+parity = "second"
+measured = 25.950
+unit = "IRE"
+band_used = 1.01
+ceiling = 1.11
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 24
+parity = "second"
+measured = 25.742
+unit = "IRE"
+band_used = 1.06
+ceiling = 1.17
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 24
+parity = "second"
+measured = 25.864
+unit = "IRE"
+band_used = 1.03
+ceiling = 1.14
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 24
+parity = "second"
+measured = 25.323
+unit = "IRE"
+band_used = 1.17
+ceiling = 1.29
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+
+# ggv1069-side1-ldv4300d-inner (NTSC): 21 of its checks fail.
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 22
+parity = "first"
+measured = 25.628
+unit = "IRE"
+band_used = 1.09
+ceiling = 1.20
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 22
+parity = "first"
+measured = 25.393
+unit = "IRE"
+band_used = 1.15
+ceiling = 1.27
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 22
+parity = "first"
+measured = 25.057
+unit = "IRE"
+band_used = 1.24
+ceiling = 1.36
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-inner"
-check = "ntsc-fcc-multiburst/packet_3/response"
+check = "ntsc-fcc-multiburst/packet_2"
 field_line = 23
 parity = "first"
-measured = 0.773
-unit = "dB"
-band_used = 1.03
-ceiling = 1.13
+measured = 25.919
+unit = "IRE"
+band_used = 1.02
+ceiling = 1.12
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "In-band multiburst flatness, the residual the video EQ servo leaves inside the band it anchors. The radius baseline recorded NTSC flatness at 0.46x of its allowance from ggv1069-side1-inner alone; a second capture of the same disc puts it over, which is the reading a one-capture row could not produce. See docs/technical/vits-radius-baseline.md, \"What the baseline says\"."
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 23
+parity = "first"
+measured = 25.575
+unit = "IRE"
+band_used = 1.11
+ceiling = 1.22
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_6"
+field_line = 23
+parity = "first"
+measured = 25.561
+unit = "IRE"
+band_used = 1.11
+ceiling = 1.22
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_2"
+field_line = 24
+parity = "first"
+measured = 25.928
+unit = "IRE"
+band_used = 1.02
+ceiling = 1.12
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 24
+parity = "first"
+measured = 25.004
+unit = "IRE"
+band_used = 1.25
+ceiling = 1.37
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 24
+parity = "first"
+measured = 25.936
+unit = "IRE"
+band_used = 1.02
+ceiling = 1.12
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-inner"
 check = "ntsc-fcc-multiburst/packet_6"
 field_line = 24
 parity = "first"
-measured = 25.544
+measured = 24.912
 unit = "IRE"
-band_used = 1.11
-ceiling = 1.23
+band_used = 1.27
+ceiling = 1.40
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-inner"
-check = "gain_ratio/NTSC"
-parity = "first"
-measured = 0.219
-unit = "ratio"
-band_used = 1.85
-ceiling = 2.04
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 22
+parity = "second"
+measured = 25.292
+unit = "IRE"
+band_used = 1.18
+ceiling = 1.29
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-inner"
-check = "ntsc-ntc7-combination/chroma_zone_3"
-field_line = 13
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 22
 parity = "second"
-measured = 45.566
+measured = 25.514
 unit = "IRE"
-band_used = 1.11
-ceiling = 1.22
+band_used = 1.12
+ceiling = 1.23
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
 
@@ -808,88 +976,137 @@ capture = "ggv1069-side1-ldv4300d-inner"
 check = "ntsc-fcc-multiburst/packet_6"
 field_line = 22
 parity = "second"
-measured = 25.795
+measured = 24.773
 unit = "IRE"
-band_used = 1.05
-ceiling = 1.16
+band_used = 1.31
+ceiling = 1.44
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_2"
+field_line = 23
+parity = "second"
+measured = 25.849
+unit = "IRE"
+band_used = 1.04
+ceiling = 1.14
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 23
+parity = "second"
+measured = 24.897
+unit = "IRE"
+band_used = 1.28
+ceiling = 1.40
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 23
+parity = "second"
+measured = 25.444
+unit = "IRE"
+band_used = 1.14
+ceiling = 1.25
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-inner"
 check = "ntsc-fcc-multiburst/packet_6"
 field_line = 23
 parity = "second"
-measured = 25.401
+measured = 24.360
 unit = "IRE"
-band_used = 1.15
-ceiling = 1.26
+band_used = 1.41
+ceiling = 1.55
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_2"
+field_line = 24
+parity = "second"
+measured = 25.653
+unit = "IRE"
+band_used = 1.09
+ceiling = 1.20
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 24
+parity = "second"
+measured = 25.246
+unit = "IRE"
+band_used = 1.19
+ceiling = 1.31
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv1069-side1-ldv4300d-inner"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 24
+parity = "second"
+measured = 25.944
+unit = "IRE"
+band_used = 1.01
+ceiling = 1.12
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-inner"
 check = "ntsc-fcc-multiburst/packet_6"
 field_line = 24
 parity = "second"
-measured = 25.769
+measured = 24.941
 unit = "IRE"
-band_used = 1.06
-ceiling = 1.16
+band_used = 1.26
+ceiling = 1.39
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
 
-# ggv1069-side1-ldv4300d-middle (NTSC): 2 of its checks fail.
-
-[[deviation]]
-capture = "ggv1069-side1-ldv4300d-middle"
-check = "ntsc-ntc7-composite/pulse_2t"
-field_line = 13
-parity = "first"
-measured = 102.438
-unit = "IRE"
-band_used = 1.22
-ceiling = 1.34
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
+# ggv1069-side1-ldv4300d-middle (NTSC): 1 of its checks fails.
 
 [[deviation]]
 capture = "ggv1069-side1-ldv4300d-middle"
 check = "gain_ratio/NTSC"
 parity = "first"
-measured = 0.225
+measured = 0.217
 unit = "ratio"
-band_used = 2.46
-ceiling = 2.70
+band_used = 1.67
+ceiling = 1.84
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
 
 
-# ggv1069-side1-ldv4300d-outer (NTSC): 2 of its checks fail.
+# ggv1069-side1-outer (NTSC): 1 of its checks fails.
 
 [[deviation]]
-capture = "ggv1069-side1-ldv4300d-outer"
+capture = "ggv1069-side1-outer"
 check = "ntsc-ntc7-composite/pulse_2t"
 field_line = 13
 parity = "first"
-measured = 102.351
+measured = 102.163
 unit = "IRE"
-band_used = 1.18
-ceiling = 1.29
+band_used = 1.08
+ceiling = 1.19
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
-
-[[deviation]]
-capture = "ggv1069-side1-ldv4300d-outer"
-check = "gain_ratio/NTSC"
-parity = "first"
-measured = 0.216
-unit = "ratio"
-band_used = 1.59
-ceiling = 1.75
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own."
 
 
 # industrial-lv-side1-inner (PAL): 5 of its checks fail.
@@ -899,10 +1116,10 @@ capture = "industrial-lv-side1-inner"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 11.568
+measured = 11.803
 unit = "IRE"
-band_used = 4.29
-ceiling = 4.72
+band_used = 4.23
+ceiling = 4.66
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -911,10 +1128,10 @@ capture = "industrial-lv-side1-inner"
 check = "pal-multiburst-field1/packet_6/frequency"
 field_line = 20
 parity = "first"
-measured = 6.033
+measured = 6.030
 unit = "MHz"
-band_used = 1.71
-ceiling = 1.88
+band_used = 1.69
+ceiling = 1.86
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Centre frequency of a packet the decoder has already lost roughly 8 dB of, so it is the band-edge loss recorded on the same packet's level and response showing up in the estimate rather than a fault of its own. This disc is the first PAL_MULTIBURST_IEC pressing in testdata/ - packets 1 to 5 land within 0.07 MHz of the IEC set - and its top packet reads 6.03 MHz against the 5.8 MHz nominal, consistently at all three radii. analysis/vits_reference.py already records two top nominals 0.1 MHz apart across two pressings; a third is what tells a disc nominal from a measurement bias, and that separation is the work this entry waits on."
 
@@ -923,35 +1140,36 @@ capture = "industrial-lv-side1-inner"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -7.921
+measured = -7.868
 unit = "dB"
-band_used = 6.34
-ceiling = 6.97
+band_used = 6.29
+ceiling = 6.92
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
-
-[[deviation]]
-capture = "industrial-lv-side1-inner"
-check = "gain_ratio/PAL"
-parity = "second"
-measured = 0.278
-unit = "ratio"
-band_used = 1.00
-ceiling = 1.11
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own.  This capture has always sat on the line - 0.2791 against a 0.2785 limit - and the chroma differential-gain corrector moved it the last 0.0007 across.  The corrector anchors at the nominal 50 IRE the chroma reference rides on, where its gain is exactly 1; this capture's grey pedestal decodes at 51.1 IRE, so the reference sees 0.22 percent of correction it was meant to be exempt from.  Bought for differential gain 0.208 -> 0.008 and differential phase 6.7 -> 3.1 degrees on the same field, so the trade is not close; closing this entry means anchoring the corrector on the measured pedestal rather than the nominal, which couples it to the luma level servo."
 
 [[deviation]]
 capture = "industrial-lv-side1-inner"
 check = "pal-its-field2/pulse_2t"
 field_line = 19
 parity = "second"
-measured = 97.010
+measured = 98.006
 unit = "IRE"
-band_used = 1.39
-ceiling = 1.52
+band_used = 1.02
+ceiling = 1.12
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
+
+[[deviation]]
+capture = "industrial-lv-side1-inner"
+check = "gain_ratio/PAL"
+parity = "second"
+measured = 0.277
+unit = "ratio"
+band_used = 1.06
+ceiling = 1.16
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Luminance and chrominance are not scaled by the same factor, so the ratio between the colour bar and its luminance reference is out even where each level passes on its own.  This capture has always sat on the line - 0.2791 against a 0.2785 limit - and the chroma differential-gain corrector moved it the last 0.0007 across.  The corrector anchors at the nominal 50 IRE the chroma reference rides on, where its gain is exactly 1; this capture's grey pedestal decodes at 51.1 IRE, so the reference sees 0.22 percent of correction it was meant to be exempt from.  Bought for differential gain 0.208 -> 0.008 and differential phase 6.7 -> 3.1 degrees on the same field, so the trade is not close; closing this entry means anchoring the corrector on the measured pedestal rather than the nominal, which couples it to the luma level servo."
+
 
 # industrial-lv-side1-middle (PAL): 4 of its checks fail.
 
@@ -960,10 +1178,10 @@ capture = "industrial-lv-side1-middle"
 check = "pal-its-field1/pulse_2t"
 field_line = 19
 parity = "first"
-measured = 97.691
+measured = 97.745
 unit = "IRE"
-band_used = 1.07
-ceiling = 1.17
+band_used = 1.05
+ceiling = 1.15
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\". Crossed when clb_findbursts stopped counting empty crossing slots, which corrected this disc's PAL sequence labelling by four fields, so the file now opens on frame 1 and the averaged fields are different ones."
 
@@ -972,10 +1190,10 @@ capture = "industrial-lv-side1-middle"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 11.055
+measured = 10.836
 unit = "IRE"
-band_used = 4.41
-ceiling = 4.85
+band_used = 4.46
+ceiling = 4.90
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -996,36 +1214,25 @@ capture = "industrial-lv-side1-middle"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -8.592
+measured = -8.743
 unit = "dB"
-band_used = 6.87
-ceiling = 7.56
+band_used = 6.99
+ceiling = 7.69
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
 
-# industrial-lv-side1-outer (PAL): 4 of its checks fail.
 
-[[deviation]]
-capture = "industrial-lv-side1-outer"
-check = "pal-its-field2/pulse_2t"
-field_line = 19
-parity = "second"
-measured = 102.771
-unit = "IRE"
-band_used = 1.13
-ceiling = 1.24
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\". Crossed when clb_findbursts stopped counting empty crossing slots, which corrected this disc's PAL sequence labelling by four fields, so the file now opens on frame 1 and the averaged fields are different ones."
+# industrial-lv-side1-outer (PAL): 4 of its checks fail.
 
 [[deviation]]
 capture = "industrial-lv-side1-outer"
 check = "pal-multiburst-field1/packet_6"
 field_line = 20
 parity = "first"
-measured = 10.976
+measured = 11.749
 unit = "IRE"
-band_used = 4.42
-ceiling = 4.87
+band_used = 4.24
+ceiling = 4.67
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
 
@@ -1034,10 +1241,10 @@ capture = "industrial-lv-side1-outer"
 check = "pal-multiburst-field1/packet_6/frequency"
 field_line = 20
 parity = "first"
-measured = 6.032
+measured = 6.027
 unit = "MHz"
-band_used = 1.71
-ceiling = 1.88
+band_used = 1.67
+ceiling = 1.84
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Centre frequency of a packet the decoder has already lost roughly 8 dB of, so it is the band-edge loss recorded on the same packet's level and response showing up in the estimate rather than a fault of its own. This disc is the first PAL_MULTIBURST_IEC pressing in testdata/ - packets 1 to 5 land within 0.07 MHz of the IEC set - and its top packet reads 6.03 MHz against the 5.8 MHz nominal, consistently at all three radii. analysis/vits_reference.py already records two top nominals 0.1 MHz apart across two pressings; a third is what tells a disc nominal from a measurement bias, and that separation is the work this entry waits on."
 
@@ -1046,12 +1253,24 @@ capture = "industrial-lv-side1-outer"
 check = "pal-multiburst-field1/packet_6/response"
 field_line = 20
 parity = "first"
-measured = -8.640
+measured = -8.013
 unit = "dB"
-band_used = 6.91
-ceiling = 7.60
+band_used = 6.41
+ceiling = 7.05
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Frequency response above the band the video EQ servo anchors, where no servo acts and the reading is the static filter chain's. PAL loses roughly 7-8 dB at 5.8 MHz at every radius; see docs/technical/vits-radius-baseline.md, \"The top multiburst packet, and what is left of it\"."
+
+[[deviation]]
+capture = "industrial-lv-side1-outer"
+check = "pal-its-field2/pulse_2t"
+field_line = 19
+parity = "second"
+measured = 103.147
+unit = "IRE"
+band_used = 1.28
+ceiling = 1.41
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\". Crossed when clb_findbursts stopped counting empty crossing slots, which corrected this disc's PAL sequence labelling by four fields, so the file now opens on frame 1 and the averaged fields are different ones.  Re-recorded (102.64 to 103.15) when the warm-up began writing once the 2T servo's level reads back as itself, after 7 frames instead of its 20-frame budget: the first frame carries the same parameters (MTF -0.118), but the smaller pool the decode carries on with takes one more servo step, to -0.225, at field 6, inside the averaged fields.  See docs/technical/vits-servos.md, \"Calibrating before the first frame\"."
 
 
 # The two captures below are not radius cuts.  They are whole captures from
@@ -1061,30 +1280,29 @@ reason = "Frequency response above the band the video EQ servo anchors, where no
 # on one cut says nothing about whether its allowance holds.  Entries here
 # are read exactly as the radius ones are.
 
-
-# ggv-ntsc-mb-v2800 (NTSC): 5 of its checks fail.
+# ggv-ntsc-mb-v2800 (NTSC): 16 of its checks fail.
 
 [[deviation]]
 capture = "ggv-ntsc-mb-v2800"
-check = "ntsc-ntc7-composite/pulse_2t"
-field_line = 13
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 22
 parity = "first"
-measured = 103.527
+measured = 25.301
 unit = "IRE"
-band_used = 1.76
-ceiling = 1.94
+band_used = 1.17
+ceiling = 1.29
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
 
 [[deviation]]
 capture = "ggv-ntsc-mb-v2800"
 check = "ntsc-fcc-multiburst/packet_4"
 field_line = 22
 parity = "first"
-measured = 25.729
+measured = 24.577
 unit = "IRE"
-band_used = 1.07
-ceiling = 1.17
+band_used = 1.36
+ceiling = 1.49
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
 
@@ -1093,19 +1311,7 @@ capture = "ggv-ntsc-mb-v2800"
 check = "ntsc-fcc-multiburst/packet_6"
 field_line = 22
 parity = "first"
-measured = 25.470
-unit = "IRE"
-band_used = 1.13
-ceiling = 1.25
-owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
-
-[[deviation]]
-capture = "ggv-ntsc-mb-v2800"
-check = "ntsc-fcc-multiburst/packet_6"
-field_line = 24
-parity = "first"
-measured = 25.529
+measured = 25.515
 unit = "IRE"
 band_used = 1.12
 ceiling = 1.23
@@ -1114,27 +1320,171 @@ reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour 
 
 [[deviation]]
 capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 23
+parity = "first"
+measured = 25.294
+unit = "IRE"
+band_used = 1.18
+ceiling = 1.29
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 23
+parity = "first"
+measured = 25.790
+unit = "IRE"
+band_used = 1.05
+ceiling = 1.16
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 24
+parity = "first"
+measured = 25.356
+unit = "IRE"
+band_used = 1.16
+ceiling = 1.28
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 24
+parity = "first"
+measured = 25.001
+unit = "IRE"
+band_used = 1.25
+ceiling = 1.37
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
 check = "ntsc-fcc-multiburst/packet_6"
 field_line = 24
+parity = "first"
+measured = 25.519
+unit = "IRE"
+band_used = 1.12
+ceiling = 1.23
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_2"
+field_line = 22
 parity = "second"
-measured = 25.766
+measured = 25.996
+unit = "IRE"
+band_used = 1.00
+ceiling = 1.10
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 22
+parity = "second"
+measured = 25.274
+unit = "IRE"
+band_used = 1.18
+ceiling = 1.30
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 22
+parity = "second"
+measured = 25.399
+unit = "IRE"
+band_used = 1.15
+ceiling = 1.27
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_2"
+field_line = 23
+parity = "second"
+measured = 25.771
 unit = "IRE"
 band_used = 1.06
 ceiling = 1.16
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
-reason = "Chroma path gain. The PAL multiburst's chrominance packets and colour bars read high, and the 5.8 MHz packet reads low because the top of the band is lost before it is measured; see docs/technical/vits-radius-baseline.md."
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 23
+parity = "second"
+measured = 25.170
+unit = "IRE"
+band_used = 1.21
+ceiling = 1.33
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 23
+parity = "second"
+measured = 25.686
+unit = "IRE"
+band_used = 1.08
+ceiling = 1.19
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_3"
+field_line = 24
+parity = "second"
+measured = 25.756
+unit = "IRE"
+band_used = 1.06
+ceiling = 1.17
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "The FCC multiburst is recorded low on the GGV pressings: the 1.25 MHz reference packet reads 25.7-26.4 IRE against 30, and the 2.0 MHz packet 24.9-26.0 with it - level with the reference to 0.15 dB, so its packet_3/response passes.  The video EQ had lifted 2 MHz by 1.6 dB on a multiburst fit that read that packet 0.7 dB low against the reference, and the lift carried it over its floor; read over its own steady interior (metrics._packet_interior) it asks for 0.4-0.7 dB.  The colour bars on GGV discs are recorded about 14 % low as well."
+
+[[deviation]]
+capture = "ggv-ntsc-mb-v2800"
+check = "ntsc-fcc-multiburst/packet_4"
+field_line = 24
+parity = "second"
+measured = 25.597
+unit = "IRE"
+band_used = 1.10
+ceiling = 1.21
+owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
+reason = "Chroma path gain on NTSC: the FCC multiburst's chrominance packets and the NTC-7 combination's chrominance zones read low against their nominals, where the PAL sweep records the same path reading high; see docs/technical/vits-radius-baseline.md."
 
 
-# ve-monitor (NTSC): 1 of its checks fail.
+# ve-monitor (NTSC): 1 of its checks fails.
 
 [[deviation]]
 capture = "ve-monitor"
 check = "ntsc-ntc7-composite/pulse_2t"
 field_line = 20
 parity = "first"
-measured = 97.310
+measured = 97.726
 unit = "IRE"
-band_used = 1.34
-ceiling = 1.48
+band_used = 1.14
+ceiling = 1.25
 owner = "docs-planning/vits-conformance-testing-plan.md Phase 8 task 5"
 reason = "The 2T pulse and the luminance references it is judged against. Worst allowance in the radius baseline on both systems, and it grows outwards; see docs/technical/vits-radius-baseline.md, \"The 2T pulse was judged against the wrong reference\"."

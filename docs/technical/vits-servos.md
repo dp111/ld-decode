@@ -24,6 +24,32 @@ Trims are adopted "tolerantly" — handed to future decode jobs without
 re-decoding in-flight fields — because a dead-band step changes chroma
 by under 2%.
 
+The boost is applied to the demodulated composite, so it lifts whatever
+shares the chroma band with the chroma, luminance detail and noise
+included. On NTSC the curve is held flat above the top of the chroma
+band (`inverse_mtf_hold_hz`, 4.2 MHz). PAL holds nothing, because its
+6.3 MHz 16th-order video low-pass ends the curve within 0.6 MHz of its
+band's top anyway. The NTSC curve used to keep rising, to +6.6 dB per unit at 7 MHz on NTSC, past a video low-pass
+only 7-17 dB down over 5-6 MHz, and at the 1.2 units an outer-radius
+NTSC disc asks for, that was most of the luminance noise the correction
+added (issue 1072).
+
+The correction is on by default; `--no_auto_chroma` turns it off
+entirely, the burst servo and the multiburst ceiling (below) both. It is
+written into the samples, so the output's capture notes record it either
+way: the strength, the burst as written and as it read before the
+correction, and the gain that would bring the burst to nominal (see
+`docs/technical/metadata-format.md`).
+
+Where the burst is low because the disc was mastered that way rather
+than because the channel lost it, the servo cannot tell the two apart
+and corrects both. Under the readout MTF model the channel loss is
+mostly made good before demodulation, so less is left for this filter.
+On five NTSC discs, the strength it holds drops from 0.84-1.27 to about
+0.5-0.65, and the burst before it is applied reads within 0.5 dB of the
+level the discs' sidebands say was recorded: 17.7 against 18.2 IRE on
+ve-monitor, 17.9 against 18.0 on ve-snw.
+
 ### 2. `mtf_level` (2T pulse servo)
 
 The black/white RF carrier ratio cannot predict the needed MTF level
@@ -31,7 +57,8 @@ across discs, and it clips at zero while real discs need HF *boost* at
 outer radius (PAL). When an insertion test signal with a 2T pulse is
 present — PAL: CCIR ITS on line 19 (bar 13–19 µs, 2T at ~25.2 µs, both
 parities); NTSC: NTC-7 composite on line 20 first fields (bar
-18–28 µs, 2T at ~34 µs) — the decoder measures the 2T pulse-to-bar
+18–28 µs, 2T at ~34 µs), read from line 19 or, failing both, line 13,
+where Pioneer's GGV discs carry it — the decoder measures the 2T pulse-to-bar
 ratio per field and servos `mtf_level` so the response is flat. On PAL
 negative levels invert the MTF filter into an HF boost; both
 directions are used in practice.
@@ -54,6 +81,10 @@ Fallback: with no usable ITS (no line, noisy content, scattered
 estimates, or explicit `-m`/`--MTF_offset` overrides) the original
 black/white carrier-ratio mapping drives `mtf_level` as before.
 
+This servo runs under the pole-pair MTF model, which PAL uses. NTSC
+uses the readout model instead, and there the servo stands down; see
+"The readout MTF model" below.
+
 ### 3. Frequency-resolved video EQ (VITS multiburst servo)
 
 Several discs carry a one-line multiburst in the VBI (PAL: GGV on line
@@ -65,7 +96,7 @@ and corrects — shape errors, such as GGV's recorded −1 dB dip at 2 MHz
 at inner radius (both the PAL and NTSC pressings show it).
 
 The servo measures each packet's amplitude with a least-squares sine fit
-over the packet's central span (per-window RMS under-reads short
+over the packet's steady interior (per-window RMS under-reads short
 low-frequency packets and biases everything), then builds a zero-phase
 magnitude EQ with anchors at the packet frequencies **below 3.6 MHz
 (PAL) / 2.8 MHz (NTSC)**, gains set to cancel the deviation from the
@@ -76,12 +107,164 @@ while chroma is recorded low, and a composite-domain filter cannot
 serve both — the burst calibration keeps ownership of the subcarrier
 region.
 
-Discs without a multiburst line simply never engage the EQ. The NTC-7
-combination multiburst (NTSC line 20 second fields) is deliberately
-not used: its ~3 µs packets are as short as the scan window at NTSC
-4fsc, so the single-line amplitude fit under-reads by up to 2.5 dB
-with the wrong sign (measured on he010 and issue176) — only the
-long-packet FCC line 22 variant is trusted.
+Discs without a multiburst line simply never engage the EQ. Where a
+disc has no FCC line 22, the NTC-7 combination multiburst (second
+fields, line 13 or 20) is read instead. It had been left out because its
+~3 µs packets are as short as the scan window at NTSC 4fsc, and the fit
+over the scan windows' span under-read them by up to 2.5 dB with the
+wrong sign (measured on he010 and issue176). Fitted over their own
+interiors (below), the 2.0–4.2 MHz packets agree with the conformance
+checker to 0.3 dB on the GGV and Video Essentials pressings. The line
+also carries three-level chrominance at the subcarrier frequency after
+its 4.2 MHz packet, so the packets taken are the run along the line that
+rises in frequency (`metrics._rising_run`). Dolby Surround's ~2.5 µs
+packets leave under 16 samples of interior and are still refused.
+
+The servo's bookkeeping reads what each pooled field was decoded under
+off the EQ curve itself (`decoder.applied_eq_db`, the same
+`dsp.video_eq_db` the filter is built from), not from the anchor list.
+A packet between anchors - the 3.0 MHz key past a 2.75 MHz last anchor,
+where the curve is still releasing - had read 0. It also moves each
+sample's inverse-MTF share from the strength the field had to the
+current one, as the flat-band estimate already did.
+
+**Where the fit looks (2026-10-20).** The scan slides a 44-sample window
+along the line and keeps the windows holding one clean tone; a packet is
+a group of them. Two things went wrong with short packets, and NTSC's
+FCC line is all short packets above 1.25 MHz (about 4 µs, with 1.5 µs
+gaps):
+
+- Windows were grouped while each frequency stayed within 0.3 MHz of
+  the *previous* one. A window straddling the gap between two packets
+  reads a frequency in between, and chained the 3.58 and 4.1 MHz packets
+  into one 4.05 MHz "packet" fitted across the gap. They are now grouped
+  against the group's median.
+- The fit ran over the accepted windows' span less a fifth at each end.
+  A window hanging into the gap after a packet is still mostly tone, so
+  that span overran the packet. The fit now runs over the packet's own
+  steady interior: where its envelope, demodulated at its frequency, is
+  at 70 % or more of its 90th percentile, less an eighth at each end
+  (`metrics._packet_interior`).
+
+Against a fit over each packet's settled amplitude, the old reading was
+0.7 dB low at 2.0 MHz and up to 2 dB low at 4.1 MHz relative to the
+1.25 MHz reference, and the EQ answered with +1.6 dB at 2 MHz on the GGV
+FCC pressings where +0.4-0.7 dB levels that packet with its reference.
+PAL's packets are longer and moved by 0.05-0.1 dB.
+
+## Calibrating before the first frame
+
+Before anything is written, the decoder decodes ahead and lets the
+servos settle (`_calibration_warmup`), then starts over from the first
+field, so nothing is skipped. By default it stops once no servo has moved
+for two fields and, on a disc with a modulated staircase, the DG corrector
+has taken its slope decision (three staircase fields), so the first frame
+goes out gain-corrected; the phase decision, sixteen readings, is left to
+the commit path. `--calibration_frames N` (off by default; 10 is a good
+choice) makes it a calibration pass: at least N frames, then until no
+servo has moved for 6 fields (`WARMUP_STABLE_FIELDS`), within a further
+60 fields. The AGC, the MTF level, the inverse-MTF strength, the
+multiburst EQ and its ceiling, and the chroma DG corrector all adopt in
+the pass.
+
+The pass is opt-in. It costs a few seconds on every decode, more on
+staircase discs, and on a 20-30 frame clip it reads most of the clip
+before writing. The radius sweep judges the default decode, and five of
+its cuts again with a 10-frame pass, against their own list
+(`analysis/vits_known_deviations_calibrated.toml`); a serial and a
+`-t 8 --exact-speculation` decode with the pass on are compared byte for
+byte. See "The calibration pass" in `cmake_modules/LdDecodeTests.cmake`.
+
+Without the pass, on the radius sweep the EQ, the
+2T servo, the inverse-MTF strength and the DG corrector then still
+adopted after writing had begun on 13 of 21 captures. DD86-DS2 middle's 2T
+servo moved at frame 25 of 30, and its ceiling's cut never arrived before
+the clip ended. A 20–30 frame clip carried two calibrations that its
+conformance then averaged. With the pass, only three captures move a
+decode parameter after the first frame (DD86-DS1 outer, DS2 middle,
+GGV1069 LDV4300D outer), and the lane takes 3 % longer. On a long decode
+the cost is decoding those frames twice, once. On a few frames cut from a
+long capture it is about 3 s (`-l 3`: 4.8 s to 8.1 s). A capture shorter
+than the pass just ends it early. The decoder logs whether it is running
+a pass, and a line when calibration ends, with what it settled on.
+
+Without a pass, two quiet fields are not by themselves a settled
+decoder; two loops needed more:
+
+- **The multiburst EQ.** On a disc whose EQ estimate stays inside its
+  0.3 dB dead-band the EQ never adopts, `veq_calibrated` never sets, and
+  the warm-up used to run its whole 40-field budget waiting for it: GGV1011
+  outer, GGV1069 middle and outer, the LDV4300D middle and outer cuts, the
+  three Industrial cuts, DD86-DS1 outer and DS2 inner all decoded 20
+  frames ahead, as did ve-monitor and `pal-cvbs`. An estimate held inside the dead-band now counts as decided
+  (`_veq_held`).
+- **The 2T servo.** Its pool mixes fields decoded at every level it has
+  passed through, and each sample is only as absolute as the loop gain is
+  right, so the older ones pull the median back and it steps toward its
+  level a few fields apart: DD86-DS2 inner goes 0.256 → −0.818 → −0.711 →
+  −0.897 → −1.0. Stopping for two quiet fields between steps wrote DS2
+  inner's first frame at −0.711. Its six fields decoded there read −0.83,
+  and its PAL gain ratio went from 0.23× to 1.35× of its band. So the
+  warm-up also waits until the fields decoded at the level in force (at
+  least `MTF_SERVO_SETTLE_SAMPLES`, four) would hold it within the servo's
+  dead-band (`_mtf_servo_settled`), unless the pool is too scattered for
+  the servo to trust.
+
+With both, the nine flat radius cuts write after 4–8 frames instead of 20
+(ve-monitor 5.5, `pal-cvbs` 9.5), DS2 inner after 14.5 at −1.0, and every
+cut but DS2 inner writes its first frame under the parameters the 20-frame
+warm-up settled on (Industrial inner's DG slope aside, +0.00188 against
++0.00208). What the
+longer warm-up still bought is the DG phase decision, whose sixteen
+staircase readings 40 fields reached and 4–8 frames do not, and a few
+small trims the 2T servo does not
+gate: DS2 inner's chroma strength, −1.293 then against −1.428 now; the
+multiburst ceiling lifting `pal-cvbs`'s from 0.000 to 0.066 after more
+than 12 frames; and on DS1 outer and Industrial outer an adoption after
+writing that comes at a different field. `pal-cvbs`'s 4.0 MHz packet 26.06 →
+25.50 IRE (its band's edge is 25.7), DS2 inner's 100 % chroma bar 43.84 →
+42.70 IRE, DS1 outer's 4.0 MHz response 1.07 → 1.38 dB and Industrial
+outer's second-field 2T 102.6 → 103.1 IRE; the phase decision taken
+after writing begins puts Industrial inner's differential phase back at
+2.79° (1.18° with it), Industrial middle's at 1.84° (1.49°) and
+ve-monitor's at 2.27° (1.67°), all inside their band. The three
+radius-cut checks are recorded in the default list, and `pal-cvbs`'s pin
+goes from 5 of 46 failing to 6. Waiting for 6 quiet fields, as
+the pass does, recovers none of them and lets DD86-DS2 middle and outer
+adopt the 2T servo on a momentary dip in its scatter gate; requiring a
+full six-reading pool before an EQ hold counts recovers none either and
+puts DS1 outer's chroma ceiling over its band.
+
+The 2T servo's scatter gate was also measured restated for the pool's size
+(`std·√(8/n)`), so that a full pool could be proportionally noisier: on
+DD86-DS2 outer the per-sample spread is 0.44–0.50 level units around a
+median steady at −0.64, and the per-sample gate holds it at the open-loop
+level for the whole decode. It engages the servo on four PAL cuts, and on
+the noisy Domesday pressings it then walks to its −1.0 clip (−0.61 → −0.80
+→ −1.0 on DS1 outer). DS2 outer's first-field 2T and chroma bars pass, but
+its multiburst's 4.0–4.8 MHz responses fail and DS1 outer's gain ratio
+goes from 0.68× to 1.34×. The gate stays per-sample: a pulse that scatters
+that much per field marks a disc on which the level is the wrong
+correction.
+
+On a disc with a modulated staircase the pass also waits, up to 25 frames
+(`WARMUP_DG_PHASE_FIELDS`), for the DG corrector's phase pool to hold the
+`DG_PHASE_MIN_SAMPLES` (16) readings its decision takes. The staircase is
+on one field in two and any servo's adoption empties the pool, so ten
+frames give it ten readings at most. On the sweep the staircase discs now
+write from 17–25 frames, and the NTSC inner cuts' differential phase is
+corrected from the first frame (Dolby Surround inner 2.14° → 1.66°,
+GGV1069 inner 2.15° → 1.29°, the LDV4300D cut 2.98° → 1.35°).
+
+The committed decode then goes back over the fields the pass read. Every
+servo's pool keeps one reading per field (`pool_reading()`): a field
+already pooled has its reading replaced where it stands. The pools used to
+compare a reading against their last entry only, which caught a redo but
+not this, so once writing began each of the pass's fields was pooled
+twice, and the medians leaned toward the clip's opening fields. That was
+how the phase decision had reached sixteen readings a few frames into the
+clip, and how DD86-DS2 middle's DG slope, +0.0012 to +0.0013/IRE read once
+per field, had crossed PAL's 0.0015 engage line.
 
 ## Which pulse the 2T servo holds
 
@@ -152,7 +335,7 @@ magnitude corrects differential gain, its argument differential phase:
            · exp(−j·radians(phase)·max(L, 0))
 
 `measure_vits_dg_staircase()` reads the ITS modulated staircase (PAL
-second fields, line 19±1; six zones from the blanking-level subcarrier
+second fields, line 19±1 — NTSC below; six zones from the blanking-level subcarrier
 stretch to the 100 IRE tread, each guarded clear of the risers and of
 the subcarrier's own end at 60 µs) and fits chroma amplitude and
 quadrature phase against luminance (the zones share one line's
@@ -169,6 +352,33 @@ correction is applied to a write-time copy and `dspicture` keeps the
 raw decode). Measured on DD86-DS2 CommunityNorth frames 3000–3100:
 pooled differential gain 0.366 → 0.031, chroma flat 17.9–18.4 IRE
 across the staircase, luminance levels unchanged.
+
+NTSC reads the NTC-7 composite signal's staircase the same way: first
+fields, line 20, or 19, or — Pioneer's GGV discs — 13; the 20 IRE
+chrominance reference over blanking, then the five treads to 90 IRE
+3.0 µs apart (`_VITS_DG_ZONES_NTSC`, guarded for both the GGV placement
+and the one 0.35 µs later that the other discs use). The NTSC CVBS writer
+takes the decoder's line-locked rows directly rather than resampling
+them, so it asks each field for its corrected picture
+(`Field.chroma_dg_cvbs_picture()`) where PAL corrects inside
+`downscale_cvbs()`. The NTC-7 estimate is the tighter of the two:
+across 25 NTSC captures (20–90 fields each) the pooled in-decoder
+slope lands within 0.0002/IRE of the conformance checker's own fit,
+with the sign always right, so NTSC engages the gain at 0.0010/IRE —
+the limit (0.10 over a 90 IRE staircase) less that error — where PAL
+holds 0.0015. Captures that read 0.11–0.18 there went to 0.02–0.06
+(saveuniverse 0.182 → 0.039, a Doobie Brothers LD-V4400 capture
+0.130 → 0.059, dbcut 0.113 → 0.015); the phase servo's unchanged
+thresholds take GGV1016 from 5.7° to 3.9°. Conforming discs whose slope
+stays under 0.0010 (VE monitor, he010, GGV1069 middle) are untouched.
+Once engaged, the slope correction releases only when the pooled median
+falls under `DG_SLOPE_RELEASE` (NTSC 0.0008, the engage line less the
+estimator's error again; PAL 0.0010, its conformance limit), as the phase
+correction releases under 0.02 where it engages at 0.035. A disc whose
+slope sits on the engage line otherwise drops out the first time its
+median dips under it, and the rate limit then keeps it off for 100 fields:
+Dolby Surround side 1 outer pools −0.00095 to −0.00118 and went out
+uncorrected from four frames in (0.080, against 0.034 corrected).
 
 Three properties carry the design:
 
@@ -325,8 +535,9 @@ But a cut is a *claim* that gain was added, and the pooled multiburst
 estimate cannot carry that claim at any size. `_imtf_ceiling()` already
 calls a band "within about a dB of flat" when it is refusing burst
 amplitude a boost; the same dB has to mean the same thing in the other
-direction, so `IMTF_CUT_ENGAGE_DB` (1.0 dB at the subcarrier) gates the
-negative half and the ceiling floors at zero below it.
+direction, so `IMTF_CUT_ENGAGE_DB` (1.5 dB at the subcarrier; 1.0 until the
+calibration pass, below) gates the negative half and the ceiling floors at zero
+below it.
 
 The two sides of the threshold are far apart in practice, which is what
 makes it a threshold rather than a tuning knob. Across the thirteen radius
@@ -336,7 +547,19 @@ cuts and the CI captures only two decodes ask for a cut at all:
 |---|---|---|
 | domesday-ds2-community-north-inner | 4.58 dB hot | −1.701 |
 | pal-cut-decoded | 1.69 dB hot | −0.628 |
+| domesday-ds2-community-north-middle | 1.24 dB hot | none since 1.5 dB |
+| domesday-ds2-community-north-outer | 1.16 dB hot | none since 1.5 dB |
 | industrial-lv-side1-inner | 0.58 dB hot | none — under the threshold |
+
+The two DD86-DS2 rows came with the calibration pass. With the decode
+allowed to settle before writing, the 2T servo there boosts pre-demod HF
+(the disc's 2T reads low) and the band then reads a little over a dB
+hot, Domesday's mastered 4–4.8 MHz peak included. At 1.0 dB that was cut,
+and the chrominance went under its references: gain ratio 0.266 on the
+middle cut, the 3.58 MHz packet −0.46 dB on both. At 1.5 the outer cut's
+chroma bars and gain ratio pass again (0.262 → 0.299). Its 4.0 MHz
+response then shows the mastered peak at +1.37 dB, which the list
+carries.
 
 industrial-lv side 1 inner is the case the threshold was written for. Its
 multiburst reads 0.58 dB hot while burst amplitude simultaneously asks for
@@ -367,6 +590,43 @@ returns 1.4 dB of the 10.3, so it does not change the verdict; the packet's
 recorded deviation was re-taken against the corrected decode instead.
 Removing an unjustified lift is not allowed to be judged by the packet it
 happened to flatter, in this direction either.
+
+## When the multiburst may cap a boost on NTSC
+
+Read correctly, NTSC's FCC multiburst puts the chroma band flat 0.5-1.0
+dB short of where the burst and the VITS chrominance references (NTC-7,
+VIRS) put it, on every Pioneer pressing in hand that carries one:
+GGV1069 inner on both players and the GGV multiburst disc. With the
+ceiling binding there the strength fell from 0.62 to 0.38 (GGV1069
+inner) and from 0.83 to 0.54 (GGV multiburst disc). The 3.58 and
+4.1 MHz packets and the luma/chroma gain ratio failed with it, and the
+chrominance references read low. The old fit had read that band low by
+about as much, so the ceiling never engaged on these discs and the
+disagreement did not show.
+
+That is a disc whose multiburst and chrominance were mastered a little
+apart, not a channel the boost would overdrive. So on NTSC the boost
+side gets the same kind of gate as the cut: `IMTF_CEILING_ENGAGE_DB`,
+1.5 dB at the subcarrier. The burst must ask for more than that past the
+multiburst's flat-band strength before the multiburst caps it, and once
+it does the cap is the flat-band strength, not flat plus the margin. At
+1.0 dB the GGV multiburst disc (0.97 dB) capped and released by turns;
+1.5 dB leaves half a dB either side of it. PAL caps on any excess, as it
+was validated, and the BBC AIV discs the ceiling exists for ask for about
+2 dB past flat on either system's terms.
+
+With the gate the strengths are back where they were (0.636, 0.590,
+0.832). What the corrected fit still changes on these discs is the 2 MHz
+EQ. Their FCC multiburst is recorded low: the 1.25 MHz reference reads
+25.7-26.4 IRE against 30, and the 2.0 MHz packet now sits level with it
+instead of 1.6 dB above it. Twenty packet-level checks went to the
+known-deviation list as recorded low, while the 2.0 MHz response checks
+and the GGV1069 inner 2T (102.1 and 102.5 to 101.0 and 100.5) passed.
+On Domesday DD86-DS2 the few hundredths of a dB the PAL readings moved
+were enough to tip three coupled loops at their thresholds. At middle
+radius the 2T servo ran to its -1.0 limit, so the 4.0 MHz response,
+saturation ceiling and staircase DG now fail. The inner cut passes three
+checks it failed. The list carries both.
 
 ## The curve the correction rides
 
@@ -549,6 +809,156 @@ boundary.
 It is disc-specific, not a property of the passband alone: on DD86-DS2
 middle, the pressing that replaced DS1 in the test data, the same pool
 passes the gate and the servo adopts.
+
+## The readout MTF model
+
+`FilterParams["MTF_model"]` selects the pre-demodulation MTF
+compensation: `"poles"` is the pole pair raised to `mtf_level` described
+above, and `"readout"` is a physical model of the disc's readout. NTSC
+uses the readout model, and PAL stays on the poles (see below).
+
+### What the model is
+
+The HF readout passes the disc's spatial frequencies through the overlap
+of the zero and first diffracted orders in the objective's pupil, the
+autocorrelation of the pupil amplitude. IEC 60857/60856 clause 11.1
+specify the reference readout as 632.8 nm, NA 0.40, with the pupil
+filled by a Gaussian 23 % (intensity) at its rim. The temporal cutoff is
+fc = (2 NA / λ) · v, so on a CAV disc it grows with radius from 13.09
+MHz (NTSC, r = 55 mm) or 10.92 MHz (PAL). `dsp.readout_otf` tabulates
+it. `mtf_level` names the cutoff as `readout_ref_cutoff_hz` over it.
+
+`dsp.readout_compensation` equalises the channel, readout times the
+decoder's own RF band-pass (`RFVideo`), to a straight line rather than
+to flat. The line is unity at the blanking carrier and reaches zero at
+0.90 fc (`readout_zero_fraction`). A zero-phase response affine in
+frequency multiplies an analytic FM signal by a real envelope and leaves
+its phase, which is the video, untouched, so only curvature distorts. A
+flat target put luminance-dependent gain on the chroma once the upper
+sideband crossed the cutoff (differential gain 0.31 on GGV1069 inner).
+Designing against the band-pass as well fixed the low burst (11-13 IRE)
+on discs whose lower chroma sideband the band-pass's low edge was
+cutting.
+
+The line's slope is free as far as the video is concerned, but not as
+far as the noise is. Baseband noise at f comes from the RF at fc ± f,
+each side scaled by the compensation there relative to the carrier. At
+inner radius the readout has the upper sideband 12-20 dB down while the
+capture's noise floor is flat out there, so the compensation's lift of
+that side is mostly lift of noise. With the zero at 0.95 fc it lifted
+11-13 MHz by 4-6.5 dB, doubled the upper side's share of the 3-4.2 MHz
+noise (27-31 % to 58-61 %), and left that band 2.5 dB noisier per unit
+response than no compensation at all, on an NTSC DdD capture at a
+14.9 MHz cutoff. A steeper line lifts the upper side less and the lower
+side more. At that capture's cutoff 0.90 fc puts the zero at 13.5 MHz,
+peak white's 4.2 MHz upper sideband; below about 15 MHz the line clips
+the highest sidebands of the brightest picture, as 0.95 fc already did
+below 14.2 MHz, and on the GGV1069 inner cuts (13.8 MHz) that did not
+cost a check. On that capture it took 0.9 dB off the 3-4.2
+MHz band, and across the NTSC VITS captures it failed 44 checks where
+0.95 failed 51. Bounding the boost instead (`readout_max_boost_db` 8 or
+12 dB, a Wiener floor) is quieter still but is not a straight line, and
+put the differential gain back up (0.042 to 0.075 on GGV1069 LDV4300D
+middle). Only the inner radii notice either way: from about 17 MHz up
+the upper sideband is strong enough that the lift costs little.
+
+The clipping that did not cost a check there does cost the chroma. A
+carrier whose upper chroma sideband lies past the zero keeps only its
+lower one, and the line then lifts chroma with luminance: on a disc that
+matches the readout model exactly, at an MTF level of 0.96 (13.6 MHz),
+by +4.6 % at 72 IRE, +8.5 % at 90 and +11 % at 100. Doobie (CLV, 0.96)
+read an NTC-7 differential gain of 0.105 that way, the only NTSC capture
+over its band. So the zero is never put below `readout_zero_min_hz`,
+13.0 MHz: peak white's carrier plus the subcarrier, with 0.1 MHz to
+spare. Only cutoffs under 14.4 MHz (levels above about 0.906) move. On
+the model-matched synthetic disc the chroma then stays within 0.4 % at
+0.96 and 2.2 % at 1.0; a higher floor asks for more lift above 13 MHz
+than the boost bound allows and the chroma falls instead. On the real
+inner cuts Doobie goes to 0.047, dbcut 0.080 to 0.056 and GGV1069
+LDV4300D inner 0.067 to 0.037, for no change in weighted noise (within
+±0.1 dB). It also takes away a lift the clipped line was giving 4.1 MHz
+luminance through the lower sideband, about 4 %: the FCC multiburst's
+4.1 MHz packet reads 0.4 dB lower on the GGV1069 inner cuts, which puts
+it past its band. And it uncovers a second error the clipping had been
+offsetting: on real inner-radius discs the compensation now pulls chroma
+*down* with luminance (GGV1069 inner from 0.069 to 0.085), where the
+model-matched disc stays flat. The real channel falls faster above 12
+MHz than the model, and by different amounts on the same disc in two
+players (0.089 against 0.034 peak to peak), so part of it is the player's
+own response, which a disc model cannot carry.
+
+### Measuring the cutoff
+
+The cutoff is read from the RF, field by field, and pooled like the
+other servos' samples. In order of preference:
+
+1. **The PAL pilot's sidebands** (`metrics.pilot_sideband_ratio`). IEC
+   60856 9.1.2 puts a 3.75 MHz pilot burst on the PAL sync tip. As FM
+   it is a line spectrum, with the two first sidebands at J1(β) H(f) and
+   |J₋₁| = |J₁|, so their ratio is H(tip − 3.75 MHz) / H(tip + 3.75
+   MHz) whatever the pilot's recorded amplitude. That amplitude varies
+   by about 3 dB between discs. The upper sideband, at 10.5 MHz, stays
+   under the cutoff on inner radii where the colour burst's has gone.
+2. **The colour burst's sidebands** (`metrics.burst_sideband_ratio`).
+   This is the same reading, the subcarrier either side of the blanking
+   carrier: 4.53 / 11.69 MHz on NTSC, 2.67 / 11.54 MHz on PAL.
+3. **The carrier's own tilt** between blanking and white
+   (`carrierTiltRatio`), with the raw b/w ratio before that is measured.
+
+A sideband pool is preferred once it holds five readings and at least
+half as many as the tilt's. A field gives no reading while either
+sideband fails to clear its noise floor, so a sparse pool is the few
+fields whose noise read high. `dsp.readout_cutoff_from_tilt` inverts
+whichever ratio is chosen through the model.
+
+The tilt is the fallback because it spans only the 1.2 MHz carrier
+swing (0.8 MHz on PAL), and the player's and capture's electronics tilt
+it too. On GGV1069 outer it reads a 57 MHz cutoff where the CAV radius
+gives 22.6 and the burst sidebands 19.9. Over an NTSC survey of 26
+captures (the radius cuts plus whole and partial disc captures, each
+decoded with `--exact-speculation`), the burst sidebands give 49 failing
+conformance checks, the tilt 53, and the pole pair with its 2T servo 79.
+
+### What the sidebands show about the channel
+
+The ratios that are independent of recorded level (pilot and burst,
+both systems) put middle and outer radii on the IEC optics at the CAV
+radius' cutoff to within 1-3 %, once a fixed droop of about 0.28 dB/MHz
+is allowed for. Most of that droop is the Domesday Duplicator 2.2.1
+board. The board's measured response is −0.45 dB at 4.5 MHz, −2.0 dB at
+11.7 MHz and −4.0 dB at 20 MHz, relative to 1 MHz, with linear phase.
+That is 1.56 dB of the roughly 2 dB measured across the burst's
+sidebands; the rest is the player. The droop costs no information: the
+noise at 11.7 MHz sits about 20 dB above the 18-20 MHz floor, so it
+enters before the board and is attenuated with the signal. Inner radii
+read a cutoff 3-10 % above the CAV formula.
+
+An earlier channel probe identified the system against an FM reference
+rebuilt from the capture's own phase. That reference is biased wherever
+the upper sideband is lost, and it read PAL's low end up to 10 dB short
+of the optics, which was wrong. The sideband readings replace it.
+
+### Why PAL stays on the poles
+
+PAL's carrier swings to within 3.5 MHz of the cutoff at inner radius,
+so luminance detail and chroma above that ride on one sideband alone.
+That sideband's level against the carrier varies by disc, and the
+pole pair's 2T servo follows it while an open-loop physical model
+cannot. Over 15 PAL captures (failing checks, pole pair 93):
+
+| Readout variant | Failing checks |
+|---|---|
+| Cutoff from the carrier tilt | 124 |
+| Cutoff from the CAV radius | 123 |
+| Cutoff from the pilot sidebands | 142 |
+| CAV cutoff, with the pole pair's 2T servo on top | 113 |
+| 2T servo driving the readout level | 134-137 |
+
+The last is unstable: the 2T pulse's response to the level changes sign
+between inner and outer radius. Differential gain improves under every
+variant (GGV1011 inner 0.106 → about 0.045). The PAL parameter set
+carries the readout parameters, and the pilot reading only runs under
+the readout model, so switching PAL over takes only `MTF_model`.
 
 ## Measured results (2026-08-31)
 

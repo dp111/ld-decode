@@ -53,6 +53,7 @@ def stub(samples, system="PAL", min_samples=6,
         CHROMA_BAND_PROBE_HZ=LDdecode.CHROMA_BAND_PROBE_HZ,
         imtf_strength_limit=LDdecode.IMTF_LIMIT_DB[system] / db_per_strength,
         IMTF_CUT_ENGAGE_DB=LDdecode.IMTF_CUT_ENGAGE_DB,
+        IMTF_CEILING_ENGAGE_DB=LDdecode.IMTF_CEILING_ENGAGE_DB,
         rf=types.SimpleNamespace(
             system=system,
             SysParams={"fsc_mhz": 4.43361875 if system == "PAL" else 3.579545},
@@ -61,6 +62,8 @@ def stub(samples, system="PAL", min_samples=6,
     it._imtf_strength_for_flat_band = (
         lambda first=False: LDdecode._imtf_strength_for_flat_band(it, first))
     it._imtf_cut_engaged = lambda flat: LDdecode._imtf_cut_engaged(it, flat)
+    it._imtf_ceiling_binds = (
+        lambda wanted, ceiling: LDdecode._imtf_ceiling_binds(it, wanted, ceiling))
     # checkVideoEQ publishes this at an adoption; the ceiling reads it.
     it._imtf_flat_band = it._imtf_strength_for_flat_band()
     return it
@@ -209,6 +212,17 @@ def test_a_band_hot_by_less_than_a_dB_does_not_authorise_a_cut():
     assert ceiling == 0.0
 
 
+def test_domesday_ds2_middle_is_not_cut():
+    """BBC Domesday DD86-DS2 middle reads 1.24 dB hot once the 2T servo's
+    pre-demod boost is in, with the disc's mastered 4-4.8 MHz peak on
+    top; cutting it took the chrominance under its references."""
+    hot_db = 1.24
+    ceiling = LDdecode._imtf_ceiling(
+        stub(samples({4.0e6: hot_db, 4.75e6: hot_db})), current=0.5)
+    assert hot_db < LDdecode.IMTF_CUT_ENGAGE_DB
+    assert ceiling == 0.0
+
+
 def test_the_threshold_is_a_gate_and_not_a_subtraction():
     """Once the band is measurably hot the whole excess is spent.
 
@@ -337,10 +351,12 @@ def eq_stub(samples_, strength, flat_band=None, job_engine=None):
     """Enough of an LDdecode for the ceiling's publish-and-apply path."""
     it = types.SimpleNamespace(
         _veq_samples=samples_,
+        auto_chroma=True,
         VEQ_MIN_SAMPLES=6,
         CHROMA_BAND_PROBE_HZ=LDdecode.CHROMA_BAND_PROBE_HZ,
         imtf_strength_limit=STRENGTH_LIMIT,
         IMTF_CUT_ENGAGE_DB=LDdecode.IMTF_CUT_ENGAGE_DB,
+        IMTF_CEILING_ENGAGE_DB=LDdecode.IMTF_CEILING_ENGAGE_DB,
         _imtf_flat_band=flat_band,
         _deemp_burst_samples=[1.0, 2.0],
         _deemp_burst_offset=7,
@@ -353,6 +369,8 @@ def eq_stub(samples_, strength, flat_band=None, job_engine=None):
     )
     it._imtf_ceiling = lambda current: LDdecode._imtf_ceiling(it, current)
     it._imtf_cut_engaged = lambda flat: LDdecode._imtf_cut_engaged(it, flat)
+    it._imtf_ceiling_binds = (
+        lambda wanted, ceiling: LDdecode._imtf_ceiling_binds(it, wanted, ceiling))
     it._imtf_strength_for_flat_band = (
         lambda first=False: LDdecode._imtf_strength_for_flat_band(it, first))
     return it
@@ -439,6 +457,7 @@ def adopt_stub(samples_, strength, flat_band=None, calibrated=False,
         params["video_eq_auto"] = applied_eq
     it = types.SimpleNamespace(
         _veq_samples=samples_,
+        auto_chroma=True,
         VEQ_MIN_SAMPLES=6,
         VEQ_DEADBAND_DB=LDdecode.VEQ_DEADBAND_DB,
         VEQ_MIN_ADOPT_FIELDS=LDdecode.VEQ_MIN_ADOPT_FIELDS,
@@ -446,6 +465,7 @@ def adopt_stub(samples_, strength, flat_band=None, calibrated=False,
         CHROMA_BAND_PROBE_HZ=LDdecode.CHROMA_BAND_PROBE_HZ,
         imtf_strength_limit=STRENGTH_LIMIT,
         IMTF_CUT_ENGAGE_DB=LDdecode.IMTF_CUT_ENGAGE_DB,
+        IMTF_CEILING_ENGAGE_DB=LDdecode.IMTF_CEILING_ENGAGE_DB,
         _imtf_flat_band=flat_band,
         _imtf_flat_band_last_publish=last_publish,
         _deemp_burst_samples=[],
@@ -469,6 +489,8 @@ def adopt_stub(samples_, strength, flat_band=None, calibrated=False,
     it._veq_estimate = lambda field: estimate
     it._imtf_ceiling = lambda current: LDdecode._imtf_ceiling(it, current)
     it._imtf_cut_engaged = lambda flat: LDdecode._imtf_cut_engaged(it, flat)
+    it._imtf_ceiling_binds = (
+        lambda wanted, ceiling: LDdecode._imtf_ceiling_binds(it, wanted, ceiling))
     it._imtf_strength_for_flat_band = (
         lambda first=False: LDdecode._imtf_strength_for_flat_band(it, first))
     it._apply_imtf_ceiling = lambda: LDdecode._apply_imtf_ceiling(it)
@@ -672,6 +694,7 @@ def deemp_stub(burst_ire, strength, flat_band=None, calibrated=True):
         imtf_strength_engage=(
             LDdecode.IMTF_ENGAGE_DB["PAL"] / DEEMP_DB_PER_STRENGTH),
         IMTF_CUT_ENGAGE_DB=LDdecode.IMTF_CUT_ENGAGE_DB,
+        IMTF_CEILING_ENGAGE_DB=LDdecode.IMTF_CEILING_ENGAGE_DB,
         _deemp_burst_samples=[burst_ire] * 4,
         _deemp_burst_offset=7,
         _imtf_flat_band=flat_band,
@@ -679,6 +702,7 @@ def deemp_stub(burst_ire, strength, flat_band=None, calibrated=True):
         deemp_calibrated=calibrated,
         exact_speculation=False,
         rf=types.SimpleNamespace(
+            system="PAL",
             SysParams={"burst_ire": 21.4, "fsc_mhz": 4.43361875},
             # 20*log10(e**0.31) ~ 2.7 dB at fsc per strength unit
             inverse_mtf_log_at_fsc=0.31,
@@ -688,6 +712,8 @@ def deemp_stub(burst_ire, strength, flat_band=None, calibrated=True):
     )
     it._imtf_ceiling = lambda current: LDdecode._imtf_ceiling(it, current)
     it._imtf_cut_engaged = lambda flat: LDdecode._imtf_cut_engaged(it, flat)
+    it._imtf_ceiling_binds = (
+        lambda wanted, ceiling: LDdecode._imtf_ceiling_binds(it, wanted, ceiling))
     it._discard_ahead = False
     it._adopt_from_next_field = lambda hand_over: LDdecode._adopt_from_next_field(it, hand_over)
     return it
@@ -728,6 +754,7 @@ def feedforward_stub(strength, delta):
     it = types.SimpleNamespace(
         imtf_strength_limit=STRENGTH_LIMIT,
         IMTF_CUT_ENGAGE_DB=LDdecode.IMTF_CUT_ENGAGE_DB,
+        IMTF_CEILING_ENGAGE_DB=LDdecode.IMTF_CEILING_ENGAGE_DB,
         mtf_deemp_feedforward=1.2,
         _deemp_burst_samples=[1.0],
         _deemp_burst_offset=7,
@@ -768,3 +795,45 @@ def test_a_burst_servo_trim_is_no_redo_in_either_mode(exact):
     assert LDdecode._deemp_calibrate(it) is False
     assert it.rf.DecoderParams["inverse_mtf_strength"] > 0.5 + it.imtf_strength_deadband
     assert it._discard_ahead is exact
+
+
+def test_with_the_chroma_correction_off_the_ceiling_stands_down():
+    """--no_auto_chroma means no inverse-MTF filter at all: the multiburst
+    may not cut the chroma band any more than the burst may boost it."""
+    it = eq_stub([], strength=0.0, flat_band=-1.0)
+    it.auto_chroma = False
+    assert LDdecode._apply_imtf_ceiling(it) is False
+    assert it.rf.DecoderParams["inverse_mtf_strength"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# When the ceiling engages
+# ---------------------------------------------------------------------------
+
+def binds_stub(system, db_per_strength=1.67):
+    return types.SimpleNamespace(
+        IMTF_CEILING_ENGAGE_DB=LDdecode.IMTF_CEILING_ENGAGE_DB,
+        rf=types.SimpleNamespace(
+            system=system,
+            SysParams={"fsc_mhz": 4.43361875 if system == "PAL" else 3.579545},
+            inverse_mtf_log_db=lambda freq_hz: db_per_strength))
+
+
+@pytest.mark.parametrize("excess_db, binds", [(1.0, False), (1.6, True)])
+def test_ntsc_caps_only_an_ask_well_past_flat(excess_db, binds):
+    """The NTSC multiburst and the chrominance references disagree by up
+    to 1.0 dB on Pioneer pressings; a BBC-sized excess is still capped."""
+    it = binds_stub("NTSC")
+    assert LDdecode._imtf_ceiling_binds(it, 0.3 + excess_db / 1.67, 0.3) is binds
+
+
+def test_pal_caps_any_excess():
+    it = binds_stub("PAL", 3.48)
+    assert LDdecode._imtf_ceiling_binds(it, 0.31, 0.30) is True
+
+
+@pytest.mark.parametrize("system", ["PAL", "NTSC"])
+def test_a_strength_at_or_under_the_ceiling_is_never_capped(system):
+    it = binds_stub(system)
+    assert LDdecode._imtf_ceiling_binds(it, 0.3, 0.3) is False
+    assert LDdecode._imtf_ceiling_binds(it, -0.5, 0.3) is False

@@ -45,7 +45,16 @@ from .filters import (
     unwrap_hilbert,
     unwrap_hilbert_pll,
 )
-from .dsp import compute_mtf, genwave
+from .dsp import (
+    band_baseband,
+    band_subtract,
+    coherent_line_estimate,
+    unit_phasor,
+    compute_mtf,
+    genwave,
+    readout_compensation,
+    video_eq_db,
+)
 
 
 try:
@@ -233,6 +242,7 @@ class RFDecode:
         self.fm_pll = extra_options.get("fm_pll", False)
         self.fm_pll_fn = extra_options.get("fm_pll_fn", 4800000)
         self.fm_pll_zeta = extra_options.get("fm_pll_zeta", 0.707)
+        self.AudioCarrierCancel = extra_options.get("AudioCarrierCancel", False)
         # Cancel the capture/player multi-path reflection ("ghost").  Opt-in via
         # --rf_echo_cancel (auto-detect from the RF cepstrum, re-estimated across
         # the disc) or --rf_echo (manual taps); applies the correction only when
@@ -837,11 +847,21 @@ class RFDecode:
         # compute_mtf's NTSC default, PAL modelled a cutoff 20 % high and a
         # curve half again too shallow: 2.69 dB per unit of strength at
         # 4.43 MHz where the disc's own response gives 3.48.
+        # The curve is held flat above the top of the chroma band
+        # (inverse_mtf_hold_hz, NTSC only): there it has no chrominance left to give
+        # back, only luminance detail and noise, and on NTSC it kept rising
+        # to +6.6 dB per unit at 7 MHz past a video low-pass that is only
+        # -7 to -17 dB down over 5-6 MHz.  At the 1.2 units the burst asks
+        # of an outer-radius NTSC disc that was most of the luminance noise
+        # the correction added (ve-monitor: black-line noise over 5-6 MHz
+        # x3, against x1.6 inside the chroma band).
         freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
         crossover = 2.0e6
         disc_fps = SP["FPS"]
+        hold_hz = DP.get("inverse_mtf_hold_hz") or np.inf
         mtf_at_crossover = compute_mtf(crossover, cavframe=0, fps=disc_fps)
-        mtf_vals = compute_mtf(freq_array.copy(), cavframe=0, fps=disc_fps)
+        mtf_vals = compute_mtf(np.minimum(freq_array, hold_hz), cavframe=0,
+                               fps=disc_fps)
         mtf_norm = np.clip(mtf_vals / mtf_at_crossover, 0.05, 1.0)
         SF["Finverse_mtf_base"] = 1.0 / mtf_norm
         # EXPERIMENT: band-limit the chroma correction.  The servo sizes its
@@ -1117,11 +1137,78 @@ class RFDecode:
         """The exponent demodblock raises MTF_half to for a decoder MTF level:
         the level through the disc/player MTF model (--MTF, --MTF_offset and
         the system's MTF_basemult).  mtf_response() is keyed by this, not by
-        the decoder's level."""
+        the decoder's level.  Under the readout model it is the level
+        through --MTF and --MTF_offset alone: the innermost-radius cutoff
+        over the cutoff to compensate for."""
+        if self.mtf_model == "readout":
+            return mtf_level * self.mtf_mult + self.mtf_offset
         return (mtf_level * self.mtf_mult + self.mtf_offset) * self.DecoderParams["MTF_basemult"]
 
+    @property
+    def mtf_model(self):
+        return self.DecoderParams.get("MTF_model", "poles")
+
+    #: How far outside readout_chain_band_hz the compensation's view of
+    #: the band-pass returns to the reference carrier's (_readout_chain).
+    READOUT_CHAIN_TAPER_HZ = 0.4e6
+
+    def _readout_chain(self):
+        """|the rest of the pre-demod chain| on the positive half: the RF
+        band-pass with its notches (RFVideo carries the Hilbert factor,
+        flat across the band, which the normalisation at the reference
+        carrier takes out), and PAL's per-block audio notch when the
+        carriers are present - the compensation is designed against all
+        of it (dsp.readout_compensation).
+
+        Only across the band the video's sidebands occupy
+        (readout_chain_band_hz).  Beyond each end, over a raised-cosine
+        taper READOUT_CHAIN_TAPER_HZ wide, the chain the design sees
+        returns to its value at the reference carrier, so out there the
+        compensation leaves the band-pass's own response alone: it neither
+        lifts the stopband - the notches at NTSC's analog audio carriers,
+        the skirt over EFM - back towards the passband, nor carries the
+        band edge's few dB of make-up onto noise no sideband shares."""
+        chain = np.abs(self.Filters["RFVideo_half"])
+        DP = self.DecoderParams
+        lo_hz, hi_hz = DP["readout_chain_band_hz"]
+        freqs = np.arange(len(chain)) * (self.freq_hz / self.blocklen)
+        ref = np.interp(DP["readout_ref_hz"], freqs, chain)
+        taper = self.READOUT_CHAIN_TAPER_HZ
+        # weight 1 inside the band, falling to 0 a taper's width outside
+        dist = np.maximum(lo_hz - freqs, freqs - hi_hz).clip(0.0, taper)
+        w = 0.5 + 0.5 * np.cos(np.pi * dist / taper)
+        edge = np.where(freqs < lo_hz, np.interp(lo_hz, freqs, chain),
+                        np.interp(hi_hz, freqs, chain))
+        outside = (freqs < lo_hz) | (freqs > hi_hz)
+        held = np.exp(w * np.log(np.maximum(edge, 1e-12))
+                      + (1.0 - w) * np.log(max(ref, 1e-12)))
+        return np.where(outside, held, chain)
+
+    def mtf_response_at(self, scaled_level):
+        """The pre-demod MTF compensation (positive half spectrum) for a
+        scaled level, in MTF_half's dtype: the pole pair raised to the
+        level, or the readout model's compensation at the cutoff the
+        level names (dsp.readout_compensation)."""
+        base = self.Filters["MTF_half"]
+        if self.mtf_model != "readout":
+            return base ** scaled_level
+        if scaled_level <= 0:
+            return np.ones_like(base)
+        DP = self.DecoderParams
+        cutoff = DP["readout_ref_cutoff_hz"] / scaled_level
+        freqs = np.arange(len(base)) * (self.freq_hz / self.blocklen)
+        comp = readout_compensation(
+            freqs, cutoff, DP["readout_ref_hz"],
+            zero_fraction=DP["readout_zero_fraction"],
+            max_boost_db=DP["readout_max_boost_db"],
+            rim_intensity=DP["readout_rim_intensity"],
+            chain=self._readout_chain(),
+            zero_min_hz=DP.get("readout_zero_min_hz", 0.0))
+        return comp.astype(base.dtype)
+
     def mtf_response(self, mtf_level):
-        """``Filters["MTF_half"] ** mtf_level``, held across blocks.
+        """``mtf_response_at(mtf_level)`` (the pole pair raised to the level,
+        or the readout model at the cutoff it names), held across blocks.
 
         The exponent is constant within a field and, past warm-up, moves at
         most once every ``MTF_SERVO_MIN_ADOPT_FIELDS`` fields, so one entry is
@@ -1136,7 +1223,7 @@ class RFDecode:
         cached = self._mtf_response_cache
         if cached is not None and cached[0] == mtf_level:
             return cached[1]
-        response = self.Filters["MTF_half"] ** mtf_level
+        response = self.mtf_response_at(mtf_level)
         self._mtf_response_cache = (mtf_level, response)
         return response
 
@@ -1269,7 +1356,8 @@ class RFDecode:
             # differs on NTSC, MTF_basemult 0.4) it never matched, and
             # priming the worker's held response with it evicted the one
             # demodblock had just rebuilt, once a job.
-            return {"MTF_response": base ** self.scaled_mtf_level(key)}
+            return {"MTF_response": self.mtf_response_at(
+                self.scaled_mtf_level(key))}
 
         if family == "video":
             imtf_strength, veq = key
@@ -1299,13 +1387,8 @@ class RFDecode:
         """
         if not points:
             return np.ones(self.blocklen)
-        freqs = np.array([0.0] + [p[0] for p in points]
-                         + [points[-1][0] + 0.5e6, self.freq_hz_half])
-        gains = np.array([0.0] + [p[1] for p in points] + [0.0, 0.0])
-        interp = spi.PchipInterpolator(freqs, gains, extrapolate=False)
         freq_array = np.abs(np.fft.fftfreq(self.blocklen, 1.0 / self.freq_hz))
-        db = interp(np.clip(freq_array, 0, self.freq_hz_half))
-        db = np.nan_to_num(db, nan=0.0)
+        db = video_eq_db(points, freq_array, self.freq_hz_half)
         return 10.0 ** (db / 20.0)
 
     def computeaudiofilters(self):
@@ -1906,6 +1989,110 @@ class RFDecode:
         whole = self.v4300d_coherent_subtract(self.mirror_spectrum(indata_fft))
         return whole[: indata_fft.shape[0]]
 
+    #: Half-width of the RF band taken around each audio carrier for its
+    #: phase reference: NTSC's +-100 kHz deviation with room for the
+    #: sidebands of the loudest programme.
+    AUDIO_CANCEL_HALFBAND_HZ = 250e3
+    #: A carrier is used only when its band holds this many times the power
+    #: of the band beside it on the side away from the other carrier.
+    AUDIO_CANCEL_MIN_SNR = 5.0
+    #: Bins in the slice of the spectra the canceller works on, centred
+    #: between the carriers (+-1.25 MHz at NTSC's block length): room for
+    #: each carrier's phase band and the level's band on either side of
+    #: it, so that their product does not wrap.
+    AUDIO_CANCEL_SLICE = 2048
+    #: The level the coupling follows is the demod low-passed to here
+    #: (cos^2 taper, -6 dB at half this).
+    AUDIO_CANCEL_LEVEL_HZ = 500e3
+
+    def audio_carrier_cancel(self, indata_fft, spectrum, centre):
+        """Subtract the analog audio carriers' intermodulation lines from the
+        demodulated video's spectrum, in place.  Prototype, opt-in
+        (--audio_carrier_cancel).
+
+        The disc's pits carry the sum of the video and audio FM carriers,
+        hard-limited, so the video carrier picks up sidebands at fv +- fa
+        (and the readout's tilt turns any AM in them to PM).  Demodulated,
+        those land as lines at the audio carriers' own frequencies, with
+        the audio carriers' own phase: in NTSC at 2.30 and 2.81 MHz, inside
+        the luminance band.  Whatever mix of upper and lower sideband and of
+        AM and PM produces them, the line is Re(c * exp(j phi_a(t))) for one
+        complex c, phi_a being the carrier's phase in the RF; c moves with
+        the video level (the tilt the sidebands see depends on where the
+        carrier sits), so the model lets it follow the level linearly.  The
+        carrier is cut out of this block's RF and reduced to a unit phasor,
+        and the model is fitted over the block's kept span with a gain that
+        backs off for lines too weak to fit (see coherent_line_estimate).
+
+        All of it happens on slices of the spectra: spectrum is the rfft of
+        the demod less centre, indata_fft the RF block's.  The phase, the
+        demod around the carrier and the level are each a few thousand
+        bins, taken down to 0 Hz on a lattice every n/m samples
+        (band_baseband), and the fitted line goes back into spectrum's bins
+        the same way - no transform or product over the whole block.  So
+        the fit sees the demod as the video filters do, clipped to the
+        discriminator's range rather than to the video's, and demod_raw
+        (the dropout detector's) keeps its lines.
+
+        Only the phase reference is taken from the RF.  The RF below the
+        video band also carries a copy of the picture (the pits' duty
+        cycle), so regressing the video on the band's own signal, its
+        envelope included, would remove picture; the audio's phase is
+        independent of the picture.
+
+        Stateless per block, like v4300d_coherent_subtract.  A carrier the
+        disc does not carry (digital-only discs; AC3's QPSK right channel is
+        never used) is skipped, so the fit cannot chase noise.
+        """
+        SP = self.SysParams
+        bl = self.blocklen
+        n = 2 * (len(spectrum) - 1)
+        fpb = self.freq_hz / bl
+        hw = self.AUDIO_CANCEL_HALFBAND_HZ
+
+        def bandpower(f0, width):
+            lo, hi = int((f0 - width) / fpb), int((f0 + width) / fpb) + 1
+            return np.mean(sqsum(indata_fft[lo:hi]) ** 2)
+
+        carriers = [SP["audio_lfreq"]]
+        if not SP["AC3"]:
+            carriers.append(SP["audio_rfreq"])
+        mid = (SP["audio_lfreq"] + SP["audio_rfreq"]) / 2
+        # Against the flank away from the other carrier: a loud programme
+        # spreads each carrier +-150 kHz, into the gap between the two.
+        carriers = [
+            fa for fa in carriers
+            if bandpower(fa, hw) >= self.AUDIO_CANCEL_MIN_SNR * bandpower(
+                fa + (-1 if fa < mid else 1) * (hw + 150e3), 75e3)
+        ]
+        if not carriers:
+            return
+
+        # One slice holds both carriers, centred between them.  Its lattice:
+        # sample j is RF sample j*bl/m.
+        m = self.AUDIO_CANCEL_SLICE
+        lo = int(round(mid / fpb)) - m // 2
+        fit = slice(-(-self.blockcut * m // bl), (bl - self.blockcut_end) * m // bl)
+        fs = self.freq_hz * m / bl
+
+        # The level the coupling follows, 100 IRE = 1.
+        kl = int(self.AUDIO_CANCEL_LEVEL_HZ / fpb)
+        low = np.zeros(m // 2 + 1, dtype=np.complex128)
+        low[:kl] = spectrum[:kl] * np.cos(0.5 * np.pi * np.arange(kl) / kl) ** 2
+        level = ((npfft.irfft(low, m) * (m / n) + centre - SP["ire0"])
+                 / (100 * SP["hz_ire"]))
+
+        video = band_baseband(spectrum, lo, m, n)
+        lines = np.zeros(m, dtype=np.complex128)
+        for fa in carriers:
+            k, hwb = int(round(fa / fpb)) - lo, int(hw / fpb)
+            phasor = unit_phasor(
+                band_baseband(indata_fft, lo, m, bl, slice(k - hwb, k + hwb + 1)))
+            line, _ = coherent_line_estimate(video, phasor, level, fit, fs)
+            video -= line
+            lines += line
+        band_subtract(spectrum, lines, lo, n)
+
     def demodblock_sync(self, data=None, fftdata=None, cut=False):
         """Demodulate only the 0.5 MHz path used for vertical-sync detection.
 
@@ -2142,9 +2329,12 @@ class RFDecode:
         # half-rate demod's whole range and never clip anything.
         np.clip(demod, 1500000, self.freq_hz_demod * 0.75, out=demod)
         np.subtract(demod, centre, out=centred)
+        spectrum = npfft.rfft(centred)
+        if self.AudioCarrierCancel and self.SysParams["analog_audio"]:
+            self.audio_carrier_cancel(indata_fft, spectrum, centre)
         video_results = npfft.irfft(
             np.multiply(
-                npfft.rfft(centred),
+                spectrum,
                 self.Filters["FVideo_rfft32"],
                 out=scratch.video_stack,
             ),

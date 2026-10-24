@@ -224,6 +224,50 @@ FilterParams_NTSC = {
     "MTF_basemult": 0.4,  # general ** level of the MTF filter for frame 0.
     "MTF_poledist": 0.9,
     "MTF_freq": 12.2,  # in mhz
+    # The pre-demod MTF compensation follows the disc readout's own
+    # transfer function (dsp.readout_compensation) rather than the pole
+    # pair above, which only "poles" selects.  mtf_level is then the
+    # innermost-radius cutoff over the disc's (0 = no compensation, 1 =
+    # 55 mm on CAV); the cutoff is measured from the colour burst's FM
+    # sidebands, or the carrier's tilt between blanking and white while
+    # they give no reading (decoder._readout_measurement).
+    "MTF_model": "readout",
+    # IEC 60857 clause 11.1 reference readout: 632.8 nm, NA 0.40, 23 %
+    # rim intensity; the cutoff at the innermost CAV programme radius
+    # (55 mm, 29.97 rev/s) is 2 NA / lambda * 2 pi r fps.
+    "readout_rim_intensity": 0.23,
+    "readout_ref_cutoff_hz": 2 * 0.40 / 632.8e-9 * 2 * np.pi * 0.055 * (30000 / 1001),
+    # the compensation is unity at the blanking carrier
+    "readout_ref_hz": 8.1e6,
+    # The straight line the channel is equalised to reaches zero here.
+    # Any slope leaves the FM alone; what it sets is how hard the upper
+    # sideband, which the readout has taken 12-20 dB down at inner radius
+    # while the capture's noise floor stays flat there, is lifted back.
+    # 0.95 lifted it 4-6.5 dB and doubled its share of the 3-4.2 MHz
+    # noise; 0.90 puts the zero at peak white's 4.2 MHz upper sideband
+    # (13.5 MHz) at a 15 MHz cutoff.  See docs/technical/vits-servos.md.
+    "readout_zero_fraction": 0.90,
+    # ...but never below the chroma's upper sideband at peak white (9.31
+    # MHz + 3.58 MHz, with 0.1 MHz to spare).  Past the zero the line is
+    # clipped at nothing, and a carrier whose upper chroma sideband lies
+    # there keeps only its lower one: the line then lifts chroma with
+    # luminance, +8.5% at 90 IRE on a disc that matches the model at an
+    # MTF level of 0.96, and Doobie's NTC-7 differential gain read 0.105.
+    # Only levels above ~0.906 (cutoff under 14.4 MHz) are affected.
+    "readout_zero_min_hz": 13.0e6,
+    "readout_max_boost_db": 26.0,
+    # The compensation makes up the RF band-pass's own loss only between
+    # the lowest and highest sidebands the video carries: the sync tip
+    # (7.61 MHz) less the 4.2 MHz luminance band, to peak white (9.31 MHz)
+    # plus it.  Outside that the band-pass is rejecting something - the
+    # analog audio carriers at 2.30 and 2.81 MHz, EFM below 1.75 - and
+    # inverting it there brought both back (5.3 and 5.8 MHz beats at -12
+    # dB on blanking, ggv-ntsc-mb-v2800).
+    "readout_chain_band_hz": (3.4e6, 13.5e6),
+    # Top of the chroma band, above which the inverse-MTF chroma
+    # correction is held flat: the subcarrier plus the 0.6 MHz the NTSC
+    # chrominance upper sideband is limited to (SMPTE 170M).
+    "inverse_mtf_hold_hz": 4.2e6,
     # used to detect rot
     "video_hpf_freq": 10000000,
     "video_hpf_order": 4,
@@ -329,6 +373,37 @@ FilterParams_PAL = {
     "MTF_basemult": 1.0,  # general ** level of the MTF filter for frame 0.
     "MTF_poledist": 0.70,
     "MTF_freq": 10,
+    # The readout MTF model's parameters, as NTSC's (see FilterParams_NTSC):
+    # IEC 60856 clause 11.1 specifies the same reference readout, and a
+    # CAV disc turns at 25 rev/s, so the innermost radius' cutoff is 5/6
+    # of NTSC's; the compensation is unity at the 7.1 MHz blanking
+    # carrier.  PAL stays on the pole pair for now: over 15 PAL captures
+    # the readout model failed 123 conformance checks against the pole
+    # pair's 93 even with each capture's cutoff taken from its CAV radius.
+    # The optics themselves hold: the ITS staircase's chroma sidebands
+    # (carrier at 7.1-7.9 MHz, lower sideband 4.43 MHz below it) read
+    # within 1.5 dB of them on GGV and Industrial discs at every radius.
+    # What the model cannot follow is the disc: PAL's carrier sits within
+    # 3.5 MHz of the cutoff at inner radius, so luminance detail and
+    # chroma above that ride on one sideband alone, and that sideband's
+    # level against the carrier varies by disc - Domesday DD86 inner
+    # reads 4 dB flatter than the optics at its radius - where the pole
+    # pair's 2T servo closes the loop on the pulse itself.
+    "MTF_model": "poles",
+    "readout_rim_intensity": 0.23,
+    "readout_ref_cutoff_hz": 2 * 0.40 / 632.8e-9 * 2 * np.pi * 0.055 * 25.0,
+    "readout_ref_hz": 7.1e6,
+    "readout_zero_fraction": 0.95,
+    "readout_max_boost_db": 26.0,
+    # sync tip (6.76 MHz) less the 5 MHz luminance band, which the RF
+    # band-pass's own low edge (2.3 MHz) cuts first; peak white (7.9 MHz)
+    # plus it (see FilterParams_NTSC)
+    "readout_chain_band_hz": (2.3e6, 12.9e6),
+    # No hold above the chroma band (see FilterParams_NTSC): PAL's video
+    # low-pass (6.3 MHz, 16th order) already ends the boost within 0.6 MHz
+    # of the band's top, and holding it there moved the 2T servo and the
+    # gain ratio on the Domesday radius cuts for no noise measured.
+    "inverse_mtf_hold_hz": None,
     # used to detect rot
     "video_hpf_freq": 10000000,
     "video_hpf_order": 4,

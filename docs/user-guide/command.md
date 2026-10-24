@@ -6,9 +6,9 @@ ld-decode's execution is largely controlled by a number of command line switches
 ld-decode [-h] [--start file-location] [--length frames] [--seek frame] [--PAL] [--NTSC] [--NTSCJ] [-m mtf]
                  [--MTF_offset mtf_offset] [--noAGC] [--noDOD] [--noEFM] [--preEFM] [--tbc_efm] [--efm_demod {pll,timing}] [--efm_conf {auto,on,off}] [--efm_eq_taps N] [--disable_analog_audio] [--AC3]
                  [--start_fileloc start_fileloc] [--ignoreleadout] [--verboseVITS] [--RF_TBC] [--lowband]
-                 [--NTSC_color_notch_filter] [--V4300D_notch_filter] [--V4300D_coherent_subtract] [--V4300D_no_defer]
+                 [--NTSC_color_notch_filter] [--audio_carrier_cancel] [--V4300D_notch_filter] [--V4300D_coherent_subtract] [--V4300D_no_defer]
                  [--deemp_low deemp_low] [--deemp_high deemp_high]
-                 [--deemp_strength deemp_str] [-t threads] [-f FREQ] [--analog_audio_frequency AFREQ]
+                 [--deemp_strength deemp_str] [--no_auto_chroma] [--vits_white_level] [--no_mtf_servo] [--calibration_frames frames] [-t threads] [-f FREQ] [--analog_audio_frequency AFREQ]
                  [--video_bpf_low FREQ] [--video_bpf_high FREQ] [--video_lpf FREQ] [--video_lpf_order VLPF_ORDER]
                  [--audio_filterwidth FREQ] [--use_profiler] [--write-test-ldf output.ldf]
                  infile outfile
@@ -241,6 +241,23 @@ Mitigate interference from analog audio in red colors in NTSC captures.
 ld-decode --NTSC --NTSC_color_notch_filter input.ldf output
 ```
 
+#### `--audio_carrier_cancel`
+Prototype. Subtract the analog audio carriers' intermodulation lines from
+NTSC video. The audio FM carriers mix with the video carrier on the disc, and
+the demodulated video carries faint lines at the carriers' own frequencies
+(2.30 and 2.81 MHz), in the luminance band. Each block's line is fitted to the
+carrier's own phase, taken from the RF, and subtracted; a carrier that is not
+on the disc (and AC3's right channel) is left alone.
+- **Default:** Disabled
+- **Note:** NTSC only. The lines are strongest towards the outer radius of
+  some discs, where removing them lowers the weighted luminance noise by up to
+  about 1.3 dB; on most captures the gain is 0.1-0.5 dB.
+
+**Example:**
+```bash
+ld-decode --NTSC --audio_carrier_cancel input.ldf output
+```
+
 ### PAL-Specific Video Options
 
 Pioneer LD-V4300D players leak their digital-audio master clock
@@ -308,13 +325,74 @@ ld-decode --deemp_high 10.0 input.ldf output
 #### `--deemp_strength deemp_str`
 Strength of deemphasis filter.
 - **Type:** Float
-- **Default:** 1.0
+- **Default:** NTSC 0.96, PAL 1.0
 - **Range:** Typically 0.0 to 2.0
-- **Note:** Multiplier for deemphasis effect; 1.0 is standard, <1.0 reduces effect, >1.0 increases effect
+- **Note:** Multiplier for deemphasis effect; 1.0 is standard, <1.0 reduces effect, >1.0 increases effect.  Giving a value also stops the colour burst from setting the automatic chroma correction's strength (see `--no_auto_chroma`)
 
 **Example:**
 ```bash
 ld-decode --deemp_strength 0.8 input.ldf output
+```
+
+#### `--no_auto_chroma`
+Disable the automatic chroma level correction.
+- **Default:** Enabled
+- **Note:** By default the decoder restores the chroma the disc's optics and the
+  RF filters took away with an inverse-MTF filter on the demodulated video,
+  limited to the chroma band.  The colour burst sets its strength, so the burst
+  is brought to its nominal level (20 IRE NTSC, 21.4 IRE PAL), and the VITS
+  multiburst, where a disc carries one, bounds it.  The correction is written
+  into the `.tbc` and `.cvbs` samples.  With this switch the chroma is written
+  as the filter chain demodulates it, so a disc mastered with a low chroma level
+  keeps it.  Either way the output's capture notes (`capture.capture_notes` in
+  the `.tbc.db`, `cvbs_file.capture_notes` in the `.cvbs.meta`) record the
+  correction's strength, the median burst level as written and as it read
+  before the correction, and the gain that would bring the burst to nominal
+  (`chroma_gain_to_nominal`), for a later decoder to apply or take out.
+
+**Example:**
+```bash
+ld-decode --no_auto_chroma input.ldf output
+```
+
+#### `--vits_white_level`
+Scale the luminance so that the disc's VITS white bar reads 100 IRE.
+- **Default:** Disabled
+- **Note:** Discs are mastered a percent or so either side of nominal level
+  (the NTSC captures tested read their white bar at 98.8-101.7 IRE).  With this
+  switch the decoder reads the white bar of the insertion test signal (PAL's
+  ITS, NTSC's NTC-7 composite) over the first few fields and scales the
+  luminance above blanking by the factor that brings it to 100 IRE.  Sync,
+  burst and chroma are left as they are; the chroma's level is set from the
+  burst (see `--no_auto_chroma`).  The correction is written into the `.tbc`
+  and `.cvbs` samples, and the first few fields, written before the reading
+  settles, are not corrected.  A disc without that test signal is left alone.
+
+**Example:**
+```bash
+ld-decode --vits_white_level input.ldf output
+```
+
+#### `--no_mtf_servo`
+Do not adapt the MTF level from the 2T pulse of the vertical-blanking test signal.
+- **Default:** The servo runs when the disc carries the pulse, and the RF black-to-white ratio gives the level otherwise
+- **Note:** The servo is already off when `-m` is not 1.0 or `--MTF_offset` is not 0; this flag turns it off without changing the level.  It only acts under the pole-pair MTF model (PAL); NTSC's readout MTF model takes its level from the RF and never runs the servo
+
+**Example:**
+```bash
+ld-decode --no_mtf_servo input.ldf output
+```
+
+#### `--calibration_frames frames`
+Run a calibration pass: decode at least this many frames ahead, before the first frame is written, to settle the servos that calibrate the decode from the disc: the AGC, MTF level, inverse-MTF chroma strength, multiburst video EQ and chroma differential-gain corrector. 10 is a good choice.
+- **Type:** Integer
+- **Default:** 0 (no pass)
+- **Note:** Without a pass the decoder writes as soon as its servos are stable, and the slower ones (the 2T servo, the chroma differential-phase decision) can still adopt after writing has begun, so the opening frames of a decode may carry a different calibration from the rest. The pass runs at least this long and then until no servo has moved for 6 fields, within a further 60 fields. On a disc with a test staircase it also waits, up to 25 frames, for the chroma differential-phase decision. It decodes ahead and starts over, so nothing is skipped; the cost is decoding those frames twice at the start, about 3 seconds. A decode of a few frames from a long capture therefore takes noticeably longer (`-l 3`: 4.8 s to 8.1 s); a capture shorter than the pass costs nothing extra, as the pass stops at the end of the input. With a shorter pass the slower servos can still adopt after writing has begun, and a short decode then carries two calibrations. `0`, the default, writes once the servos have been stable for two fields, the video EQ has adopted or held, the 2T servo's level reads back as itself and the chroma differential-gain decision is taken - usually 4-8 frames ahead - and leaves the differential-phase decision until after writing begins.
+- **Log:** a pass reports itself on the console when it starts; either way the decoder logs a line when calibration ends (`Calibrating... settled after 5.5 frames - ...` without a pass), with why it stopped (settled, end of input, field limit) and the MTF level, chroma strength, video EQ and chroma DG it settled on.
+
+**Example:**
+```bash
+ld-decode --calibration_frames 10 input.ldf output
 ```
 
 ### Audio Decoding Options
@@ -486,6 +564,16 @@ Create a `.tbc.ldf` file containing time-base corrected RF data.
 **Example:**
 ```bash
 ld-decode --RF_TBC input.ldf output
+```
+
+#### `--cvbs-legacy-origin`, `--cvbs-spec-origin`
+Where each `.cvbs` frame starts relative to 0H.  The legacy origin keeps the decoder's own line origin, as written before frames were 0H-aligned (NTSC 0H 0.3-1.9 samples after sample 0, PAL -0.1 to -1.04), for readers built to that layout.  `--cvbs-spec-origin` moves the frame origin by whole samples so 0H falls in the sample before sample 0, as the CVBS specification requires.
+- **Default:** legacy origin, for now
+- **Note:** a legacy-origin file is not spec compliant (a spec reader can take NTSC colour frame A for B) and says so in the `.meta` `capture_notes`; `analysis/cvbs_verify.py` fails an NTSC one on its origin check
+
+**Example:**
+```bash
+ld-decode --cvbs-spec-origin input.ldf output
 ```
 
 #### `--ignoreleadout`
