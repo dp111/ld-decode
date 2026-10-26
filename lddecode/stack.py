@@ -166,10 +166,14 @@ class TBCFrameSource(FrameSource):
         self._fshape = (fh, fw)
         self._fbytes = fh * fw * 2
         self._nfields = n
-        self.pcm = None
+        # audio is read per frame like the fields: holding every capture's
+        # whole .pcm cost ~7 GB for a 12-capture side, in every worker
+        self._pcm_fd = None
+        self._pcm_len = 0               # stereo samples
         p = base + ".pcm"
         if os.path.exists(p):
-            self.pcm = np.fromfile(p, dtype="<i2").reshape(-1, 2)
+            self._pcm_fd = os.open(p, os.O_RDONLY)
+            self._pcm_len = os.path.getsize(p) // 4
 
     def prefetch(self, keys):
         """Read the fields of `keys` with one large read per contiguous span.
@@ -182,6 +186,7 @@ class TBCFrameSource(FrameSource):
         if not hasattr(self, "_idx"):
             self._build_index()
         self._cache = {}
+        self._acache = None
         fis = sorted(self._idx[k] for k in keys if k in self._idx)
         if not fis:
             return
@@ -201,32 +206,52 @@ class TBCFrameSource(FrameSource):
         got = len(arr) // (self._fshape[0] * self._fshape[1])
         arr = arr[: got * self._fshape[0] * self._fshape[1]].reshape(got, *self._fshape)
         self._cache = {lo + i: arr[i] for i in range(got)}
+        if self._pcm_fd is not None and self._spf:
+            f0, f1 = lo // 2, hi // 2 + 1
+            a = self._pread(self._pcm_fd, (f1 - f0) * self._spf * 4, f0 * self._spf * 4)
+            a = np.frombuffer(a, dtype="<i2")
+            a = a[: len(a) // 2 * 2].reshape(-1, 2)
+            self._acache = (f0, a)
 
     def drop_prefetch(self):
         self._cache = {}
+        self._acache = None
 
-    def _read_field(self, idx):
-        c = getattr(self, "_cache", None)
-        if c and idx in c:
-            return c[idx]
+    @staticmethod
+    def _pread(fd, n, off):
         # drvfs/9P reads under heavy parallel load occasionally fail with a
         # transient ENOMEM (seen 2026-10-11 at frame ~25k of a 9-capture
         # stack, 22 workers); back off and retry rather than lose the run.
         for attempt in range(8):
             try:
-                buf = os.pread(self._tbc_fd, self._fbytes, idx * self._fbytes)
-                break
+                return os.pread(fd, n, off)
             except OSError as e:
                 if e.errno != errno.ENOMEM or attempt == 7:
                     raise
                 time.sleep(0.5 * 2 ** attempt)
+
+    def _read_field(self, idx):
+        c = getattr(self, "_cache", None)
+        if c and idx in c:
+            return c[idx]
+        buf = self._pread(self._tbc_fd, self._fbytes, idx * self._fbytes)
         return np.frombuffer(buf, dtype="<u2").reshape(self._fshape)
 
+    def _read_audio(self, fi):
+        n = self._spf
+        c = getattr(self, "_acache", None)
+        if c is not None and c[0] <= fi and (fi - c[0] + 1) * n <= len(c[1]):
+            return c[1][(fi - c[0]) * n:(fi - c[0] + 1) * n]
+        a = np.frombuffer(self._pread(self._pcm_fd, n * 4, fi * n * 4), dtype="<i2")
+        return a[: len(a) // 2 * 2].reshape(-1, 2)
+
     def close(self):
-        try:
-            os.close(self._tbc_fd)
-        except OSError:
-            pass
+        for fd in (self._tbc_fd, self._pcm_fd):
+            try:
+                if fd is not None:
+                    os.close(fd)
+            except OSError:
+                pass
 
     def _dropouts(self, fj):
         do = fj.get("dropOuts") or {}
@@ -239,8 +264,8 @@ class TBCFrameSource(FrameSource):
         self._idx = {}
         self._spf = 0
         nframes = len(self.fields) // 2
-        if self.pcm is not None and nframes:
-            self._spf = len(self.pcm) // nframes
+        if self._pcm_fd is not None and nframes:
+            self._spf = self._pcm_len // nframes
         prev = None
         raw = []
         for fi in range(nframes):
@@ -276,8 +301,8 @@ class TBCFrameSource(FrameSource):
         fi = self._idx[key]
         j0, j1 = self.fields[fi * 2], self.fields[fi * 2 + 1]
         audio = None
-        if self.pcm is not None and self._spf:
-            audio = np.asarray(self.pcm[fi * self._spf:(fi + 1) * self._spf])
+        if self._pcm_fd is not None and self._spf:
+            audio = self._read_audio(fi)
         return Frame(
             key,
             self._read_field(fi * 2), self._read_field(fi * 2 + 1),
@@ -428,7 +453,7 @@ def integer_shift(ref, img):
     return -sy, -sx
 
 
-def integer_shift_luma(ref, img, cut=0.17):
+def integer_shift_luma(ref, img, cut=0.17, rows_only=False):
     """Integer (dy, dx) of img vs ref from the luma alone: plain (unwhitened)
     cross-correlation of the two blocks low-passed below cut x fs (0.17 x
     17.7 MHz = 3 MHz).  integer_shift's whitened phase correlation is
@@ -437,7 +462,14 @@ def integer_shift_luma(ref, img, cut=0.17):
     def lp(x):
         X = np.fft.rfft(x - x.mean(), axis=1)
         X[:, int(cut * x.shape[1]) + 1:] = 0
-        return np.fft.irfft(X, x.shape[1], axis=1)
+        return X if rows_only else np.fft.irfft(X, x.shape[1], axis=1)
+    if rows_only:
+        # dy fixed at 0: the line-by-line correlations summed over the lines
+        A, B = lp(ref), lp(img)
+        n = ref.shape[1]
+        c = np.fft.irfft((B * np.conj(A)).sum(0), n)
+        p = int(np.argmax(c))
+        return 0, -(p - (n if p > n // 2 else 0))
     a, b = lp(ref), lp(img)
     c = np.real(np.fft.ifft2(np.fft.fft2(b) * np.conj(np.fft.fft2(a))))
     p = np.unravel_index(np.argmax(c), c.shape)
@@ -482,6 +514,10 @@ def fourier_shift(img, dy, dx):
     if dy == 0 and dx == 0:
         return img
     H, W = img.shape
+    if dy == 0:
+        # a horizontal shift is a 1-D one along each line
+        px = np.exp(-2j * np.pi * np.fft.rfftfreq(W) * dx)[None, :]
+        return np.fft.irfft(np.fft.rfft(img, axis=1) * px, W, axis=1)
     return _apply_shift_spectrum(np.fft.rfft2(img), H, W, dy, dx)
 
 
@@ -493,6 +529,22 @@ def _smooth_axis0(a, sigma):
     k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
     k /= k.sum()
     return np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), 0, a)
+
+
+def _catmull_rom(a, p):
+    """1-D cubic (Catmull-Rom) interpolation of ``a`` at positions ``p``
+    (clamped at the ends).  Linear interpolation at a fractional position is
+    a low-pass (-3.9 dB at 1/4 fs for a half-sample shift: the PAL
+    subcarrier); this is near-flat to there."""
+    n = len(a)
+    ip = np.floor(p).astype(np.int64)
+    f = p - ip
+
+    def tap(off):
+        return a[np.clip(ip + off, 0, n - 1)]
+    m1, p0, p1, p2 = tap(-1), tap(0), tap(1), tap(2)
+    return (p0 + 0.5 * f * (p1 - m1 + f * (2 * m1 - 5 * p0 + 4 * p1 - p2
+            + f * (3 * (p0 - p1) + p2 - m1))))
 
 
 def subpixel_warp_x(img, ref, ra, ca, nblocks=1, max_shift=0.3, line_sigma=4.0):
@@ -534,20 +586,79 @@ def subpixel_warp_x(img, ref, ra, ca, nblocks=1, max_shift=0.3, line_sigma=4.0):
     for k, li in enumerate(range(ra.start, ra.stop)):
         dxrow = (np.full_like(full_x, dxg[k, 0]) if nb == 1
                  else np.interp(full_x, centers, dxg[k]))
-        out[li] = np.interp(full_x + dxrow, full_x, out[li])
+        out[li] = _catmull_rom(out[li], full_x + dxrow)
     return out
 
 
 REG_WALK_MAX = 8          # cold registration: re-centred 5x5 grids before giving up
-# largest vertical registration shift (field lines) searched; captures are line-locked, so it is ~0
-REG_MAX_DY = float(os.environ.get("LDSTACK_REG_MAX_DY", "1.0"))
+# largest vertical registration shift (field lines) searched.  Captures and
+# masters are line-locked (measured |dy| <= 0.07 line on Community South, a
+# fraction of the search step), so the default is 0: the shift is then purely
+# horizontal and every transform is a 1-D one along the lines
+REG_MAX_DY = float(os.environ.get("LDSTACK_REG_MAX_DY", "0"))
+# largest horizontal shift (samples) the cold search accepts.  TBC'd captures
+# sit within ~1.5 samples of each other (masters included); on a black field
+# the luma correlation peak is random (South picture 3100: ds11 at +178)
+REG_MAX_DX = float(os.environ.get("LDSTACK_REG_MAX_DX", "6"))
+# level fit used by the analysis stage (capture noise, master clustering, the
+# cross-master blend weights): "ls" keeps the production measurement.  With
+# the unbiased fit there the two-master three-cornered hat handed a single
+# noisy alt master 39-46 % of the blend (South s3000: was 24-35 %), and
+# newdecode turned that into grain on held stills (bars rms 4.5 -> 8.7 8-bit
+# levels), although every composite noise measure was lower
+MEASURE_FIT = os.environ.get("LDSTACK_MEASURE_FIT", "ls")
+# plausible range of the level-match gain (a capture vs the reference)
+REG_GAIN_MIN = float(os.environ.get("LDSTACK_REG_GAIN_MIN", "0.8"))
+REG_GAIN_MAX = float(os.environ.get("LDSTACK_REG_GAIN_MAX", "1.25"))
+# the gain is shrunk toward 1 by signal / (signal + SHRINK x noise) variance
+REG_GAIN_SHRINK = float(os.environ.get("LDSTACK_REG_GAIN_SHRINK", "10"))
 
 
-def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
+def level_fit_ls(x, y):
+    """Least-squares gain/offset (y on x): the production stacker's fit up to
+    Oct 2026, biased low by noise in x (see level_fit)."""
+    A = np.vstack([x, np.ones_like(x)]).T
+    g, o = np.linalg.lstsq(A, y, rcond=None)[0]
+    return float(g), float(o)
+
+
+def level_fit(x, y, noise_ratio=1.0):
+    """Gain/offset with g * x + o ~= y, both noisy.
+
+    noise_ratio = var(noise of y) / var(noise of x).  Least squares of y on
+    x assumes x is noise-free and is biased low by var(signal) / (var(signal)
+    + var(noise)): on a black field the picture is all noise and the gain
+    came out 0.02-0.8 (South: an alt master squashed flat, sync and burst
+    included).  This is the Deming (errors-in-both) estimate, shrunk toward
+    1 as the picture's signal-to-noise falls - captures differ in gain by a
+    few % at most, and a field with nothing to fit cannot tell more - and
+    clamped to [REG_GAIN_MIN, REG_GAIN_MAX].  (The sync tip is no help: its
+    depth differs between captures by more than their picture gain does.)"""
+    mx, my = x.mean(), y.mean()
+    dx_, dy_ = x - mx, y - my
+    n = max(len(x), 1)
+    sxx, syy, sxy = float(np.dot(dx_, dx_)) / n, float(np.dot(dy_, dy_)) / n, float(np.dot(dx_, dy_)) / n
+    d = max(float(noise_ratio), 1e-6)
+    if sxy <= 0:
+        g = 1.0
+    else:
+        e = syy - d * sxx
+        g = (e + np.sqrt(e * e + 4 * d * sxy * sxy)) / (2 * sxy)
+        # signal variance ~ sxy; noise variance of the pair ~ what is left
+        noise = max(sxx + syy - 2 * sxy, 0.0)
+        g = 1.0 + (g - 1.0) * sxy / (sxy + REG_GAIN_SHRINK * noise)
+    g = float(np.clip(g, REG_GAIN_MIN, REG_GAIN_MAX))
+    return g, float(my - g * mx)
+
+
+def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None,
+                   noise_ratio=1.0, return_level=False, fit="deming"):
     """Return field resampled to align with ref, plus affine level-matched.
     ra/ca are the active row/col slices used for measuring the shift.
     line_reg>0 adds a per-line (==1) / within-line (>1, = #blocks) sub-pixel
     horizontal warp after the global shift, to remove residual intra-line wow.
+    noise_ratio: var(ref noise) / var(field noise), for the level fit.
+    return_level: also return the (gain, offset) applied.
 
     hint: this capture's shift on the previous frame. Inter-capture offsets
     drift slowly, so searching a small window around the hint costs ~9 field
@@ -557,11 +668,13 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
     it only skips work when the answer is already bracketed."""
     fa = field.astype(np.float64)
     best = None
+    rows_only = REG_MAX_DY <= 0
     if subpixel and hint is not None:
-        best = (float(hint[0]), float(hint[1]))
+        best = (0.0 if rows_only else float(hint[0]), float(hint[1]))
     if best is None and not subpixel:
         iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
-        best = (float(iy), float(ix))
+        best = (0.0 if rows_only else float(iy),
+                float(np.clip(ix, -REG_MAX_DX, REG_MAX_DX)))
     if subpixel:
         refblk = ref[ra, ca].astype(np.float32)
         H, W = fa.shape
@@ -571,16 +684,31 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
         # candidate transform; the active block sits far from the padding.
         # The final resample below stays float64 at the true width.
         WP = _sfft.next_fast_len(W, real=True)
-        fpad = np.zeros((H, WP), np.float32)
-        fpad[:, :W] = fa
-        Ffa = _sfft.rfft2(fpad)         # forward FFT once for the whole search
         pyc, pxc = {}, {}
         cands = {}
+        if rows_only:
+            # horizontal shifts only: one 1-D transform per line, and only
+            # the lines the search compares
+            fpad = np.zeros((ra.stop - ra.start, WP), np.float32)
+            fpad[:, :W] = fa[ra]
+            Fr = _sfft.rfft(fpad, axis=1)
+        else:
+            fpad = np.zeros((H, WP), np.float32)
+            fpad[:, :W] = fa
+            Ffa = _sfft.rfft2(fpad)         # forward FFT once for the whole search
 
         def ev(dy, dx):
             key = (round(dy, 4), round(dx, 4))
             if key not in cands:
-                if dy == 0 and dx == 0:
+                if rows_only:
+                    if dx == 0:
+                        s = fpad[:, ca]
+                    else:
+                        px = pxc.get(dx)
+                        if px is None:
+                            px = pxc[dx] = np.exp(-2j * np.pi * np.fft.rfftfreq(WP) * dx).astype(np.complex64)[None, :]
+                        s = _sfft.irfft(Fr * px, n=WP, axis=1)[:, ca]
+                elif dy == 0 and dx == 0:
                     s = fpad[ra, ca]
                 else:
                     s = _shift_search(Ffa, H, WP, dy, dx, pyc, pxc)[ra, ca]
@@ -613,14 +741,16 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
             # survived every later frame through the hints).  The error
             # surface is smooth and single-minimum over +-3 samples, so walk:
             # while the best point is on the 5x5 grid's border, re-centre there.
-            cy, cx = (float(v) for v in integer_shift_luma(ref[ra, ca], fa[ra, ca]))
+            cy, cx = (float(v) for v in integer_shift_luma(ref[ra, ca], fa[ra, ca],
+                                                          rows_only=rows_only))
             # captures (and masters) are line-locked: the vertical offset is 0 (+- a fraction).  On content
             # with no vertical structure (colour bars) the correlation is flat in dy and the search used to
             # land anywhere (fq benchmark, PAL bars: alt masters registered at dy -14..+108 lines)
             cy = float(np.clip(cy, -REG_MAX_DY, REG_MAX_DY))
+            cx = float(np.clip(cx, -REG_MAX_DX, REG_MAX_DX))
             for _ in range(REG_WALK_MAX):
                 bestrms, best, edge = grid(cy, cx, 0.5)
-                if not edge:
+                if not edge or abs(best[1]) >= REG_MAX_DX:
                     break
                 cy, cx = best
             return bestrms, best
@@ -642,24 +772,85 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
             return float(np.clip(0.5 * (fm - fp) / den * h, -h, h))
 
         by, bx = best
-        oy = para(ev(by - 0.25, bx), ev(by, bx), ev(by + 0.25, bx), 0.25)
-        oy = float(np.clip(by + oy, -REG_MAX_DY, REG_MAX_DY) - by)
+        oy = 0.0
+        if not rows_only:
+            oy = para(ev(by - 0.25, bx), ev(by, bx), ev(by + 0.25, bx), 0.25)
+            oy = float(np.clip(by + oy, -REG_MAX_DY, REG_MAX_DY) - by)
         ox = para(ev(by, bx - 0.25), ev(by, bx), ev(by, bx + 0.25), 0.25)
         if (oy or ox) and ev(by + oy, bx + ox) <= bestrms:
             best = (by + oy, bx + ox)
     shifted = fourier_shift(fa, best[0], best[1])
-    # affine level match (gain+offset) to reference over active region
-    x = shifted[ra, ca].ravel()
-    y = ref[ra, ca].ravel()
-    A = np.vstack([x, np.ones_like(x)]).T
-    g, o = np.linalg.lstsq(A, y, rcond=None)[0]
+    # affine level match (gain+offset) to the reference over the active area
+    if fit == "ls":
+        g, o = level_fit_ls(shifted[ra, ca].ravel(), ref[ra, ca].ravel())
+    else:
+        g, o = level_fit(shifted[ra, ca].ravel(), ref[ra, ca].ravel(), noise_ratio)
     out = g * shifted + o
     if line_reg:
         out = subpixel_warp_x(out, ref, ra, ca, nblocks=line_reg)
+    if return_level:
+        return out, best, (g, o)
     return out, best
 
 
-def chroma_align_field(field, ref, ca, fsc_norm=0.25, halfband=0.06):
+# a dropout's energy spreads along the line through the chroma band-pass
+# (~1/halfband samples): its phase estimate ignores this much either side
+CHROMA_DO_GROW = 16
+
+
+def _chroma_band(n, fsc_norm=0.25, halfband=0.06):
+    fr = np.fft.rfftfreq(n)
+    return (fr > fsc_norm - halfband) & (fr < fsc_norm + halfband)
+
+
+def _analytic_band(spec, band, n):
+    """Complex (analytic) chroma-band signal of each line from its rfft."""
+    X = np.zeros((spec.shape[0], n), np.complex128)
+    X[:, :spec.shape[1]] = np.where(band, spec, 0)
+    return np.fft.ifft(X, axis=1)
+
+
+def chroma_phase(field, ref, ca, mask=None, ref_an=None, fsc_norm=0.25, halfband=0.06):
+    """Per-line chroma phase of ``field`` relative to ``ref`` on the active
+    columns, as a complex sum (angle = phase, 0 = no usable samples).
+
+    Samples in ``mask`` (dropouts of either field, True = bad), grown by
+    CHROMA_DO_GROW, are left out: a dropout's chroma-band energy would
+    otherwise pull the whole line's phase.  Without a mask this equals the
+    frequency-domain sum(cF * conj(cR)) (Parseval).  ref_an: the reference's
+    analytic band signal, if already computed."""
+    seg = field[:, ca].astype(np.float64)
+    n = seg.shape[1]
+    band = _chroma_band(n, fsc_norm, halfband)
+    aF = _analytic_band(np.fft.rfft(seg, axis=1), band, n)
+    if ref_an is None:
+        ref_an = _analytic_band(np.fft.rfft(ref[:, ca].astype(np.float64), axis=1), band, n)
+    p = aF * np.conj(ref_an)
+    if mask is not None:
+        m = mask[:, ca]
+        if m.any():
+            from scipy.ndimage import maximum_filter1d
+            m = maximum_filter1d(m.view(np.uint8), 2 * CHROMA_DO_GROW + 1, axis=1).astype(bool)
+            p = np.where(m, 0, p)
+    return p.sum(axis=1)
+
+
+def chroma_rotate(field, ca, rot, fsc_norm=0.25, halfband=0.06):
+    """Rotate each line's chroma band (active columns) by -rot radians."""
+    F = field.astype(np.float64)
+    seg = F[:, ca]
+    n = seg.shape[1]
+    band = _chroma_band(n, fsc_norm, halfband)
+    Ff = np.fft.rfft(seg, axis=1)
+    cF = np.where(band, Ff, 0)
+    chroma = np.fft.irfft(cF, n, axis=1)
+    chroma_aligned = np.fft.irfft(cF * np.exp(-1j * rot)[:, None], n, axis=1)
+    out = F.copy()
+    out[:, ca] = seg - chroma + chroma_aligned
+    return out
+
+
+def chroma_align_field(field, ref, ca, fsc_norm=0.25, halfband=0.06, mask=None):
     """Make a capture's chroma subcarrier phase-coherent with the reference,
     per line, so it survives averaging.
 
@@ -669,32 +860,23 @@ def chroma_align_field(field, ref, ca, fsc_norm=0.25, halfband=0.06):
     (around fSC = fs/4 for both PAL and NTSC at 4*fSC sampling) and rotate its
     phase to match the reference capture's chroma on the same line.  Luma is left
     untouched (it is already pilot-solid).  The result shares the reference's
-    wander -- common-mode -- so it no longer cancels on combine.
+    wander -- common-mode -- so it no longer cancels on combine.  (The stack
+    itself aligns every capture to the consensus phase instead, see
+    _compute_frame; this is the single-reference form.)
     """
-    F = field.astype(np.float64)
-    seg = F[:, ca]
-    R = ref.astype(np.float64)[:, ca]
-    n = seg.shape[1]
-    fr = np.fft.rfftfreq(n)
-    band = (fr > fsc_norm - halfband) & (fr < fsc_norm + halfband)
-    Ff = np.fft.rfft(seg, axis=1)
-    Rf = np.fft.rfft(R, axis=1)
-    cF = np.where(band, Ff, 0)
-    cR = np.where(band, Rf, 0)
-    # per-line phase offset of this capture's chroma vs the reference's
-    dphi = np.angle((cF * np.conj(cR)).sum(axis=1))
-    chroma = np.fft.irfft(cF, n, axis=1)
-    chroma_aligned = np.fft.irfft(cF * np.exp(-1j * dphi)[:, None], n, axis=1)
-    out = F.copy()
-    out[:, ca] = seg - chroma + chroma_aligned
-    return out
+    dphi = np.angle(chroma_phase(field, ref, ca, mask, fsc_norm=fsc_norm, halfband=halfband))
+    return chroma_rotate(field, ca, dphi, fsc_norm, halfband)
 
 
 def dropout_mask(shape, dropouts):
+    """Bool mask (True = dropout) from (fieldLine, startx, endx) records.
+    fieldLine is 1-based: ld-decode writes line + 1 (field.py
+    dropout_errlist_to_tbc) and ld-dropout-correct / newdecode read row
+    fieldLine - 1."""
     m = np.zeros(shape, dtype=bool)
     for line, sx, ex in dropouts:
-        if 0 <= line < shape[0]:
-            m[int(line), int(sx):int(ex)] = True
+        if 1 <= line <= shape[0]:
+            m[int(line) - 1, max(0, int(sx)):int(ex)] = True
     return m
 
 
@@ -1213,6 +1395,35 @@ FRAME_LEVEL_K = float(os.environ.get("LDSTACK_FRAME_LEVEL_K", "8.0"))
 DIFF_DOD = os.environ.get("LDSTACK_DIFF_DOD", "0") not in ("0", "", "no")
 
 
+def masked_median(stack, good):
+    """Per-pixel median along axis 0 over the entries where ``good``; where
+    none is good, the median of all.  (np.median of a NaN-masked stack is
+    NaN wherever ONE entry is masked, and the old fallback to the plain mean
+    put the dropout itself into the reference every capture is judged by.)"""
+    if good.all():
+        return np.median(stack, axis=0)
+    n = good.sum(0)
+    s = np.sort(np.where(good, stack, np.inf), axis=0)
+    k = np.maximum(n, 1)
+    lo = np.take_along_axis(s, ((k - 1) // 2)[None], 0)[0]
+    hi = np.take_along_axis(s, (k // 2)[None], 0)[0]
+    med = 0.5 * (lo + hi)
+    none = n == 0
+    if none.any():
+        med[none] = np.median(stack[:, none], axis=0)
+    return med
+
+
+def _robust_mean(v, floor):
+    """Mean of the values within max(3 robust sigmas, floor) of their median."""
+    v = np.asarray(v, dtype=np.float64)
+    if len(v) < 3:
+        return float(v.mean())
+    med = np.median(v)
+    mad = 1.4826 * np.median(np.abs(v - med))
+    return float(v[np.abs(v - med) <= max(3 * mad, floor)].mean())
+
+
 def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
     """Dropout-aware, inverse-variance weighted combine of registered fields.
 
@@ -1229,8 +1440,8 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
     """
     stack = np.stack(fields, 0)
     good = ~np.stack(masks, 0)
-    med = np.median(np.where(good, stack, np.nan), axis=0)
-    med = np.where(np.isnan(med), stack.mean(0), med)
+    unflagged = good.copy()
+    med = masked_median(stack, good)
     # reject pixels far from the median (catches un-flagged dropouts/glitches)
     thr = (5.0 * np.array(sigma)).reshape(-1, 1, 1)
     good &= np.abs(stack - med[None]) <= thr
@@ -1242,7 +1453,7 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
     # captures' own noise so ordinary disagreement is never rejected.
     if len(fields) >= 4 and LOCAL_SPREAD_K > 0:
         dev = np.abs(stack - med[None])
-        mad = np.median(dev, axis=0) * 1.4826
+        mad = masked_median(dev, unflagged) * 1.4826
         floor = 3.0 * float(np.median(sigma))
         good &= dev <= np.maximum(LOCAL_SPREAD_K * mad, floor)[None]
     w = np.array(weights, dtype=np.float64).reshape(-1, 1, 1) * good
@@ -1254,7 +1465,7 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
         # not all broken.  wsum stays 0 (cross-master fill still gets these pixels: marking them good lost
         # that fill, fq benchmark 0-2 MHz error +14%); the caller only leaves them unflagged if nothing fills
         # them, so the median (out, above) reaches the output instead of an ld-dropout-correct line copy
-        unmasked = (~np.stack(masks, 0)).sum(0)
+        unmasked = unflagged.sum(0)
         info["rej_only"] = (wsum == 0) & (2 * unmasked > len(fields))
     if diff_dod and len(fields) >= 3:
         allbad = wsum == 0
@@ -1292,8 +1503,9 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
 XM_BAND_EDGES_MHZ = (2.0, 3.5, 5.5)
 XM_XOVER_MHZ = 0.3
 XM_REJECT_K = 6.0       # a master's pixel this many sigma from the primary's is a defect
-XM_HF_BAND_MHZ = (5.5, 7.0)     # disc-noise band used to tell masters apart
-XM_HF_CORR_MIN = 0.3            # same master: ~0.6-0.95; different masters: ~0.0
+XM_HF_BAND_MHZ = (5.9, 7.0)     # disc-noise band used to tell masters apart (above PAL chroma, 4.43 + 1.3 MHz)
+XM_HF_CORR_REL = 0.6            # ...and at least this fraction of the typical capture's best correlation
+XM_HF_CORR_MIN = 0.2            # same master: 0.40-0.44 at 5.9-7 MHz (0.6-0.95 at 5.5-7); different masters: 0.04-0.06
 XM_PAD = 64
 XM_GROW = 12             # a >K-sigma disagreement is a defect: exclude its tails too (samples)
 
@@ -1329,9 +1541,10 @@ def _grow_x(mask, n):
 def xm_clusters(frame_dicts, names, ra, ca, fs_hz):
     """Group captures by master from their shared on-disc noise.
 
-    Above 5.5 MHz there is no picture, only noise, and the on-disc part of it
-    is identical across captures of one master and unrelated between masters,
-    so the correlation of the 5.5-7 MHz band separates masters cleanly where
+    Above ~5.9 MHz (PAL chroma reaches 4.43 + 1.3 MHz) there is no picture, only
+    noise, and the on-disc part of it is identical across captures of one
+    master and unrelated between masters, so the correlation of the
+    XM_HF_BAND_MHZ band separates masters cleanly where
     the sub-pixel dx clustering can be marginal (Community South ds5/ds11 sit
     at dx +0.06..+0.5, inside the 0.3 tolerance).  Returns a list of groups,
     largest first."""
@@ -1346,7 +1559,7 @@ def xm_clusters(frame_dicts, names, ra, ca, fs_hz):
         ref = fd[present[0]].f0.astype(np.float64)
         hp = {}
         for n in present:
-            r, _ = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True)
+            r, _ = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True, fit=MEASURE_FIT)
             X = np.fft.rfft(r[ra, ca], axis=1)
             X[:, ~band] = 0
             hp[n] = np.fft.irfft(X, width, axis=1)
@@ -1356,15 +1569,44 @@ def xm_clusters(frame_dicts, names, ra, ca, fs_hz):
                 num[k] = num.get(k, 0.0) + float((hp[a] * hp[b]).sum())
                 den[k] = den.get(k, 0.0) + float(np.sqrt((hp[a] ** 2).sum() * (hp[b] ** 2).sum()))
     corr = {k: num[k] / den[k] for k in num if den[k] > 0}
-    # single-linkage on the correlation graph
+    # single-linkage on the correlation graph.  The level of a same-master
+    # correlation depends on the decode (0.40-0.44 on the Oct 2026 South
+    # decodes, 0.8-0.95 on older ones) and fine picture detail leaks into the
+    # band (map / test-card frames: 0.3-0.5 between masters), so a pair is
+    # linked at XM_HF_CORR_REL of the typical capture's best correlation
+    best = {}
+    for (a, b), v in corr.items():
+        best[a] = max(best.get(a, -1.0), v); best[b] = max(best.get(b, -1.0), v)
+    thr = max(XM_HF_CORR_MIN, XM_HF_CORR_REL * float(np.median(list(best.values())))) if best else XM_HF_CORR_MIN
     groups = []
     for n in names:
         linked = [g for g in groups
-                  if any(corr.get((n, m), corr.get((m, n), 0.0)) >= XM_HF_CORR_MIN for m in g)]
+                  if any(corr.get((n, m), corr.get((m, n), 0.0)) >= thr for m in g)]
         merged = [n] + [m for g in linked for m in g]
         groups = [g for g in groups if g not in linked] + [merged]
     groups.sort(key=len, reverse=True)
     return groups, corr
+
+
+def xm_floor_variance(V, Q, P, groups):
+    """Floor every master's error variance V (M, nb) at its player noise Q
+    (the within-master leave-one-out estimate, NaN where the master has one
+    capture).  A master with ONE capture has no such estimate: it takes a
+    typical capture's (median of the per-capture P over the captures that
+    have one).  Unfloored, a three-cornered-hat V <= 0 (sampling noise, or a
+    master that happens to sit between the others) was clamped to 1e-12 and
+    took ~all the weight."""
+    V = np.array(V, dtype=np.float64)
+    Q = np.array(Q, dtype=np.float64)
+    allp = [P[n] for n in P]
+    for m, g in enumerate(groups):
+        if not np.all(np.isfinite(Q[m])) and allp:
+            Q[m] = np.median(allp, 0) / max(1, len(g))
+    for m in range(len(V)):
+        if np.all(np.isfinite(Q[m])):
+            V[m] = np.maximum(V[m], Q[m])
+        V[m] = np.where(np.isfinite(V[m]), np.maximum(V[m], 1e-12), np.inf)
+    return V
 
 
 def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
@@ -1435,7 +1677,8 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
                 dm = dropout_mask((fh, fw), fd[n].do0)
                 if n == ref_name:
                     regs.append(ref[ra, ca]); dmask |= dm[ra, ca]; continue
-                r, best = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True)
+                r, best = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True,
+                                         fit=MEASURE_FIT)
                 regs.append(chroma_align_field(r, ref, ca)[ra, ca])
                 dmask |= np.roll(dm, (int(round(best[0])), int(round(best[1]))), (0, 1))[ra, ca]
             stacka = np.stack(regs, 0)
@@ -1493,10 +1736,7 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
         q1 = Q[m1] if np.all(np.isfinite(Q[m1])) else (np.median(prim, 0) if prim else q0)
         d = np.maximum((S[(m0, m1)] - q0 - q1) / 2, 0)
         V[m0], V[m1] = q0 + d, q1 + d
-    for m in range(M):
-        if np.all(np.isfinite(Q[m])):
-            V[m] = np.maximum(V[m], Q[m])
-        V[m] = np.where(np.isfinite(V[m]), np.maximum(V[m], 1e-12), np.inf)
+    V = xm_floor_variance(V, Q, P, groups)
     alpha = (1.0 / V) / (1.0 / V).sum(0, keepdims=True)
     # picture/blank-line power ratio of each master's difference from the
     # primary: information only (it is 4-8x even within one master, because
@@ -1591,8 +1831,7 @@ def perframe_weights(regs, masks, global_w, ra, ca, drop=True, drop_mult=3.0,
         return list(gw)
     stack = np.stack([r[ra, ca] for r in regs], 0)
     good = ~np.stack([m[ra, ca] for m in masks], 0)
-    med = np.median(np.where(good, stack, np.nan), axis=0)
-    med = np.where(np.isnan(med), stack.mean(0), med)
+    med = masked_median(stack, good)
     resid = np.empty(len(regs))
     for i in range(len(regs)):
         d = (stack[i] - med)[good[i]]
@@ -1611,14 +1850,21 @@ def perframe_weights(regs, masks, global_w, ra, ca, drop=True, drop_mult=3.0,
     return list(eff)
 
 
-def align_audio(ref, x, maxlag=4000):
+# a lag is only trusted when the normalised correlation peak reaches this;
+# otherwise (silence, hiss) the capture keeps its lag from the previous frame,
+# or 0 (captures aligned on the picture number agree to ~0.05 sample)
+AUDIO_LAG_MIN_CORR = float(os.environ.get("LDSTACK_AUDIO_LAG_MIN_CORR", "0.5"))
+
+
+def align_audio(ref, x, maxlag=4000, return_peak=False):
     """Sub-sample lag of x vs ref (mono): the integer central-segment xcorr peak
     refined by parabolic interpolation of its two neighbours.  Returns a float;
     a fractional shift removes the +-0.5-sample quantisation that otherwise combs
-    out high audio frequencies when capture waveforms are averaged."""
+    out high audio frequencies when capture waveforms are averaged.
+    return_peak: return (lag, normalised correlation at the peak)."""
     n = min(len(ref), len(x))
     if n < 256:
-        return 0.0
+        return (0.0, 0.0) if return_peak else 0.0
     s, L = n // 4, n // 2
     r = ref[s:s + L] - ref[s:s + L].mean()
     rn = np.linalg.norm(r) + 1e-9
@@ -1637,7 +1883,7 @@ def align_audio(ref, x, maxlag=4000):
         denom = a - 2 * b + c
         if denom != 0 and a > -1.9 and c > -1.9:
             lag += 0.5 * (a - c) / denom
-    return lag
+    return (lag, float(corr[j])) if return_peak else lag
 
 
 def frac_shift_audio(a, lag):
@@ -1711,7 +1957,7 @@ def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0,
         reg = {}
         for n, fr in fd.items():
             r, best = register_field(fr.f0.astype(np.float64), ref, ra, ca,
-                                     subpixel=True)
+                                     subpixel=True, fit=MEASURE_FIT)
             shifts[n].append(best[1])           # dx (sub-pixel)
             reg[n] = r[ra, ca]
         med = np.median(np.stack(list(reg.values()), 0), 0)
@@ -1757,6 +2003,42 @@ def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0,
 # --------------------------------------------------------------------------- #
 #  Output writer (.tbc / .tbc.json / .tbc.db / .pcm / .efm)
 # --------------------------------------------------------------------------- #
+# longest run of missing pictures padded with repeats (longer runs are logged, not padded)
+GAP_MAX = int(os.environ.get("LDSTACK_GAP_MAX", "250"))
+
+
+def _bcd(v, digits):
+    return int("%0*d" % (digits, v), 16)
+
+
+def picture_vbi(prev_vbi, prev_key, key):
+    """VBI words (field 0, field 1) for a padded frame with picture/frame
+    number ``key``, in the form of the previous frame: CAV 0xFxxxxx on lines
+    17/18 of the first field, or the CLV picture number and time code, as
+    ld-discmap writes them.  Anything else: the previous frame's VBI."""
+    words = [w for v in prev_vbi for w in (v or [])]
+    if cav_picture(words) == prev_key:
+        c = 0xF00000 | _bcd(key % 100000, 5)
+        return [0, c, c], [0, 0, 0]
+    if clv_frame(words) == prev_key:
+        sec, pic = divmod(key, 25)
+        mins, sec = divmod(sec, 60)
+        hr, mn = divmod(mins, 60)
+        p = 0x80E000 | ((0xA + sec // 10) << 16) | ((sec % 10) << 8) | _bcd(pic, 2)
+        t = 0xF0DD00 | ((hr & 0xF) << 16) | _bcd(mn, 2)
+        return [p, t, t], [0, 0, 0]
+    return list(prev_vbi[0]), list(prev_vbi[1])
+
+
+def pad_frame(r, prev_key, key):
+    """A stack result repeating r's picture and audio as picture ``key``."""
+    v0, v1 = picture_vbi([f[2] for f in r["fields"]], prev_key, key)
+    fields = [(outu, meta, vb, [], None, audio_n)
+              for (outu, meta, _, _, _, audio_n), vb in zip(r["fields"], (v0, v1))]
+    return {"fields": fields, "audio": r["audio"], "filled": 0, "repaired": 0,
+            "extra_reg": 0, "key": key, "fstats": {}}
+
+
 class StackWriter:
     def __init__(self, outbase, vp, system, git_commit=""):
         self.outbase = outbase
@@ -1795,9 +2077,11 @@ class StackWriter:
                 vbi1 INTEGER, vbi2 INTEGER, PRIMARY KEY(capture_id, field_id));
             CREATE TABLE drop_outs(capture_id INTEGER, field_id INTEGER,
                 field_line INTEGER, startx INTEGER, endx INTEGER);
+            CREATE TABLE vits_metrics(capture_id INTEGER, field_id INTEGER,
+                b_psnr REAL, w_snr REAL, PRIMARY KEY(capture_id, field_id));
         '''))
 
-    def write_field(self, arr_u16, meta, vbidata, dropouts, efm_t, audio_n):
+    def write_field(self, arr_u16, meta, vbidata, dropouts, efm_t, audio_n, pad=False):
         self.tbc.write(np.ascontiguousarray(arr_u16, dtype="<u2").tobytes())
         fid = self._field_id
         self._field_id += 1
@@ -1817,14 +2101,16 @@ class StackWriter:
             do["fieldLine"].append(int(line)); do["startx"].append(int(sx)); do["endx"].append(int(ex))
         if do["fieldLine"]:
             fj["dropOuts"] = do
+        if pad:
+            fj["pad"] = True        # ld-discmap's mark for a frame no source had
         self.fields_json.append(fj)
         self.db.execute(
             "INSERT INTO field_record(capture_id,field_id,audio_samples,efm_t_values,"
-            "field_phase_id,is_first_field,sync_conf,median_burst_ire,pad,disk_loc) "
-            "VALUES(0,?,?,?,?,?,?,?,0,?)",
+            "field_phase_id,is_first_field,sync_conf,median_burst_ire,pad,disk_loc,file_loc) "
+            "VALUES(0,?,?,?,?,?,?,?,?,?,0)",
             (fid, int(audio_n), int(efm_t), int(fj["fieldPhaseID"]),
              1 if fj["isFirstField"] else 0, fj["syncConf"], fj["medianBurstIRE"],
-             fj["diskLoc"]))
+             1 if pad else 0, fj["diskLoc"]))
         v = list(vbidata) + [0, 0, 0]
         self.db.execute("INSERT INTO vbi VALUES(0,?,?,?,?)", (fid, v[0], v[1], v[2]))
         for line, sx, ex in dropouts:
@@ -1834,7 +2120,7 @@ class StackWriter:
     def write_audio(self, audio):
         if audio is None:
             return
-        a = np.ascontiguousarray(np.clip(audio, -32768, 32767), dtype="<i2")
+        a = np.ascontiguousarray(np.clip(np.round(audio), -32768, 32767), dtype="<i2")
         self.pcm.write(a.tobytes())
         self.audio_total += a.shape[0]
 
@@ -2109,14 +2395,36 @@ def _compute_frame(fd, P, hints=None):
         present_primary = sorted(present_primary,
                                  key=lambda n: abs(means[n] - cons))
     ref_frame = fd[present_primary[0]]
+    ref_name = present_primary[0]
     filled = 0
     repaired = 0
     extra_reg = 0                   # fields whose alt was registered for repair only
+    xm_misaligned = 0               # alt-master fields left out of the blend (alt_aligned failed)
     out_fields = []
+    fill_lim = max(FILL_SANITY_K * float(np.median(list(sig.values()))), 1500.0)
 
-    def repair_from(out, valid, alts):
+    def fill_implausible(f):
+        """Samples of a fill estimate whose local luma (8-sample box: two
+        subcarrier cycles, chroma cancels) is further than fill_lim from that
+        of its own lines above and below (FILL_SANITY_K).  On the composite
+        itself saturated PAL chroma alone differs 4000-5000 between adjacent
+        field lines, and clean alt-master fills of master-level dropouts
+        were refused (South picture 7979)."""
+        from scipy.ndimage import uniform_filter1d
+        est = np.empty_like(f)
+        est[1:-1] = 0.5 * (f[:-2] + f[2:])
+        est[0], est[-1] = f[1], f[-2]
+        return np.abs(uniform_filter1d(f - est, REPAIR_LUMA_W, axis=1)) > fill_lim
+
+    def log_misaligned(ai, c0, cs, sd):
+        if REPAIR_DUMP:
+            with open(os.path.join(REPAIR_DUMP, "misaligned.txt"), "a") as fh:
+                fh.write(f"{fd[present_primary[0]].key} f{which} a{ai} corr0 {c0:.3f} shifted {cs:.3f} std {sd:.0f}\n")
+
+    def repair_from(out, valid, alts, aligned=False):
         """Master-defect repair: a defect every primary carries (cut into the
-        primary glass master) taken from an alt master that is clean there."""
+        primary glass master) taken from an alt master that is clean there.
+        aligned: the alts have already passed alt_aligned against out."""
         n = 0
         rawk = os.environ.get("LDSTACK_REPAIR_RAWDUMP_KEYS", "")
         if REPAIR_DUMP and rawk and str(fd[present_primary[0]].key) in rawk.split(","):
@@ -2126,12 +2434,11 @@ def _compute_frame(fd, P, hints=None):
                                 ra=np.array([ra.start, ra.stop]), ca=np.array([ca.start, ca.stop]))
         for ai, (alt, alt_ok) in enumerate(alts):
             rra = slice(REPAIR_ROW0, min(REPAIR_ROW1, out.shape[0] - 1))
-            al, c0, cs, sd = alt_aligned(out, alt, valid & alt_ok, rra, ca)
-            if REPAIR_DUMP and not al:
-                with open(os.path.join(REPAIR_DUMP, "misaligned.txt"), "a") as fh:
-                    fh.write(f"{fd[present_primary[0]].key} f{which} a{ai} corr0 {c0:.3f} shifted {cs:.3f} std {sd:.0f}\n")
-            if not al:
-                continue
+            if not aligned:
+                al, c0, cs, sd = alt_aligned(out, alt, valid & alt_ok, rra, ca)
+                if not al:
+                    log_misaligned(ai, c0, cs, sd)
+                    continue
             rm, rsig = master_repair_mask(out, valid, alt, alt_ok, rra, ca,
                                           black=P.get("black"))
             if rm is None or not rm.any():
@@ -2166,26 +2473,24 @@ def _compute_frame(fd, P, hints=None):
     for fidx, which in enumerate(("f0", "f1")):
         ref_field = getattr(ref_frame, which).astype(np.float64)
         do_attr = "do0" if which == "f0" else "do1"
+        ref_mask = dropout_mask((fh, fw), getattr(ref_frame, do_attr))
+        rib = integrity_bad.get(ref_name, {}).get(which)
+        if rib is not None and rib.any():
+            ref_mask[rib, :] = True
+        ref_an = None
+        # consensus of the primary captures (set by its combine_set): level
+        # (A, B) and chroma phase per line.  Everything registers to the
+        # reference capture, but the output is put at the mean of all the
+        # primary captures' levels and phases: tied to the reference alone it
+        # jumped whenever the reference changed (12,604 times on Community
+        # South: ~1 IRE level flicker, ~2 deg hue jitter between frames).
+        cons = {}
 
-        def combine_set(names, diff_dod=False, info=None):
-            regs, masks, ws, sigs = [], [], [], []
+        def combine_set(names, diff_dod=False, info=None, primary=False):
+            nonlocal ref_an
+            regs, masks, ws, sigs, levels = [], [], [], [], []
             for n in names:
                 fr = fd[n]
-                if fr is ref_frame:
-                    # registering/phase-aligning the reference to itself is an
-                    # identity (the search provably lands at (0,0), the affine
-                    # at gain 1 offset 0, the chroma rotation at 0) -- skip it
-                    reg = ref_field
-                else:
-                    hk = (n, which)
-                    reg, shift = register_field(
-                        getattr(fr, which).astype(np.float64), ref_field,
-                        ra, ca, P["subpixel"], line_reg=P["line_reg"],
-                        hint=(hints or {}).get(hk) if WARM else None)
-                    out_shifts[hk] = shift
-                    if P["chroma_align"]:
-                        reg = chroma_align_field(reg, ref_field, ca)
-                regs.append(reg)
                 m = dropout_mask((fh, fw), getattr(fr, do_attr))
                 # Mask this capture's locally mistimed lines instead of
                 # discarding its whole frame; the other captures cover them
@@ -2193,8 +2498,51 @@ def _compute_frame(fd, P, hints=None):
                 ib = integrity_bad.get(n, {}).get(which)
                 if ib is not None and ib.any():
                     m[ib, :] = True
+                if fr is ref_frame:
+                    # registering the reference to itself is an identity (the
+                    # search provably lands at (0,0), the level fit at gain 1
+                    # offset 0) -- skip it
+                    reg, lev = ref_field, (1.0, 0.0)
+                else:
+                    hk = (n, which)
+                    # equal-noise level fit: analyse()'s noise leaves out the
+                    # disc noise the reference carries, and as the ratio it
+                    # put alt masters at gain 1.04 on the fq bench (truth 1)
+                    reg, shift, lev = register_field(
+                        getattr(fr, which).astype(np.float64), ref_field,
+                        ra, ca, P["subpixel"], line_reg=P["line_reg"],
+                        hint=(hints or {}).get(hk) if WARM else None,
+                        return_level=True)
+                    out_shifts[hk] = shift
+                    # the dropout mask moves with the picture (alt masters sit 0.5-1.5 samples off)
+                    sy, sx = int(round(shift[0])), int(round(shift[1]))
+                    if (sy or sx) and m.any():
+                        m = np.roll(m, (sy, sx), (0, 1))
+                regs.append(reg)
                 masks.append(m)
+                levels.append(lev)
                 ws.append(weights[n]); sigs.append(sig[n])
+            if P["chroma_align"]:
+                # per-line chroma phase of each capture vs the reference,
+                # dropouts (of either) left out; every capture is then rotated
+                # to the primary captures' consensus phase
+                if ref_an is None:
+                    seg = ref_field[:, ca]
+                    ref_an = _analytic_band(np.fft.rfft(seg, axis=1),
+                                            _chroma_band(seg.shape[1]), seg.shape[1])
+                zs = [np.ones(fh, complex) if fd[n] is ref_frame
+                      else chroma_phase(r, ref_field, ca, m | ref_mask, ref_an=ref_an)
+                      for n, r, m in zip(names, regs, masks)]
+                ph = [np.angle(z) for z in zs]
+                if primary:
+                    c = sum(w * (np.abs(z) > 0) * np.exp(1j * p) for w, z, p in zip(ws, zs, ph))
+                    cons["phase"] = np.angle(c)
+                phc = cons.get("phase", 0.0)
+                regs = [chroma_rotate(r, ca, p - phc) for r, p in zip(regs, ph)]
+            if primary:
+                # (plain mean but for a gross outlier: > 5 % gain / ~5 IRE)
+                cons["level"] = (_robust_mean([1.0 / g for g, _ in levels], 0.05),
+                                 -_robust_mean([o / g for g, o in levels], 2000.0))
             if P["reg_confidence"]:
                 ws = perframe_weights(regs, masks, ws, ra, ca,
                                       drop=True, drop_mult=P["reg_drop_mult"])
@@ -2205,42 +2553,61 @@ def _compute_frame(fd, P, hints=None):
         # flagged them (user instruction): leave them for the dropout
         # corrector rather than trusting flagged samples
         prim_info = {} if (REJ_KEEP_MEDIAN and len(present_primary) >= 3) else None
-        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD, info=prim_info)
+        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD, info=prim_info,
+                                primary=True)
         # ---- cross-master blend: average the masters' estimates per band
         blended = False
         xm_alts = []                # (estimate, ok) per alt master, for repair
         fill_cache = None
         if xm is not None:
             alt_sets = []
+            rra = slice(REPAIR_ROW0, min(REPAIR_ROW1, fh - 1))
             for m, names in enumerate(P["xm_groups"][1:], 1):
                 pres = [n for n in names if n in fd]
                 if not pres:
                     continue
                 fo, fws = combine_set(pres)
+                # an alt master that does not line up with the primary on this
+                # field (another picture: South 29733; misregistered: 16374,
+                # 50144) is left out of the blend, not only of the repair
+                al, c0, cs, sd = alt_aligned(out, fo, (wsum > 0) & (fws > 0), rra, ca)
+                if not al:
+                    log_misaligned(m - 1, c0, cs, sd)
+                    xm_misaligned += 1
+                    continue
                 alt_sets.append((m, fo, fws > 0))
                 xm_alts.append((fo, fws > 0))
             # repair primary-master defects BEFORE the blend: blended, a defect
             # is diluted by the alt and no longer passes the repair's tests
             # (North test card frames 2996-2999: streak halved, not repaired)
             if REPAIR_K > 0 and xm_alts:
-                out, n = repair_from(out, wsum > 0, xm_alts)
+                out, n = repair_from(out, wsum > 0, xm_alts, aligned=True)
                 repaired += n
-            ests = [(0, out, wsum > 0)]
+            prim_ok = wsum > 0
+            ests = [(0, out, prim_ok)]
             for m, fo, ok in alt_sets:
                 # a defect on an alt master (often a single capture, so nothing
                 # inside its own combine can reject it) must not reach the output,
                 # nor its tails (XM_GROW)
                 if xm["sig"][m] > 0:
-                    dis = (wsum > 0) & ok & (np.abs(fo - out) > XM_REJECT_K * xm["sig"][m])
-                    ok = ok & ~_grow_x(dis, XM_GROW)
+                    dis = prim_ok & ok & (np.abs(fo - out) > XM_REJECT_K * xm["sig"][m])
+                    # (not onto pixels no primary covers: next to a primary
+                    # dropout the disagreement is the dropout's unflagged
+                    # tail, and the grown mask refused the alt the fill)
+                    ok = ok & ~(_grow_x(dis, XM_GROW) & prim_ok)
+                # where no primary capture is usable the alts are all there is
+                # (a fill): the fill path's plausibility test applies
+                if FILL_SANITY_K > 0:
+                    ok = ok & ~(~prim_ok & fill_implausible(fo))
                 ests.append((m, fo, ok))
             if len(ests) > 1:
                 out, anyok = xm_blend(ests, xm["alpha"], ra, ca, P["fs_hz"])
+                filled += int((anyok & ~prim_ok).sum())
                 wsum = np.where(anyok, np.maximum(wsum, 1e-6), wsum)
                 blended = True
         allbad = (wsum == 0)            # dropout present in EVERY primary disc
         # ---- cross-master fill: patch master-level dropouts from alt master
-        if present_fill and allbad.any() and not blended:
+        if present_fill and allbad.any() and not blended and xm is None:
             fout, fws = combine_set(present_fill)
             fill_cache = (fout, fws)
             fillable = allbad & (fws > 0)
@@ -2253,19 +2620,14 @@ def _compute_frame(fd, P, hints=None):
             # neighbourhood; where it is not, leave the pixel flagged so the
             # downstream dropout corrector conceals it instead.
             if fillable.any() and FILL_SANITY_K > 0:
-                est = np.empty_like(fout)
-                est[1:-1] = 0.5 * (fout[:-2] + fout[2:])
-                est[0], est[-1] = fout[1], fout[-2]
-                lim = max(FILL_SANITY_K * float(np.median(list(sig.values()))), 1500.0)
-                implausible = fillable & (np.abs(fout - est) > lim)
-                fillable &= ~implausible
+                fillable &= ~fill_implausible(fout)
             if fillable.any():
                 out = out.copy()
                 out[fillable] = fout[fillable]
                 filled += int(fillable.sum())
                 allbad = allbad & ~fillable
         # ---- master-defect repair (no cross-master blend: from the fill captures)
-        if REPAIR_K > 0 and not xm_alts and present_fill:
+        if REPAIR_K > 0 and not xm_alts and present_fill and xm is None:
             valid = wsum > 0
             go = True
             if fill_cache is None and REPAIR_PRESCREEN:
@@ -2288,6 +2650,10 @@ def _compute_frame(fd, P, hints=None):
                         del out_shifts[k]
                 out, n = repair_from(out, valid, [(fill_cache[0], fill_cache[1] > 0)])
                 repaired += n
+        # the primary captures' consensus level (see cons)
+        A, B = cons.get("level", (1.0, 0.0))
+        if A != 1.0 or B != 0.0:
+            out = A * out + B
         outu = np.clip(np.round(out), 0, 65535).astype(np.uint16)
         meta = ref_frame.meta0 if which == "f0" else ref_frame.meta1
         resid_do = []                   # still bad after cross-fill
@@ -2296,12 +2662,13 @@ def _compute_frame(fd, P, hints=None):
         if allbad.any():
             # one entry per RUN of bad samples (gaps <= RESID_DO_GAP merged), not one min..max span per
             # line: two bad pixels at x=200 and x=1000 used to flag the 800 good samples between them,
-            # which ld-dropout-correct then replaced from another line (EcoDisc_S2: 45M samples flagged)
+            # which ld-dropout-correct then replaced from another line (EcoDisc_S2: 45M samples flagged).
+            # fieldLine is 1-based (row + 1), as ld-decode writes it
             for ln in np.where(allbad.any(1))[0]:
                 xs = np.where(allbad[ln])[0]
                 brk = np.where(np.diff(xs) > RESID_DO_GAP + 1)[0]
                 for a, b in zip(np.r_[0, brk + 1], np.r_[brk, len(xs) - 1]):
-                    resid_do.append((int(ln), int(xs[a]), int(xs[b]) + 1))
+                    resid_do.append((int(ln) + 1, int(xs[a]), int(xs[b]) + 1))
         # EFM: pool ALL discs (the digital data is master-independent)
         efm_src = [n for n in present_primary + present_fill
                    if fd[n].efm is not None]
@@ -2327,7 +2694,21 @@ def _compute_frame(fd, P, hints=None):
             fa = fd[n].audio
             if fa is None or fa.shape != ref_audio.shape:
                 continue
-            lag = align_audio(refm, fa[:, 0].astype(np.float64))
+            lag = 0.0
+            if fd[n] is not ref_frame:
+                lag, pk = align_audio(refm, fa[:, 0].astype(np.float64), return_peak=True)
+                hk = (n, "audio")
+                if pk < AUDIO_LAG_MIN_CORR:
+                    # silence / hiss: the peak is anywhere in +-maxlag.  Keep
+                    # the previous frame's lag if it was against this reference
+                    h = (hints or {}).get(hk)
+                    if h is None or h[0] != ref_name:
+                        lag = 0.0
+                    else:
+                        lag = h[1]
+                        out_shifts[hk] = h
+                else:
+                    out_shifts[hk] = (ref_name, lag)
             aligned.append(frac_shift_audio(fa, lag))
             awts.append(weights[n])
         if aligned:
@@ -2337,8 +2718,8 @@ def _compute_frame(fd, P, hints=None):
               "resid_do": [sum(b - a for _, a, b in f[3]) for f in out_fields]}
     return {"fields": out_fields, "audio": audio_out, "filled": filled,
             "repaired": repaired, "extra_reg": extra_reg, "shifts": out_shifts,
+            "xm_misaligned": xm_misaligned, "key": ref_frame.key,
             "fstats": fstats}
-
 
 _WORKER_STATE = None            # (sources, P) inherited by forked pool workers
 
@@ -2451,13 +2832,17 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
           scratch_dir=None, git_commit="", reg_confidence=True, reg_drop_mult=3.0,
           line_reg=0, jobs=0, cross_master=False, log=print):
     aw = analysis_window or max(sample * 2, 40)
-    merged = lockstep(sources)
+    # indexed .tbc sources are sampled across the side and stacked by key
+    # below: they need no head window (it held up to 512 frames of every
+    # capture in memory for the whole stack)
+    all_tbc = all(isinstance(s, TBCFrameSource) for s in sources)
+    merged = None if all_tbc else lockstep(sources)
 
     # ---- buffer an initial window for the quality / master analysis ----
     # (live .ldf sources only know their geometry once decoding has started, so
     # pull frames first, then read videoParameters)
-    head_buf, nfull = head_window(merged, len(sources), aw)
-    if not head_buf:
+    head_buf, nfull = ([], aw) if all_tbc else head_window(merged, len(sources), aw)
+    if not head_buf and not (all_tbc and any(s.keys() for s in sources)):
         raise SystemExit("no frames shared across all captures")
     if nfull < aw:
         log(f"[stack] head window: only {nfull} of the first {len(head_buf)} "
@@ -2519,7 +2904,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
                     info[n]["keep"] = mid == 0
                     info[n]["reason"] = ("disc-noise cluster" if mid == 0
                                          else "alt master (disc-noise cluster)")
-        log("[stack] masters by shared 5.5-7 MHz disc noise: "
+        log("[stack] masters by shared %g-%g MHz disc noise: " % XM_HF_BAND_MHZ
             + " | ".join(",".join(g) for g in groups))
     if not indexed:
         log("[stack] streaming sources: master clustering from the opening "
@@ -2570,6 +2955,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         if xm is None:
             log("[stack] cross-master: masters never overlap in the sample - fill only")
 
+    del asample
     writer = StackWriter(outbase, vp, system, git_commit)
     # LDSTACK_FRAME_STATS=<file>: one line per output frame (does not change the stack):
     # frame, picture, captures available / used (primary master), alt captures used, pixels
@@ -2583,7 +2969,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
     filled_total = 0
     repaired_total = 0
     extra_reg_total = 0
-    import itertools
+    xm_mis_total = 0
 
     P = dict(primary=primary, fill_sources=fill_sources, cross_fill=cross_fill,
              black=float(vp.get("black16bIre", 0)) or None,
@@ -2592,15 +2978,16 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
              reg_confidence=reg_confidence, reg_drop_mult=reg_drop_mult,
              xm=xm, xm_groups=xm_groups, fs_hz=fs_hz)
 
-    def emit(r):
-        nonlocal nwritten, filled_total, repaired_total, extra_reg_total
-        if r is None:
-            return
+    last = {"key": None, "r": None}
+    padded = []                 # (first, last) picture of each padded hole
+
+    def write_result(r, pad=False):
+        nonlocal nwritten, filled_total, repaired_total, extra_reg_total, xm_mis_total
         for outu, meta, vbidata, resid_do, efm_avi, audio_n in r["fields"]:
             efm_t = 0
             if efm_avi is not None:
                 efm_stream.append(efm_avi); efm_t = len(efm_avi)
-            writer.write_field(outu, meta, vbidata, resid_do, efm_t, audio_n)
+            writer.write_field(outu, meta, vbidata, resid_do, efm_t, audio_n, pad=pad)
         if r["audio"] is not None:
             writer.write_audio(r["audio"])
         if fstats_fh is not None:
@@ -2613,15 +3000,40 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             fstats_fh.write("%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n" % (
                 nwritten, "" if pic is None else pic, len(fs.get("avail", [])),
                 len(fs.get("used", [])), len(fs.get("used_alt", [])), r["filled"], r.get("repaired", 0),
-                sum(fs.get("resid_do", [])), nm(fs.get("used", [])), nm(fs.get("used_alt", []))))
+                sum(fs.get("resid_do", [])), "pad" if pad else nm(fs.get("used", [])),
+                nm(fs.get("used_alt", []))))
         filled_total += r["filled"]
         repaired_total += r.get("repaired", 0)
         extra_reg_total += r.get("extra_reg", 0)
+        xm_mis_total += r.get("xm_misaligned", 0)
         nwritten += 1
         if nwritten % 50 == 0:
             log(f"  ... {nwritten} frames")
 
-    all_tbc = all(isinstance(s, TBCFrameSource) for s in sources)
+    def emit(r):
+        """Write a frame, padding the output first for pictures between the
+        previous frame and this one that no capture carried (or none could
+        stack): without that every later frame, and the audio, sits one
+        frame early against its picture number (Volcanoes_S1: picture 15712
+        is in no capture).  A padded frame repeats the previous one with its
+        picture number and pad=True, as ld-discmap pads a missing frame."""
+        if r is None:
+            return
+        k, pk = r.get("key"), last["key"]
+        if pk is not None and k is not None and k - pk > 1:
+            hole = k - pk - 1
+            if hole <= GAP_MAX:
+                for gk in range(pk + 1, k):
+                    write_result(pad_frame(last["r"], pk, gk), pad=True)
+                padded.append((pk + 1, k - 1))
+                log(f"[stack] pictures {pk + 1}-{k - 1} in no usable capture: "
+                    f"padded with {hole} repeat(s) of picture {pk}")
+            else:
+                log(f"[stack] pictures {pk + 1}-{k - 1} in no usable capture: "
+                    f"{hole} frames is more than LDSTACK_GAP_MAX={GAP_MAX}, not padded")
+        write_result(r)
+        if k is not None:
+            last["key"], last["r"] = k, r
 
     def _run(work, submit, depth):
         """Drive the combine, retiring results in order at a fixed lag.
@@ -2719,7 +3131,12 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         # Streaming sources cannot be asked for a key twice, so the frames
         # arrive in lockstep order and are stacked as they come.
         def _fds():
-            for _key, fd in itertools.chain(head_buf, merged):
+            # hand the head window over frame by frame so it is not held
+            # for the whole stack
+            head_buf.reverse()
+            while head_buf:
+                yield head_buf.pop()[1]
+            for _key, fd in merged:
                 yield fd
 
         if jobs and jobs > 1:
@@ -2806,7 +3223,9 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         + (f", {outbase}.data (merged EFM)" if efm_merged else "")
         + f" ({nwritten} frames; {filled_total} px cross-master filled; "
         f"{repaired_total} px primary-master defects repaired from an alt master; "
-        f"{extra_reg_total} fields registered an alt master for the repair check)")
+        f"{extra_reg_total} fields registered an alt master for the repair check; "
+        f"{xm_mis_total} alt-master fields not aligned, left out of the blend; "
+        f"{sum(b - a + 1 for a, b in padded)} frames padded in {len(padded)} gaps)")
     return info
 
 
@@ -2874,7 +3293,7 @@ def main(argv=None):
                    help="blend ALL masters' captures, per frequency band, instead "
                    "of using alt masters only to fill dropouts: on-disc noise is "
                    "per glass master, so averaging masters reduces it.  Masters "
-                   "are grouped by their shared 5.5-7 MHz disc noise")
+                   "are grouped by their shared 5.9-7 MHz disc noise")
     p.add_argument("--masters", type=str, default=None,
                    help="explicit master grouping instead of auto-clustering; "
                    "groups separated by ';', captures by ',', first group is the "

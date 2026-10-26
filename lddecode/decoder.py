@@ -452,7 +452,8 @@ class LDdecode:
                 # touches the connection at open and after close() has
                 # drained that stage.
                 self.dbconn = sqlite3.connect(fname_out + '.tbc.db',
-                                              check_same_thread=False)
+                                              check_same_thread=False,
+                                              timeout=600)
                 self.create_db_schema()
 
         self.pipe_rftbc = extra_options.get("pipe_RF_TBC", None)
