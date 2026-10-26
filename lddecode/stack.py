@@ -34,13 +34,16 @@ Works for PAL and NTSC; the engine is system-agnostic and reads geometry/levels
 from the reference capture's videoParameters.
 """
 
+import errno
 import json
 import os
 import sqlite3
 import sys
+import time
 from textwrap import dedent
 
 import numpy as np
+import scipy.fft as _sfft
 
 
 # --------------------------------------------------------------------------- #
@@ -168,8 +171,55 @@ class TBCFrameSource(FrameSource):
         if os.path.exists(p):
             self.pcm = np.fromfile(p, dtype="<i2").reshape(-1, 2)
 
+    def prefetch(self, keys):
+        """Read the fields of `keys` with one large read per contiguous span.
+
+        A stack reads every capture at nearly the same position, so on a
+        single hard disk (T:) per-frame reads from 16 workers x 9-12 files
+        turn into a seek storm: the 2026-10-12 South stack ran at ~22 MB/s
+        with the CPUs 78% idle.  One read per capture per block of frames is
+        one seek per ~35 MB instead of one per 0.7 MB."""
+        if not hasattr(self, "_idx"):
+            self._build_index()
+        self._cache = {}
+        fis = sorted(self._idx[k] for k in keys if k in self._idx)
+        if not fis:
+            return
+        lo, hi = fis[0] * 2, fis[-1] * 2 + 1
+        if hi - lo + 1 > 2 * (2 * len(fis)) + 16:    # scattered: per-field reads
+            return
+        n = hi - lo + 1
+        for attempt in range(8):
+            try:
+                buf = os.pread(self._tbc_fd, n * self._fbytes, lo * self._fbytes)
+                break
+            except OSError as e:
+                if e.errno != errno.ENOMEM or attempt == 7:
+                    raise
+                time.sleep(0.5 * 2 ** attempt)
+        arr = np.frombuffer(buf, dtype="<u2")
+        got = len(arr) // (self._fshape[0] * self._fshape[1])
+        arr = arr[: got * self._fshape[0] * self._fshape[1]].reshape(got, *self._fshape)
+        self._cache = {lo + i: arr[i] for i in range(got)}
+
+    def drop_prefetch(self):
+        self._cache = {}
+
     def _read_field(self, idx):
-        buf = os.pread(self._tbc_fd, self._fbytes, idx * self._fbytes)
+        c = getattr(self, "_cache", None)
+        if c and idx in c:
+            return c[idx]
+        # drvfs/9P reads under heavy parallel load occasionally fail with a
+        # transient ENOMEM (seen 2026-10-11 at frame ~25k of a 9-capture
+        # stack, 22 workers); back off and retry rather than lose the run.
+        for attempt in range(8):
+            try:
+                buf = os.pread(self._tbc_fd, self._fbytes, idx * self._fbytes)
+                break
+            except OSError as e:
+                if e.errno != errno.ENOMEM or attempt == 7:
+                    raise
+                time.sleep(0.5 * 2 ** attempt)
         return np.frombuffer(buf, dtype="<u2").reshape(self._fshape)
 
     def close(self):
@@ -372,7 +422,31 @@ def integer_shift(ref, img):
     p = np.unravel_index(np.argmax(c), c.shape)
     sy = p[0] - (c.shape[0] if p[0] > c.shape[0] // 2 else 0)
     sx = p[1] - (c.shape[1] if p[1] > c.shape[1] // 2 else 0)
-    return sy, sx
+    # the correlation peak sits at img's offset from ref; fourier_shift needs
+    # the correction, i.e. minus that (an img = ref shifted by +3 gave +3,
+    # and the cold search then centred its grid 6 samples from the answer)
+    return -sy, -sx
+
+
+def integer_shift_luma(ref, img, cut=0.17):
+    """Integer (dy, dx) of img vs ref from the luma alone: plain (unwhitened)
+    cross-correlation of the two blocks low-passed below cut x fs (0.17 x
+    17.7 MHz = 3 MHz).  integer_shift's whitened phase correlation is
+    dominated by the colour subcarrier, whose 4-sample period gives false
+    peaks a cycle away (Community South ds3: -2.7 instead of +1.3)."""
+    def lp(x):
+        X = np.fft.rfft(x - x.mean(), axis=1)
+        X[:, int(cut * x.shape[1]) + 1:] = 0
+        return np.fft.irfft(X, x.shape[1], axis=1)
+    a, b = lp(ref), lp(img)
+    c = np.real(np.fft.ifft2(np.fft.fft2(b) * np.conj(np.fft.fft2(a))))
+    p = np.unravel_index(np.argmax(c), c.shape)
+    sy = p[0] - (c.shape[0] if p[0] > c.shape[0] // 2 else 0)
+    sx = p[1] - (c.shape[1] if p[1] > c.shape[1] // 2 else 0)
+    # the correlation peak sits at img's offset from ref; fourier_shift needs
+    # the correction, i.e. minus that (an img = ref shifted by +3 gave +3,
+    # and the cold search then centred its grid 6 samples from the answer)
+    return -sy, -sx
 
 
 def _apply_shift_spectrum(F, H, W, dy, dx, _pycache=None, _pxcache=None):
@@ -391,6 +465,17 @@ def _apply_shift_spectrum(F, H, W, dy, dx, _pycache=None, _pxcache=None):
         if _pxcache is not None:
             _pxcache[dx] = px
     return np.fft.irfft2((F * py) * px, s=(H, W))
+
+
+def _shift_search(F, H, W, dy, dx, pyc, pxc):
+    """float32 counterpart of _apply_shift_spectrum for the shift search."""
+    py = pyc.get(dy)
+    if py is None:
+        py = pyc[dy] = np.exp(-2j * np.pi * np.fft.fftfreq(H) * dy).astype(np.complex64)[:, None]
+    px = pxc.get(dx)
+    if px is None:
+        px = pxc[dx] = np.exp(-2j * np.pi * np.fft.rfftfreq(W) * dx).astype(np.complex64)[None, :]
+    return _sfft.irfft2((F * py) * px, s=(H, W))
 
 
 def fourier_shift(img, dy, dx):
@@ -453,6 +538,11 @@ def subpixel_warp_x(img, ref, ra, ca, nblocks=1, max_shift=0.3, line_sigma=4.0):
     return out
 
 
+REG_WALK_MAX = 8          # cold registration: re-centred 5x5 grids before giving up
+# largest vertical registration shift (field lines) searched; captures are line-locked, so it is ~0
+REG_MAX_DY = float(os.environ.get("LDSTACK_REG_MAX_DY", "1.0"))
+
+
 def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
     """Return field resampled to align with ref, plus affine level-matched.
     ra/ca are the active row/col slices used for measuring the shift.
@@ -469,13 +559,21 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
     best = None
     if subpixel and hint is not None:
         best = (float(hint[0]), float(hint[1]))
-    if best is None:
+    if best is None and not subpixel:
         iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
         best = (float(iy), float(ix))
     if subpixel:
-        refblk = ref[ra, ca]
+        refblk = ref[ra, ca].astype(np.float32)
         H, W = fa.shape
-        Ffa = np.fft.rfft2(fa)          # forward FFT once for the whole search
+        # The search only ranks candidate shifts against each other, so it
+        # runs in float32 on a line zero-padded to a fast FFT length: 1135 is
+        # 5 x 227 (prime), the slowest size there is.  12.3 -> 3.6 ms per
+        # candidate transform; the active block sits far from the padding.
+        # The final resample below stays float64 at the true width.
+        WP = _sfft.next_fast_len(W, real=True)
+        fpad = np.zeros((H, WP), np.float32)
+        fpad[:, :W] = fa
+        Ffa = _sfft.rfft2(fpad)         # forward FFT once for the whole search
         pyc, pxc = {}, {}
         cands = {}
 
@@ -483,11 +581,10 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
             key = (round(dy, 4), round(dx, 4))
             if key not in cands:
                 if dy == 0 and dx == 0:
-                    s = fa[ra, ca]
+                    s = fpad[ra, ca]
                 else:
-                    s = _apply_shift_spectrum(Ffa, H, W, dy, dx,
-                                              pyc, pxc)[ra, ca]
-                cands[key] = np.mean((s - refblk) ** 2)
+                    s = _shift_search(Ffa, H, WP, dy, dx, pyc, pxc)[ra, ca]
+                cands[key] = float(np.mean((s - refblk) ** 2))
             return cands[key]
 
         # coarse 5x5 grid (0.25 step) around the integer estimate, then
@@ -495,25 +592,48 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
         # sub-step optimum (~0.03px, vs 0.05px for the old 11x11 fine grid,
         # at ~5x fewer full-field transforms). A verification eval keeps
         # the result no worse than the best grid point.
-        cy, cx = best
-        span = 0.25 if hint is not None else 0.5      # warm: 3x3, cold: 5x5
-        bestrms = None
-        for dy in cy + np.arange(-span, span + 1e-9, 0.25):
-            for dx in cx + np.arange(-span, span + 1e-9, 0.25):
-                r = ev(dy, dx)
-                if bestrms is None or r < bestrms:
-                    bestrms, best = r, (dy, dx)
-        if hint is not None and (abs(best[0] - cy) >= span - 1e-9
-                                 or abs(best[1] - cx) >= span - 1e-9):
-            # stale hint: the optimum is outside the warm window - cold search
-            iy, ix = integer_shift(ref[ra, ca], fa[ra, ca])
-            cy, cx = float(iy), float(ix)
-            bestrms = None
-            for dy in cy + np.arange(-0.5, 0.5 + 1e-9, 0.25):
-                for dx in cx + np.arange(-0.5, 0.5 + 1e-9, 0.25):
+        def grid(cy, cx, span):
+            bestrms, best = None, None
+            for dy in cy + np.arange(-span, span + 1e-9, 0.25):
+                if abs(dy) > REG_MAX_DY + 1e-9:
+                    continue
+                for dx in cx + np.arange(-span, span + 1e-9, 0.25):
                     r = ev(dy, dx)
                     if bestrms is None or r < bestrms:
                         bestrms, best = r, (dy, dx)
+            # an optimum pinned at the +-REG_MAX_DY limit is not a stale window: only dx can walk on
+            edge = ((abs(best[0] - cy) >= span - 1e-9 and abs(best[0]) < REG_MAX_DY - 1e-9)
+                    or abs(best[1] - cx) >= span - 1e-9)
+            return bestrms, best, edge
+
+        def cold():
+            # integer_shift (phase correlation on the composite) is often a
+            # sample or two off between masters (Community South: -1 for a
+            # master at +0.5, -1/-2 for one at +1.3; the 0.75-sample error
+            # survived every later frame through the hints).  The error
+            # surface is smooth and single-minimum over +-3 samples, so walk:
+            # while the best point is on the 5x5 grid's border, re-centre there.
+            cy, cx = (float(v) for v in integer_shift_luma(ref[ra, ca], fa[ra, ca]))
+            # captures (and masters) are line-locked: the vertical offset is 0 (+- a fraction).  On content
+            # with no vertical structure (colour bars) the correlation is flat in dy and the search used to
+            # land anywhere (fq benchmark, PAL bars: alt masters registered at dy -14..+108 lines)
+            cy = float(np.clip(cy, -REG_MAX_DY, REG_MAX_DY))
+            for _ in range(REG_WALK_MAX):
+                bestrms, best, edge = grid(cy, cx, 0.5)
+                if not edge:
+                    break
+                cy, cx = best
+            return bestrms, best
+
+        if hint is not None:
+            cy, cx = best
+            cy = float(np.clip(cy, -REG_MAX_DY, REG_MAX_DY))
+            bestrms, best, edge = grid(cy, cx, 0.25)      # warm: 3x3
+            if edge:
+                # stale hint: the optimum is outside the warm window - cold search
+                bestrms, best = cold()
+        else:
+            bestrms, best = cold()
 
         def para(fm, f0, fp, h):
             den = fm - 2.0 * f0 + fp
@@ -523,6 +643,7 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None):
 
         by, bx = best
         oy = para(ev(by - 0.25, bx), ev(by, bx), ev(by + 0.25, bx), 0.25)
+        oy = float(np.clip(by + oy, -REG_MAX_DY, REG_MAX_DY) - by)
         ox = para(ev(by, bx - 0.25), ev(by, bx), ev(by, bx + 0.25), 0.25)
         if (oy or ox) and ev(by + oy, bx + ox) <= bestrms:
             best = (by + oy, bx + ox)
@@ -586,9 +707,429 @@ LOCAL_SPREAD_K = float(os.environ.get("LDSTACK_LOCAL_SPREAD_K", "6.0"))
 # treated as local and masked line-by-line instead, so a three-line defect no
 # longer costs the 623 good lines around it.
 INTEGRITY_DROP_FRAC = float(os.environ.get("LDSTACK_INTEGRITY_DROP_FRAC", "0.20"))
+# residual (every-capture) dropouts are written as runs; runs closer than this many good samples are merged
+RESID_DO_GAP = int(os.environ.get("LDSTACK_RESID_DO_GAP", "8"))
+# every capture outlier-rejected but most not dropout-flagged: output the median unflagged (0 = flag it)
+REJ_KEEP_MEDIAN = int(os.environ.get("LDSTACK_REJ_KEEP_MEDIAN", "1"))
 # cross-master fill must sit within K x the captures' noise of a simple vertical
 # estimate; 0 disables the check
 FILL_SANITY_K = float(os.environ.get("LDSTACK_FILL_SANITY_K", "8.0"))
+# Master-defect repair (see master_repair_mask): a defect cut into the
+# primary glass master (every primary capture carries it, no dropout detector
+# flags it) is replaced from an alt-master capture where that is plausible.
+# LDSTACK_REPAIR_K=0 disables.  K: seed threshold in sigma of the
+# primary-vs-alt difference; R: plausibility ratio (primary vs alt vertical
+# residual, alt vs primary's neighbours, neighbour agreement); MINRUN:
+# shortest seed run along the line; SUBBLACK: a seed run must dip below this
+# fraction of the black level; KW/GAP: the weaker part of a dashed streak is
+# taken within GAP of the seeds on the same line; GROW: margin each side;
+# LEVEL_W: box width of the local level match; DUMP: directory for a per-field
+# audit trail of every substituted pixel; PRESCREEN(_F): skip registering a
+# fill-only alt master when the primary has no candidate at all.
+REPAIR_K = float(os.environ.get("LDSTACK_REPAIR_K", "6.0"))
+REPAIR_R = float(os.environ.get("LDSTACK_REPAIR_R", "3.0"))
+REPAIR_MINRUN = int(os.environ.get("LDSTACK_REPAIR_MINRUN", "6"))
+REPAIR_KW = float(os.environ.get("LDSTACK_REPAIR_KW", "2.0"))
+REPAIR_GAP = int(os.environ.get("LDSTACK_REPAIR_GAP", "48"))
+REPAIR_GROW = int(os.environ.get("LDSTACK_REPAIR_GROW", "4"))
+REPAIR_SUBBLACK = float(os.environ.get("LDSTACK_REPAIR_SUBBLACK", "0.5"))
+REPAIR_NBR = os.environ.get("LDSTACK_REPAIR_NBR", "1") not in ("0", "", "no")
+REPAIR_LEVEL_W = int(os.environ.get("LDSTACK_REPAIR_LEVEL_W", "33"))
+REPAIR_DUMP = os.environ.get("LDSTACK_REPAIR_DUMP", "")
+REPAIR_PRESCREEN_F = float(os.environ.get("LDSTACK_REPAIR_PRESCREEN_F", "1.5"))
+REPAIR_PRESCREEN = os.environ.get("LDSTACK_REPAIR_PRESCREEN", "1") not in ("0", "", "no")
+# Short-impulse path of the repair (2026-10-16): 1..IMP_MAXRUN-sample spikes
+# cut into the primary master (CommunitySouth picture 3030 bars: ~90-250 per
+# frame, in 92-100 % of the primary captures, too short for MINRUN).  Seed:
+# the primary deviates from its same-subcarrier-phase horizontal median
+# (+-4, +-8 samples) by > IMP_K sigma, the alt does not (< 1/R of it) and the
+# alt sits near the primary's own median there.  IMP_K=0 disables.
+REPAIR_IMP_K = float(os.environ.get("LDSTACK_REPAIR_IMP_K", "6.0"))
+REPAIR_IMP_MAXRUN = int(os.environ.get("LDSTACK_REPAIR_IMP_MAXRUN", "5"))
+REPAIR_IMP_GROW = int(os.environ.get("LDSTACK_REPAIR_IMP_GROW", "1"))
+# Dip path (2026-10-16): the bars streaks at 3030 are ~5-20 samples long,
+# jitter between captures, and in composite show as deep dips at the chroma
+# troughs (primary ~0-14000, alt ~21000-32000); the vertical-residual tests
+# of the streak path fail on saturated PAL chroma.  Seed: primary below
+# DIP_SUB x black, the alt above it by > DIP_D x black and > IMP_K/1.5 sigma.
+# Seeds closer than DIP_GAP on a line form one span (<= DIP_MAXLEN), which
+# is replaced whole, +-DIP_GROW.  DIP_D=0 disables.
+REPAIR_DIP_SUB = float(os.environ.get("LDSTACK_REPAIR_DIP_SUB", "0.9"))
+REPAIR_DIP_D = float(os.environ.get("LDSTACK_REPAIR_DIP_D", "0.5"))
+REPAIR_DIP_GAP = int(os.environ.get("LDSTACK_REPAIR_DIP_GAP", "6"))
+REPAIR_DIP_MAXLEN = int(os.environ.get("LDSTACK_REPAIR_DIP_MAXLEN", "600"))
+REPAIR_DIP_GROW = int(os.environ.get("LDSTACK_REPAIR_DIP_GROW", "2"))
+# a span also takes, within DIP_GAP, samples where the primary is below the
+# alt by > DIP_WEAK sigma (the shallower parts of the same streak)
+REPAIR_DIP_WEAK = float(os.environ.get("LDSTACK_REPAIR_DIP_WEAK", "2.0"))
+REPAIR_DIP_EDGE = int(os.environ.get("LDSTACK_REPAIR_DIP_EDGE", "24"))
+# dip path: the alt sample must be no rougher along its own line than the
+# primary (|alt - same-phase median| <= max(ALTK x sigma, the primary's));
+# a single-capture alt master's own unflagged dropout (South ds3, pictures
+# 16291/16991) otherwise passes "alt brighter" on half its samples in
+# saturated colour and is pasted in.  0 disables the test.
+REPAIR_DIP_ALTK = float(os.environ.get("LDSTACK_REPAIR_DIP_ALTK", "6.0"))
+# every repair path: a substitution must not move the line's local luma
+# (8-sample box = two subcarrier cycles, chroma cancels) further from its
+# field neighbours' than the primary already is, by more than LUMA_M x sigma.
+# A real defect (dropout to sync, dip, spike) pulls the primary's luma away
+# and the alt brings it back; an alt master's own unflagged dropout (South
+# ds3: picture 18621 line 266 whole stretch near 0, oks True) pushes it away.
+# 0 disables it.
+REPAIR_LUMA_M = float(os.environ.get("LDSTACK_REPAIR_LUMA_M", "1.0"))
+REPAIR_LUMA_W = 8
+
+
+def _box(x, w=REPAIR_LUMA_W):
+    k = np.ones(w) / w
+    return np.apply_along_axis(lambda r: np.convolve(r, k, "same"), -1, x)
+
+
+# per field and alt master: repair only from an alt that lines up with the
+# primary.  South picture 29733: ds3 carried a different picture (luma corr
+# 0.01) and its repair "removed" every map road; 16374 (ds3, +1.5..4 samples)
+# and 50144 (master 1, -1.7) were misregistered, so thin strokes were pasted
+# in shifted (ghost lettering).  Box-8 luma (chroma cancels) over the repair
+# area: corr at zero shift must be >= ALIGN_C (0.90) and no 1-2 sample / 1 line
+# shift may fit better.  Fields with too little picture (std of the luma <
+# ALIGN_STD, e.g. black) cannot be judged and are let through.
+REPAIR_ALIGN_C = float(os.environ.get("LDSTACK_REPAIR_ALIGN_C", "0.90"))
+REPAIR_ALIGN_STD = float(os.environ.get("LDSTACK_REPAIR_ALIGN_STD", "1000"))
+
+
+REPAIR_ALIGN_BAND = int(os.environ.get("LDSTACK_REPAIR_ALIGN_BAND", "24"))
+# a band is only refused when a shifted alt matches clearly better than the
+# unshifted one: low correlation alone just means flat picture, different
+# master noise, or the primary's own defect in the band (North 12981: run-5
+# band gate refused real dropout repairs, corr0 0.30 vs shifted 0.30).
+# Refused when shifted - corr0 > max(floor, GAIN * (1 - corr0)): 16272 0.744
+# -> 0.890 and 31167 0.799 -> 0.860 still refused.
+REPAIR_ALIGN_BAND_GAIN = float(os.environ.get("LDSTACK_REPAIR_ALIGN_BAND_GAIN", "0.1"))
+REPAIR_ALIGN_BAND_FLOOR = float(os.environ.get("LDSTACK_REPAIR_ALIGN_BAND_FLOOR", "0.005"))
+
+
+def alt_aligned(out, alt, ok, ra, ca, minrows=50):
+    """(aligned?, corr at zero shift, best corr at a shift, luma std)."""
+    if REPAIR_ALIGN_C <= 0:
+        return True, 1.0, 0.0, 0.0
+    A = _box(out[ra, ca].astype(np.float64))[:, 8:-8]
+    B = _box(alt[ra, ca].astype(np.float64))[:, 8:-8]
+    good = ok[ra, ca][:, 8:-8]
+    rows = good.mean(1) > 0.95
+    if rows.sum() < minrows:
+        return True, 1.0, 0.0, 0.0
+    A = A[rows]; B = B[rows]
+    A = A - A.mean(1, keepdims=True); B = B - B.mean(1, keepdims=True)
+    sd = float(A.std())
+    if sd < REPAIR_ALIGN_STD:
+        return True, 1.0, 0.0, sd
+
+    def corr(dy, dx):
+        a = A[2:-2, 4:-4]
+        b = B[2 + dy:B.shape[0] - 2 + dy, 4 + dx:B.shape[1] - 4 + dx]
+        return float(np.sum(a * b) / np.sqrt(np.sum(a * a) * np.sum(b * b) + 1e-9))
+    c0 = corr(0, 0)
+    cs = max(corr(dy, dx) for dy, dx in ((0, -2), (0, -1), (0, 1), (0, 2), (-1, 0), (1, 0)))
+    return (c0 >= REPAIR_ALIGN_C and c0 >= cs), c0, cs, sd
+
+
+def band_misaligned(out, alt, ok, rm, ca):
+    """Bands of REPAIR_ALIGN_BAND lines (holding repairs) where the alt is
+    locally misregistered although the field as a whole lines up, e.g. a
+    capture whose timebase slips for the first lines of a field (picture
+    16272: ds3 4 samples out on lines 22-46, exact below).
+    -> list of (row slice, c0, cs, sd)."""
+    bad = []
+    if REPAIR_ALIGN_BAND <= 0 or REPAIR_ALIGN_C <= 0:
+        return bad
+    ys = np.where(rm.any(1))[0]
+    # bands overlap (step REPAIR_ALIGN_BAND // 3) so a slip that starts part-way
+    # down a band is still the majority of some band (South 31167: master 1 is
+    # 4 samples out from field line 140 only; 120-144 passed, 136-160 doesn't)
+    st = max(1, REPAIR_ALIGN_BAND // 3)
+    starts = set()
+    for y in ys:
+        b = (y // st) * st
+        starts.update(range(max(0, b - REPAIR_ALIGN_BAND + st), b + 1, st))
+    for b0 in sorted(starts):
+        r = slice(max(0, b0 - 4), min(out.shape[0], b0 + REPAIR_ALIGN_BAND + 4))
+        al, c0, cs, sd = alt_aligned(out, alt, ok, r, ca, minrows=REPAIR_ALIGN_BAND // 2)
+        if not al and cs - c0 > max(REPAIR_ALIGN_BAND_FLOOR, REPAIR_ALIGN_BAND_GAIN * (1 - c0)):
+            bad.append((slice(b0, b0 + REPAIR_ALIGN_BAND), c0, cs, sd))
+    return bad
+
+
+def luma_check(out, rm, vals, sig):
+    """rm limited to the substitutions that keep (or bring) the local luma
+    at least as close to the neighbouring lines as the primary's."""
+    if REPAIR_LUMA_M <= 0 or sig <= 0:
+        return rm
+    trial = out.copy()
+    trial[rm] = vals
+    ys = np.where(rm.any(1))[0]
+    ok = np.zeros_like(rm)
+    H = out.shape[0]
+    for ln in ys:
+        nb = [l for l in (ln - 1, ln + 1) if 0 <= l < H]
+        ref = _box(trial[nb]).mean(0)
+        lr = np.abs(_box(trial[ln]) - ref)
+        lp = np.abs(_box(out[ln]) - ref)
+        ok[ln] = lr <= lp + REPAIR_LUMA_M * sig
+    return rm & ok
+
+
+# field lines the repair covers: every line the chroma decoder outputs
+# (22..308; 309-310 hold the half-line blanking, which differs between masters), not ra (24..fh-6) - CommunitySouth
+# frames 9060/11980/20940 kept primary-master streaks on line 307
+REPAIR_ROW0 = int(os.environ.get("LDSTACK_REPAIR_ROW0", "22"))
+REPAIR_ROW1 = int(os.environ.get("LDSTACK_REPAIR_ROW1", "309"))
+
+
+def _vert_est(x):
+    """Mean of the lines above and below (same field)."""
+    e = np.empty_like(x)
+    e[1:-1] = 0.5 * (x[:-2] + x[2:])
+    e[0], e[-1] = x[1], x[-2]
+    return e
+
+
+def _phase_med(x):
+    """Median of the same-subcarrier-phase samples +-4, +-8 along the line."""
+    return np.median(np.stack([np.roll(x, k, -1) for k in (-8, -4, 4, 8)]), 0)
+
+
+def impulse_mask(p, a, both, d, sig, vp_ok=None):
+    """Short primary-only spikes (see REPAIR_IMP_K); p, a, d on the block."""
+    ip = p - _phase_med(p)
+    ia = a - _phase_med(a)
+    thr = REPAIR_IMP_K * sig
+    m = (both & (np.abs(ip) > thr) & (np.abs(d) > thr)
+         & (np.sign(ip) == np.sign(d)) & (np.abs(ia) * REPAIR_R < np.abs(ip))
+         & (np.abs(a - (p - ip)) * REPAIR_R < np.abs(d)))
+    if not m.any():
+        return m
+    keep = np.zeros_like(m)
+    for ln in np.where(m.any(1))[0]:
+        for x0, x1 in _runs(m[ln]):
+            if x1 - x0 <= REPAIR_IMP_MAXRUN:
+                keep[ln, x0:x1] = True
+    g = keep.copy()
+    for k in range(1, REPAIR_IMP_GROW + 1):
+        g[:, k:] |= keep[:, :-k]; g[:, :-k] |= keep[:, k:]
+    return g & both
+
+
+def dip_mask(p, a, both, sig, black):
+    """Primary-only deep dips (see REPAIR_DIP_D); p, a on the block."""
+    seed = (both & (p < REPAIR_DIP_SUB * black)
+            & (a - p > max(REPAIR_DIP_D * black, REPAIR_IMP_K / 1.5 * sig)))
+    # not at the ends of the active line: the blanking edge differs a
+    # little between masters (North: a column of seeds down the left edge)
+    seed[:, :REPAIR_DIP_EDGE] = False
+    seed[:, -REPAIR_DIP_EDGE:] = False
+    m = np.zeros_like(seed)
+    w = m.shape[1]
+    for ln in np.where(seed.any(1))[0]:
+        xs = np.where(seed[ln])[0]
+        brk = np.where(np.diff(xs) > REPAIR_DIP_GAP)[0]
+        for c0, c1 in zip(np.concatenate(([0], brk + 1)),
+                          np.concatenate((brk, [len(xs) - 1]))):
+            x0, x1 = xs[c0], xs[c1] + 1
+            if x1 - x0 > REPAIR_DIP_MAXLEN:
+                continue
+            weak = both[ln] & (a[ln] - p[ln] > REPAIR_DIP_WEAK * sig)
+            while True:         # grow over weak samples within GAP
+                lo = np.where(weak[max(0, x0 - REPAIR_DIP_GAP):x0])[0]
+                hi = np.where(weak[x1:x1 + REPAIR_DIP_GAP])[0]
+                n0, n1 = x0, x1
+                if len(lo): n0 = max(0, x0 - REPAIR_DIP_GAP) + lo[0]
+                if len(hi): n1 = x1 + hi[-1] + 1
+                if (n0, n1) == (x0, x1) or n1 - n0 > REPAIR_DIP_MAXLEN:
+                    break
+                x0, x1 = n0, n1
+            m[ln, max(0, x0 - REPAIR_DIP_GROW):min(w, x1 + REPAIR_DIP_GROW)] = True
+    if REPAIR_DIP_ALTK > 0 and m.any():
+        ia = np.abs(a - _phase_med(a))
+        ip = np.abs(p - _phase_med(p))
+        m &= ia <= np.maximum(REPAIR_DIP_ALTK * sig, ip)
+    return m & both
+
+
+def _runs(row):
+    """(start, stop) of the True runs of a 1-D bool array."""
+    e = np.diff(np.concatenate(([0], row.view(np.int8), [0])))
+    return zip(np.where(e == 1)[0], np.where(e == -1)[0])
+
+
+def _seed_runs(seed, minrun):
+    """Keep only runs of >= minrun samples along each line."""
+    keep = np.zeros_like(seed)
+    for ln in np.where(seed.any(1))[0]:
+        for x0, x1 in _runs(seed[ln]):
+            if x1 - x0 >= minrun:
+                keep[ln, x0:x1] = True
+    return keep
+
+
+def repair_prescreen(out, valid, ra, ca, thr, black=None):
+    """Cheap primary-only test: does any line of the active area deviate from
+    its vertical neighbourhood by > thr over >= REPAIR_MINRUN samples (and,
+    with the sub-black gate, reach below it inside that run)?  Only then is
+    an alt master consulted (registering it costs FFTs).  Every seed run
+    master_repair_mask can find lies inside such a run when thr is at most
+    K x the primary-vs-alt spread."""
+    blk = (ra, ca)
+    p = out[blk]
+    if black is not None and REPAIR_SUBBLACK > 0:
+        low = (p < REPAIR_SUBBLACK * black) & valid[blk]
+        if not low.any():
+            return False
+    rp = np.abs(p - _vert_est(out)[blk]) > thr
+    rp &= valid[blk]
+    if not rp.any():
+        return False
+    runs = _seed_runs(rp, REPAIR_MINRUN)
+    if black is None or REPAIR_SUBBLACK <= 0:
+        return bool(runs.any())
+    return bool((runs & low).any())
+
+
+def repair_values(out, alt, rm, usable):
+    """The alt's samples for the pixels in rm, level-matched to the primary.
+
+    register_field removes the masters' global gain/offset, but a residual
+    local level difference of a few hundred remains (master nonlinearity,
+    ~1 %), which would show as a faint line where one line is swapped.  Add
+    the primary-minus-alt difference of the neighbouring lines (+-1, +-2 in
+    the field), box-smoothed along the line so chroma and noise cancel."""
+    d = np.where(usable & ~rm, out - alt, 0.0)
+    c = usable & ~rm
+    k = np.ones(REPAIR_LEVEL_W)
+    vals = alt[rm].copy()
+    ys = np.where(rm.any(1))[0]
+    pos = 0
+    for ln in ys:
+        nb = [l for l in (ln - 2, ln - 1, ln + 1, ln + 2) if 0 <= l < out.shape[0]]
+        num = np.convolve(d[nb].sum(0), k, "same")
+        den = np.convolve(c[nb].sum(0).astype(np.float64), k, "same")
+        corr = np.where(den > 0, num / np.maximum(den, 1), 0.0)
+        xs = np.where(rm[ln])[0]
+        vals[pos:pos + len(xs)] += corr[xs]
+        pos += len(xs)
+    return vals
+
+
+def master_repair_mask(out, valid, alt, alt_ok, ra, ca, black=None):
+    """Pixels where the PRIMARY master carries a defect an alt master does not.
+
+    The primary combine cannot see a defect cut into the glass master: every
+    primary capture carries it, they agree, and no dropout detector flags it
+    (Community North test card, picture 3001 field 2 line 208: a dashed streak
+    on all of DS5/8/10/11, absent from DS3 of another master).  Where the
+    primary and the registered alt-master estimate disagree grossly, decide
+    which side is wrong from its own field: the defective side deviates from
+    the mean of its neighbouring lines in the direction of the disagreement,
+    the clean side does not.  Genuine fine detail (a one-line-thick horizontal
+    stroke, a grating) is on both masters, so they agree there and nothing
+    fires; a defect on the alt is the alt's implausibility and is left alone.
+
+    Seeds: |prim - alt| > K sigma, the primary's vertical residual > K sigma
+    with the same sign, the alt's < 1/R of it, the alt within 1/R of the
+    primary's neighbour mean, the primary's neighbours agreeing with each
+    other, in runs >= MINRUN along the line (a master defect is a streak, not
+    a speckle) that dip below SUBBLACK x black somewhere.  A line with seeds
+    also gives up its weaker (> KW sigma, same sign, same tests) disagreements
+    within GAP of the seeds - the gaps of a dashed streak - plus GROW samples
+    each side.  sigma = robust (MAD) spread of the primary-vs-alt difference
+    over the active area.  Returns (mask, sigma).
+
+    Tuned on the Community trial windows (North/South map, photo, cmap, both
+    stacking modes): without the neighbour and sub-black tests, map line work
+    and the ends of sloping strokes - real detail the masters render a little
+    differently - were taken (up to 2500 px per 60-frame map window)."""
+    blk = (ra, ca)
+    both = (valid & alt_ok)[blk]
+    if both.sum() < 1000:
+        return None, 0.0
+    p, a = out[blk], alt[blk]
+    d = p - a
+    dv = d[both]
+    sig = 1.4826 * float(np.median(np.abs(dv - np.median(dv))))
+    if sig <= 0:
+        return None, 0.0
+    vp = _vert_est(out)[blk]
+    rp = p - vp
+    ralt = np.abs(a - _vert_est(alt)[blk])
+    same = np.sign(rp) == np.sign(d)
+    # the alt must look like the primary WITHOUT the feature: equal to the
+    # primary's own neighbouring lines.  Real one-line content that the
+    # masters merely render differently (a dashed map line softer on one
+    # master) fails this - the alt has the feature too, only weaker.
+    flat = np.abs(a - vp) * REPAIR_R < np.abs(d)
+    # ...and the primary's own neighbours must agree with each other: a
+    # defect sits on otherwise continuous picture, whereas at an edge or the
+    # end of a sloping stroke the lines above and below differ, the mean of
+    # them is no estimate of the line between, and a sub-sample master
+    # difference there is not a defect.
+    nb = np.empty_like(out)
+    nb[1:-1] = np.abs(out[:-2] - out[2:])
+    nb[0], nb[-1] = nb[1], nb[-2]
+    if REPAIR_NBR:
+        flat &= nb[blk] * REPAIR_R < np.abs(rp)
+    seed = (both & same & flat & (np.abs(d) > REPAIR_K * sig)
+            & (np.abs(rp) > REPAIR_K * sig) & (ralt * REPAIR_R < np.abs(rp)))
+    imp = impulse_mask(p, a, both, d, sig) if REPAIR_IMP_K > 0 else None
+    if REPAIR_DIP_D > 0 and black is not None:
+        dm = dip_mask(p, a, both, sig, black)
+        imp = dm if imp is None else (imp | dm)
+
+    def _only_imp():
+        if imp is None or not imp.any():
+            return None, sig
+        full = np.zeros(out.shape, dtype=bool)
+        full[blk] = imp
+        return full, sig
+    if not seed.any():
+        return _only_imp()
+    seed = _seed_runs(seed, REPAIR_MINRUN)
+    if black is not None and REPAIR_SUBBLACK > 0:
+        # a seed run must reach far below black (half way to the sync tip)
+        # somewhere: no picture goes there, while a defect - RF lost on the
+        # master - rails low.  Ink and edge overshoot stay above it.
+        floor = REPAIR_SUBBLACK * black
+        for ln in np.where(seed.any(1))[0]:
+            for x0, x1 in list(_runs(seed[ln])):
+                if p[ln, x0:x1].min() >= floor:
+                    seed[ln, x0:x1] = False
+    if not seed.any():
+        return _only_imp()
+    weak = (both & same & flat & (np.abs(d) > REPAIR_KW * sig)
+            & (np.abs(rp) > REPAIR_KW * sig) & (ralt * REPAIR_R < np.abs(rp)))
+    m = seed.copy()
+    w = m.shape[1]
+    for ln in np.where(seed.any(1))[0]:
+        xs = np.where(seed[ln])[0]
+        # seed clusters: seeds closer than GAP belong to one streak, and a
+        # streak has one polarity - only weak hits of that sign join it
+        brk = np.where(np.diff(xs) > REPAIR_GAP)[0]
+        for c0, c1 in zip(np.concatenate(([0], brk + 1)),
+                          np.concatenate((brk, [len(xs) - 1]))):
+            pol = np.sign(np.median(d[ln, xs[c0:c1 + 1]]))
+            lo = max(0, xs[c0] - REPAIR_GAP); hi = min(w, xs[c1] + 1 + REPAIR_GAP)
+            m[ln, lo:hi] |= weak[ln, lo:hi] & (np.sign(d[ln, lo:hi]) == pol)
+    # GROW samples of margin each side along the line (a streak's soft
+    # ends), never onto pixels the alt cannot supply
+    g = m.copy()
+    for k in range(1, REPAIR_GROW + 1):
+        g[:, k:] |= m[:, :-k]; g[:, :-k] |= m[:, k:]
+    g &= both
+    if imp is not None:
+        g |= imp
+    full = np.zeros(out.shape, dtype=bool)
+    full[blk] = g
+    return full, sig
+
+
 # picture-number progression: tolerance per frame, and how many consecutive
 # consistent frames confirm a genuine resync after a skip/seek
 SEQ_TOL = int(os.environ.get("LDSTACK_SEQ_TOL", "2"))
@@ -672,7 +1213,7 @@ FRAME_LEVEL_K = float(os.environ.get("LDSTACK_FRAME_LEVEL_K", "8.0"))
 DIFF_DOD = os.environ.get("LDSTACK_DIFF_DOD", "0") not in ("0", "", "no")
 
 
-def combine_fields(fields, masks, weights, sigma, diff_dod=False):
+def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
     """Dropout-aware, inverse-variance weighted combine of registered fields.
 
     fields: list of float 2D arrays (already registered to a common grid)
@@ -707,6 +1248,14 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False):
     w = np.array(weights, dtype=np.float64).reshape(-1, 1, 1) * good
     wsum = w.sum(0)
     out = np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
+    if info is not None:
+        # every capture rejected by the outlier tests, yet most were not flagged as dropouts: the captures
+        # disagree (saturated chroma, ~10-17 sigma between players on Test Card F with 4 captures), they are
+        # not all broken.  wsum stays 0 (cross-master fill still gets these pixels: marking them good lost
+        # that fill, fq benchmark 0-2 MHz error +14%); the caller only leaves them unflagged if nothing fills
+        # them, so the median (out, above) reaches the output instead of an ld-dropout-correct line copy
+        unmasked = (~np.stack(masks, 0)).sum(0)
+        info["rej_only"] = (wsum == 0) & (2 * unmasked > len(fields))
     if diff_dod and len(fields) >= 3:
         allbad = wsum == 0
         if allbad.any():
@@ -719,6 +1268,298 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False):
                 o = out[allbad]; o[rec] = dmed[rec]; out[allbad] = o
                 ws = wsum[allbad]; ws[rec] = 1e-6; wsum[allbad] = ws
     return out, wsum
+
+
+# --------------------------------------------------------------------------- #
+#  Cross-master stacking
+# --------------------------------------------------------------------------- #
+# Much of the noise on a disc is recorded on it: every pressing from one glass
+# master carries the same noise, so stacking captures of one master cannot
+# remove it.  Measured on the Domesday Community discs (3 masters per side):
+# blank-line noise at 5.5-7 MHz is 0.94-0.99 coherent between captures of one
+# master and 0.00 between masters, and 40-80% of the noise in every band is
+# on-disc.  Each master's disc noise is independent of the others', so
+# averaging masters reduces it.  The optimum weights depend on frequency (the
+# disc noise steps up ~10x above 5.5 MHz, where a master's capture count no
+# longer helps), so masters are blended per horizontal frequency band:
+#   1. combine each master's captures as usual -> one estimate per master
+#   2. estimate each master estimate's total error variance V_m per band from
+#      the differences between master estimates (independent errors, so
+#      var(x_m - x_k) = V_m + V_k; three or more masters make it solvable)
+#   3. blend with weights 1/V_m per band, on the active picture only (masters
+#      place the picture differently relative to sync, so blanking, sync and
+#      VBI stay from the primary master).
+XM_BAND_EDGES_MHZ = (2.0, 3.5, 5.5)
+XM_XOVER_MHZ = 0.3
+XM_REJECT_K = 6.0       # a master's pixel this many sigma from the primary's is a defect
+XM_HF_BAND_MHZ = (5.5, 7.0)     # disc-noise band used to tell masters apart
+XM_HF_CORR_MIN = 0.3            # same master: ~0.6-0.95; different masters: ~0.0
+XM_PAD = 64
+XM_GROW = 12             # a >K-sigma disagreement is a defect: exclude its tails too (samples)
+
+
+def xm_band_masks(n, fs_hz, edges_mhz=XM_BAND_EDGES_MHZ, xover_mhz=XM_XOVER_MHZ):
+    """Raised-cosine partition of unity over rfft bins of length n: (nb, n//2+1)."""
+    f = np.fft.rfftfreq(n, 1.0 / fs_hz) / 1e6
+    ups = [0.5 - 0.5 * np.cos(np.pi * np.clip((f - (e - xover_mhz / 2)) / xover_mhz, 0, 1))
+           for e in edges_mhz]
+    bounds = [np.ones_like(f)] + ups + [np.zeros_like(f)]
+    return np.array([bounds[i] - bounds[i + 1] for i in range(len(bounds) - 1)])
+
+
+def _xm_band_power(x, masks, bad=None):
+    """Per-band power of the rows of x (mean-removed), in consistent units.
+    Pixels flagged in ``bad`` (dropouts, rejected defects) are replaced by the
+    row's median so they neither count nor spread into the band power."""
+    if bad is not None and bad.any():
+        x = np.where(bad, np.median(x, axis=1, keepdims=True), x)
+    X = np.fft.rfft(x - x.mean(1, keepdims=True), axis=1)
+    p = (np.abs(X) ** 2).sum(0)
+    return (masks * p[None]).sum(1) / x.size
+
+
+def _grow_x(mask, n):
+    """Grow a boolean mask n samples each way along the line."""
+    out = mask.copy()
+    for s in range(1, n + 1):
+        out |= np.roll(mask, s, 1) | np.roll(mask, -s, 1)
+    return out
+
+
+def xm_clusters(frame_dicts, names, ra, ca, fs_hz):
+    """Group captures by master from their shared on-disc noise.
+
+    Above 5.5 MHz there is no picture, only noise, and the on-disc part of it
+    is identical across captures of one master and unrelated between masters,
+    so the correlation of the 5.5-7 MHz band separates masters cleanly where
+    the sub-pixel dx clustering can be marginal (Community South ds5/ds11 sit
+    at dx +0.06..+0.5, inside the 0.3 tolerance).  Returns a list of groups,
+    largest first."""
+    width = ca.stop - ca.start
+    f = np.fft.rfftfreq(width, 1.0 / fs_hz) / 1e6
+    band = (f >= XM_HF_BAND_MHZ[0]) & (f < XM_HF_BAND_MHZ[1])
+    num = {}; den = {}
+    for fd in frame_dicts:
+        present = [n for n in names if n in fd]
+        if len(present) < 2:
+            continue
+        ref = fd[present[0]].f0.astype(np.float64)
+        hp = {}
+        for n in present:
+            r, _ = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True)
+            X = np.fft.rfft(r[ra, ca], axis=1)
+            X[:, ~band] = 0
+            hp[n] = np.fft.irfft(X, width, axis=1)
+        for i, a in enumerate(present):
+            for b in present[i + 1:]:
+                k = (a, b)
+                num[k] = num.get(k, 0.0) + float((hp[a] * hp[b]).sum())
+                den[k] = den.get(k, 0.0) + float(np.sqrt((hp[a] ** 2).sum() * (hp[b] ** 2).sum()))
+    corr = {k: num[k] / den[k] for k in num if den[k] > 0}
+    # single-linkage on the correlation graph
+    groups = []
+    for n in names:
+        linked = [g for g in groups
+                  if any(corr.get((n, m), corr.get((m, n), 0.0)) >= XM_HF_CORR_MIN for m in g)]
+        merged = [n] + [m for g in linked for m in g]
+        groups = [g for g in groups if g not in linked] + [merged]
+    groups.sort(key=len, reverse=True)
+    return groups, corr
+
+
+def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
+    """Per-band blend weights for the master estimates (see the section note).
+
+    Noise is measured on the blank vertical-interval lines (field lines 6-13,
+    samples 200-1080), where there is no picture: there a difference between
+    two captures is noise and nothing else.  Measured on picture content, a
+    systematic difference between masters (a slightly different frequency
+    response or level - present below ~3.5 MHz on Community South) looks like
+    noise and gets blamed on whichever master differs from the others, which
+    once handed 90% of the low band to a two-capture master.  Bands where the
+    masters' picture differs by much more than their noise explains are
+    therefore left to the primary master alone.
+
+    Returns dict with alpha (M, nb) and sig (M,) - the broadband pixel sigma
+    of each master estimate's picture difference from the primary's, used to
+    reject master-level defects - or None if fewer than two masters overlap.
+
+    xm2 (Oct 2026 study): the error variances are
+    measured on the PICTURE area, not on blank lines.  Capture noise on a
+    LaserDisc is level-dependent: in the (bright) picture it is 4-8x the
+    blank-line power at 0-2 MHz even between two captures of ONE master, so
+    the blank-line guard rejected every alt master below 3.5 MHz as
+    "systematically different" when nothing but the noise level differed
+    (the masters register to a constant sub-sample dx, dy 0, no skew, |H|
+    within 2% and phase <1 deg to 4.5 MHz).  The picture-area three-cornered
+    hat predicted held-out residual drops within 1-2% on map/photo windows
+    and the held-out gains were -17..-27% rms per band for a 2-master blend.
+    Dropouts and >K-sigma disagreements (grown by XM_GROW, as in the blend)
+    are left out of the estimate so a few gross pixels cannot set a master's
+    variance."""
+    M = len(groups)
+    BL, BX0, BX1 = slice(6, 14), 200, 1080
+    bmasks = xm_band_masks(BX1 - BX0, fs_hz)
+    amasks = xm_band_masks(ca.stop - ca.start, fs_hz)
+    nb = bmasks.shape[0]
+    within = {}; pair = {}; apair = {}; pairpix = {}; awithin = {}
+    fh, fw = frame_dicts[0][next(iter(frame_dicts[0]))].f0.shape
+
+    def blank(fr):
+        x = fr.f0.astype(np.float64)[BL, BX0:BX1]
+        return x if np.median(x) - np.median(fr.f0[BL, 10:50]) > 5000 else None
+
+    for fd in frame_dicts:
+        ref_name = next((n for n in groups[0] if n in fd), None)
+        if ref_name is None:
+            continue
+        ref = fd[ref_name].f0.astype(np.float64)
+        means, ameans, amask = {}, {}, {}
+        for m, g in enumerate(groups):
+            pres = [n for n in g if n in fd]
+            bl = {n: blank(fd[n]) for n in pres}
+            pres = [n for n in pres if bl[n] is not None]
+            if not pres:
+                continue
+            w = np.array([weights[n] for n in pres]); w = w / w.sum()
+            stackb = np.stack([bl[n] for n in pres], 0)
+            means[m] = np.tensordot(w, stackb, 1)
+            if len(pres) >= 2:
+                for i, n in enumerate(pres):
+                    ow = np.delete(w, i)
+                    others = np.tensordot(ow / ow.sum(), np.delete(stackb, i, 0), 1)
+                    acc = within.setdefault(n, [np.zeros(nb), 0, len(pres)])
+                    acc[0] += _xm_band_power(stackb[i] - others, bmasks); acc[1] += 1
+            regs = []; dmask = np.zeros((ra.stop - ra.start, ca.stop - ca.start), bool)
+            for n in pres:
+                dm = dropout_mask((fh, fw), fd[n].do0)
+                if n == ref_name:
+                    regs.append(ref[ra, ca]); dmask |= dm[ra, ca]; continue
+                r, best = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True)
+                regs.append(chroma_align_field(r, ref, ca)[ra, ca])
+                dmask |= np.roll(dm, (int(round(best[0])), int(round(best[1]))), (0, 1))[ra, ca]
+            stacka = np.stack(regs, 0)
+            ameans[m] = np.tensordot(w, stacka, 1)
+            amask[m] = dmask
+            if len(pres) >= 2:          # picture-area player noise per capture (leave-one-out)
+                for i, n in enumerate(pres):
+                    ow = np.delete(w, i)
+                    others = np.tensordot(ow / ow.sum(), np.delete(stacka, i, 0), 1)
+                    acc = awithin.setdefault(n, [np.zeros(nb), 0, len(pres)])
+                    acc[0] += _xm_band_power(stacka[i] - others, amasks, dmask); acc[1] += 1
+        for m in means:
+            for k in means:
+                if k <= m:
+                    continue
+                acc = pair.setdefault((m, k), [np.zeros(nb), 0])
+                acc[0] += _xm_band_power(means[m] - means[k], bmasks); acc[1] += 1
+                if m in ameans and k in ameans:
+                    d = ameans[m] - ameans[k]
+                    bad = amask[m] | amask[k]
+                    # the same K-sigma (grown) rejection the blend applies
+                    bad |= _grow_x(np.abs(d) > XM_REJECT_K * np.sqrt(d.var()), XM_GROW)
+                    apair.setdefault((m, k), []).append(_xm_band_power(d, amasks, bad))
+                    if (~bad).any():
+                        pairpix.setdefault((m, k), []).append(float(d[~bad].var()))
+    if not any(k[0] == 0 for k in apair):
+        return None
+    P = {n: s / c * (k - 1) / k for n, (s, c, k) in awithin.items()}
+    Q = np.full((M, nb), np.nan)
+    for m, g in enumerate(groups):
+        ps = [P[n] for n in g if n in P]
+        if ps:
+            Q[m] = 1.0 / np.sum([1.0 / np.maximum(p, 1e-12) for p in ps], 0)
+    Sb = {k: s / c for k, (s, c) in pair.items()}        # blank lines (log only)
+    # picture area: median over the sample frames, not the mean - on black
+    # frames the Community South alt-master players output an almost
+    # noise-free flat level (ds3 vs ds5/ds11 differ by ~0 there), which a
+    # pooled mean let hand 92% of the low bands to a 2-capture master
+    S = {k: np.median(v, 0) for k, v in apair.items()}
+    V = np.full((M, nb), np.nan)
+    present = sorted({m for k in S for m in k})
+    if len(present) >= 3:
+        A = []; y = []
+        for (m, k), s in S.items():
+            row = np.zeros(M); row[m] = row[k] = 1; A.append(row); y.append(s)
+        sol, *_ = np.linalg.lstsq(np.array(A)[:, present], np.array(y), rcond=None)
+        for i, m in enumerate(present):
+            V[m] = sol[i]
+    else:
+        # two masters: assume equal on-disc noise; a single-capture master's
+        # player noise is taken as the primary's typical capture
+        m0, m1 = present
+        prim = [P[n] for n in groups[0] if n in P]
+        q0 = Q[m0] if np.all(np.isfinite(Q[m0])) else np.zeros(nb)
+        q1 = Q[m1] if np.all(np.isfinite(Q[m1])) else (np.median(prim, 0) if prim else q0)
+        d = np.maximum((S[(m0, m1)] - q0 - q1) / 2, 0)
+        V[m0], V[m1] = q0 + d, q1 + d
+    for m in range(M):
+        if np.all(np.isfinite(Q[m])):
+            V[m] = np.maximum(V[m], Q[m])
+        V[m] = np.where(np.isfinite(V[m]), np.maximum(V[m], 1e-12), np.inf)
+    alpha = (1.0 / V) / (1.0 / V).sum(0, keepdims=True)
+    # picture/blank-line power ratio of each master's difference from the
+    # primary: information only (it is 4-8x even within one master, because
+    # capture noise is level-dependent - see the docstring)
+    ratio = np.zeros((M, nb))
+    for m in range(1, M):
+        if (0, m) in Sb and (0, m) in S:
+            ratio[m] = S[(0, m)] / np.maximum(Sb[(0, m)], 1e-12)
+    sysband = np.zeros(nb, bool)
+    sig = np.zeros(M)
+    for m in range(1, M):
+        if (0, m) in pairpix:
+            sig[m] = np.sqrt(np.median(pairpix[(0, m)]))
+    edges = (0,) + XM_BAND_EDGES_MHZ + ("Nyq",)
+    log("[stack] cross-master blend weights per band (MHz), from each master's "
+        "error variance measured on the picture (three-cornered hat):")
+    log("          " + "".join(f"{str(edges[b]) + '-' + str(edges[b + 1]) + ('*' if sysband[b] else ''):>12}"
+                               for b in range(nb)))
+    for m, g in enumerate(groups):
+        log(f"  master {m} ({len(g)} cap) " + "".join(f"{alpha[m, b]:12.2f}" for b in range(nb))
+            + "   V " + " ".join(f"{v:.0f}" for v in V[m])
+            + (("   picture/blank " + " ".join(f"{r:.1f}" for r in ratio[m])) if m else "")
+            + f"   [{', '.join(g)}]")
+    Vb = 1.0 / (1.0 / V).sum(0)
+    log("  predicted blend error vs primary alone per band: "
+        + " ".join(f"{100 * (np.sqrt(b / a) - 1):+.0f}%" for a, b in zip(V[0], Vb)) + " rms")
+    return dict(alpha=alpha, sig=sig)
+
+
+def xm_blend(ests, alpha, active_rows, active_cols, fs_hz):
+    """Blend master estimates [(m, field, ok_mask)] per band on the active area.
+
+    ests[0] must be the primary master.  Outside the active area, and where
+    no master is valid, the primary is kept.  Where only some masters are
+    valid, those are averaged with their broadband weights."""
+    ms = [m for m, _, _ in ests]
+    a = alpha[ms]
+    a = a / a.sum(0, keepdims=True)
+    abb = a.mean(1)                                   # broadband weight per master
+    out = ests[0][1].copy()
+    blk = (active_rows, active_cols)
+    fields = [e[1][blk] for e in ests]
+    oks = [e[2][blk] for e in ests]
+    wsum = sum(w * ok for w, ok in zip(abb, oks))
+    prov = sum(w * ok * f for w, ok, f in zip(abb, oks, fields)) / np.maximum(wsum, 1e-12)
+    prov = np.where(wsum > 0, prov, fields[0])
+    width = fields[0].shape[1]
+    n = width + 2 * XM_PAD
+    masks = xm_band_masks(n, fs_hz)
+    acc = None
+    for i, (f, ok) in enumerate(zip(fields, oks)):
+        x = np.where(ok, f, prov)
+        x = np.pad(x, ((0, 0), (XM_PAD, XM_PAD)), mode="reflect")
+        H = (a[i][:, None] * masks).sum(0)
+        X = np.fft.rfft(x, axis=1) * H[None]
+        acc = X if acc is None else acc + X
+    blended = np.fft.irfft(acc, n, axis=1)[:, XM_PAD:XM_PAD + width]
+    allok = np.logical_and.reduce(oks)
+    res = np.where(allok, blended, prov)
+    out[blk] = res
+    anyok = np.zeros(out.shape, dtype=bool)
+    anyok[blk] = wsum > 0
+    return out, anyok
 
 
 def perframe_weights(regs, masks, global_w, ra, ca, drop=True, drop_mult=3.0,
@@ -1210,6 +2051,9 @@ def _compute_frame(fd, P, hints=None):
     out_shifts = {}
     present_primary = [n for n in primary if n in fd]
     present_fill = [n for n in fill_sources if n in fd] if P["cross_fill"] else []
+    avail = (list(present_primary), list(present_fill))     # per-frame stats (LDSTACK_FRAME_STATS)
+    # cross-master blend only when the primary master carries this frame
+    xm = P.get("xm") if present_primary else None
     if not present_primary:
         # picture missing from every primary-master capture: build the frame
         # from the alt-master captures rather than dropping it from the output
@@ -1266,12 +2110,64 @@ def _compute_frame(fd, P, hints=None):
                                  key=lambda n: abs(means[n] - cons))
     ref_frame = fd[present_primary[0]]
     filled = 0
+    repaired = 0
+    extra_reg = 0                   # fields whose alt was registered for repair only
     out_fields = []
+
+    def repair_from(out, valid, alts):
+        """Master-defect repair: a defect every primary carries (cut into the
+        primary glass master) taken from an alt master that is clean there."""
+        n = 0
+        rawk = os.environ.get("LDSTACK_REPAIR_RAWDUMP_KEYS", "")
+        if REPAIR_DUMP and rawk and str(fd[present_primary[0]].key) in rawk.split(","):
+            np.savez_compressed(os.path.join(REPAIR_DUMP, f"raw_{fd[present_primary[0]].key}_{which}.npz"),
+                                out=out, valid=valid, alts=np.stack([a for a, _ in alts]),
+                                oks=np.stack([o for _, o in alts]), black=P.get("black") or 0,
+                                ra=np.array([ra.start, ra.stop]), ca=np.array([ca.start, ca.stop]))
+        for ai, (alt, alt_ok) in enumerate(alts):
+            rra = slice(REPAIR_ROW0, min(REPAIR_ROW1, out.shape[0] - 1))
+            al, c0, cs, sd = alt_aligned(out, alt, valid & alt_ok, rra, ca)
+            if REPAIR_DUMP and not al:
+                with open(os.path.join(REPAIR_DUMP, "misaligned.txt"), "a") as fh:
+                    fh.write(f"{fd[present_primary[0]].key} f{which} a{ai} corr0 {c0:.3f} shifted {cs:.3f} std {sd:.0f}\n")
+            if not al:
+                continue
+            rm, rsig = master_repair_mask(out, valid, alt, alt_ok, rra, ca,
+                                          black=P.get("black"))
+            if rm is None or not rm.any():
+                continue
+            for br, bc0, bcs, bsd in band_misaligned(out, alt, valid & alt_ok, rm, ca):
+                rm[br] = False
+                if REPAIR_DUMP:
+                    with open(os.path.join(REPAIR_DUMP, "misaligned.txt"), "a") as fh:
+                        fh.write(f"{fd[present_primary[0]].key} f{which} a{ai} lines {br.start}-{br.stop} "
+                                 f"corr0 {bc0:.3f} shifted {bcs:.3f} std {bsd:.0f}\n")
+            if not rm.any():
+                continue
+            vals = repair_values(out, alt, rm, valid & alt_ok)
+            keep = luma_check(out, rm, vals, rsig)
+            if (keep != rm).any():
+                vals = vals[keep[rm]]
+                rm = keep
+            if not rm.any():
+                continue
+            if REPAIR_DUMP:
+                # audit trail: every substituted pixel, old and new
+                ys, xs = np.where(rm)
+                np.savez_compressed(
+                    os.path.join(REPAIR_DUMP, f"{fd[present_primary[0]].key}_{which}_a{ai}.npz"),
+                    y=ys, x=xs, prim=out[rm], alt=alt[rm], sig=rsig, new=vals)
+            out = out.copy()
+            out[rm] = vals
+            n += int(rm.sum())
+            valid = valid & ~rm     # a second alt master: only the rest
+        return out, n
+
     for fidx, which in enumerate(("f0", "f1")):
         ref_field = getattr(ref_frame, which).astype(np.float64)
         do_attr = "do0" if which == "f0" else "do1"
 
-        def combine_set(names, diff_dod=False):
+        def combine_set(names, diff_dod=False, info=None):
             regs, masks, ws, sigs = [], [], [], []
             for n in names:
                 fr = fd[n]
@@ -1303,16 +2199,50 @@ def _compute_frame(fd, P, hints=None):
                 ws = perframe_weights(regs, masks, ws, ra, ca,
                                       drop=True, drop_mult=P["reg_drop_mult"])
             return combine_fields(regs, masks, ws, sigs,
-                                  diff_dod=diff_dod)
+                                  diff_dod=diff_dod, info=info)
 
         # dropout-flagged pixels are never used, even when every capture
         # flagged them (user instruction): leave them for the dropout
         # corrector rather than trusting flagged samples
-        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD)
+        prim_info = {} if (REJ_KEEP_MEDIAN and len(present_primary) >= 3) else None
+        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD, info=prim_info)
+        # ---- cross-master blend: average the masters' estimates per band
+        blended = False
+        xm_alts = []                # (estimate, ok) per alt master, for repair
+        fill_cache = None
+        if xm is not None:
+            alt_sets = []
+            for m, names in enumerate(P["xm_groups"][1:], 1):
+                pres = [n for n in names if n in fd]
+                if not pres:
+                    continue
+                fo, fws = combine_set(pres)
+                alt_sets.append((m, fo, fws > 0))
+                xm_alts.append((fo, fws > 0))
+            # repair primary-master defects BEFORE the blend: blended, a defect
+            # is diluted by the alt and no longer passes the repair's tests
+            # (North test card frames 2996-2999: streak halved, not repaired)
+            if REPAIR_K > 0 and xm_alts:
+                out, n = repair_from(out, wsum > 0, xm_alts)
+                repaired += n
+            ests = [(0, out, wsum > 0)]
+            for m, fo, ok in alt_sets:
+                # a defect on an alt master (often a single capture, so nothing
+                # inside its own combine can reject it) must not reach the output,
+                # nor its tails (XM_GROW)
+                if xm["sig"][m] > 0:
+                    dis = (wsum > 0) & ok & (np.abs(fo - out) > XM_REJECT_K * xm["sig"][m])
+                    ok = ok & ~_grow_x(dis, XM_GROW)
+                ests.append((m, fo, ok))
+            if len(ests) > 1:
+                out, anyok = xm_blend(ests, xm["alpha"], ra, ca, P["fs_hz"])
+                wsum = np.where(anyok, np.maximum(wsum, 1e-6), wsum)
+                blended = True
         allbad = (wsum == 0)            # dropout present in EVERY primary disc
         # ---- cross-master fill: patch master-level dropouts from alt master
-        if present_fill and allbad.any():
+        if present_fill and allbad.any() and not blended:
             fout, fws = combine_set(present_fill)
+            fill_cache = (fout, fws)
             fillable = allbad & (fws > 0)
             # The fill source is often a SINGLE alt-master capture, so nothing
             # cross-checks it: combine_fields with one field cannot reject
@@ -1334,13 +2264,44 @@ def _compute_frame(fd, P, hints=None):
                 out[fillable] = fout[fillable]
                 filled += int(fillable.sum())
                 allbad = allbad & ~fillable
+        # ---- master-defect repair (no cross-master blend: from the fill captures)
+        if REPAIR_K > 0 and not xm_alts and present_fill:
+            valid = wsum > 0
+            go = True
+            if fill_cache is None and REPAIR_PRESCREEN:
+                # the alt is not registered yet: only pay for it when the
+                # primary has a candidate streak at all.  The seed threshold
+                # is K x the primary-vs-alt spread, measured at 2.0-13.7x
+                # the noise of the best primary capture (median 5.9x, 560
+                # trial fields): F = 1.5 keeps a margin below that.
+                thr = REPAIR_K * REPAIR_PRESCREEN_F * min(sig[n] for n in present_primary)
+                go = repair_prescreen(out, valid, ra, ca, thr, black=P.get("black"))
+            if go:
+                if fill_cache is None:
+                    extra_reg += 1
+                    before = set(out_shifts)
+                    fill_cache = combine_set(present_fill)
+                    # the production path did not register the fill
+                    # captures on this frame: keep their hints as they
+                    # were so later frames register identically
+                    for k in set(out_shifts) - before:
+                        del out_shifts[k]
+                out, n = repair_from(out, valid, [(fill_cache[0], fill_cache[1] > 0)])
+                repaired += n
         outu = np.clip(np.round(out), 0, 65535).astype(np.uint16)
         meta = ref_frame.meta0 if which == "f0" else ref_frame.meta1
         resid_do = []                   # still bad after cross-fill
+        if prim_info and "rej_only" in prim_info:
+            allbad = allbad & ~prim_info["rej_only"]      # disagreement, not dropout: keep the median
         if allbad.any():
+            # one entry per RUN of bad samples (gaps <= RESID_DO_GAP merged), not one min..max span per
+            # line: two bad pixels at x=200 and x=1000 used to flag the 800 good samples between them,
+            # which ld-dropout-correct then replaced from another line (EcoDisc_S2: 45M samples flagged)
             for ln in np.where(allbad.any(1))[0]:
                 xs = np.where(allbad[ln])[0]
-                resid_do.append((int(ln), int(xs.min()), int(xs.max()) + 1))
+                brk = np.where(np.diff(xs) > RESID_DO_GAP + 1)[0]
+                for a, b in zip(np.r_[0, brk + 1], np.r_[brk, len(xs) - 1]):
+                    resid_do.append((int(ln), int(xs[a]), int(xs[b]) + 1))
         # EFM: pool ALL discs (the digital data is master-independent)
         efm_src = [n for n in present_primary + present_fill
                    if fd[n].efm is not None]
@@ -1371,8 +2332,12 @@ def _compute_frame(fd, P, hints=None):
             awts.append(weights[n])
         if aligned:
             audio_out = combine_audio(aligned, awts)
+    fstats = {"avail": avail[0], "avail_alt": avail[1], "used": list(present_primary),
+              "used_alt": list(present_fill),
+              "resid_do": [sum(b - a for _, a, b in f[3]) for f in out_fields]}
     return {"fields": out_fields, "audio": audio_out, "filled": filled,
-            "shifts": out_shifts}
+            "repaired": repaired, "extra_reg": extra_reg, "shifts": out_shifts,
+            "fstats": fstats}
 
 
 _WORKER_STATE = None            # (sources, P) inherited by forked pool workers
@@ -1399,6 +2364,32 @@ def _frame_by_key(args):
     sources, P = _WORKER_STATE
     fd = {s.name: s.get(key) for s in sources if key in s.keys()}
     return _compute_frame(fd, P, hints)
+
+
+# Frames per work item on the indexed (.tbc) path.  A block is read with one
+# large read per capture (TBCFrameSource.prefetch) and stacked in order, each
+# frame's registration warm-started from the previous frame of its block and
+# the first frame of a block starting cold.  Blocks are fixed slices of the
+# picture list, so the output does not depend on --jobs.
+BLOCK = int(os.environ.get("LDSTACK_BLOCK", "24"))
+
+
+def _frame_block(keys):
+    sources, P = _WORKER_STATE
+    for s in sources:
+        s.prefetch(keys)
+    out, hints = [], None
+    try:
+        for key in keys:
+            fd = {s.name: s.get(key) for s in sources if key in s.keys()}
+            r = _compute_frame(fd, P, hints)
+            if r:
+                hints = r["shifts"]
+            out.append(r)
+    finally:
+        for s in sources:
+            s.drop_prefetch()
+    return out
 
 
 def _frame_from_fd(args):
@@ -1458,7 +2449,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
           cross_fill=True, masters=None, sample=24, analysis_window=None,
           max_frames=None,
           scratch_dir=None, git_commit="", reg_confidence=True, reg_drop_mult=3.0,
-          line_reg=0, jobs=0, log=print):
+          line_reg=0, jobs=0, cross_master=False, log=print):
     aw = analysis_window or max(sample * 2, 40)
     merged = lockstep(sources)
 
@@ -1511,6 +2502,25 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
     # per-frame registration confidence, which is the graceful version of the
     # same judgement.
     info = analyse(asample, ra, ca, allow_noise_drop=indexed)
+    fs_hz = float(vp.get("sampleRate") or 4 * 4433618.75)
+    if cross_master and not masters:
+        # regroup by shared on-disc noise (see xm_clusters) and judge noise
+        # outliers against each capture's own master: an alt-master capture's
+        # global noise figure is inflated by its master's disc noise
+        cand = [n for n in sorted(info) if info[n]["reason"] != "no usable frames"]
+        groups, corr = xm_clusters(asample, cand, ra, ca, fs_hz)
+        for mid, g in enumerate(groups):
+            med = float(np.median([info[n]["noise"] for n in g]))
+            for n in g:
+                info[n]["master"] = mid
+                if len(g) >= 3 and indexed and info[n]["noise"] > 4.0 * med:
+                    info[n]["keep"], info[n]["reason"] = False, "noise outlier (within master)"
+                else:
+                    info[n]["keep"] = mid == 0
+                    info[n]["reason"] = ("disc-noise cluster" if mid == 0
+                                         else "alt master (disc-noise cluster)")
+        log("[stack] masters by shared 5.5-7 MHz disc noise: "
+            + " | ".join(",".join(g) for g in groups))
     if not indexed:
         log("[stack] streaming sources: master clustering from the opening "
             "window, noise used for weighting only (no noise-outlier drop)")
@@ -1550,21 +2560,40 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
     if fill_sources and cross_fill:
         log(f"[stack] cross-master fill from {len(fill_sources)} alt-master "
             f"captures: {', '.join(fill_sources)}")
+    xm, xm_groups = None, None
+    if cross_master and fill_sources:
+        nmaster = max(info[n]["master"] for n in fill_sources)
+        xm_groups = [primary] + [[n for n in fill_sources if info[n]["master"] == m]
+                                 for m in range(1, nmaster + 1)]
+        xm_groups = [g for g in xm_groups if g]
+        xm = xm_estimate(asample, xm_groups, ra, ca, fs_hz, weights, log=log)
+        if xm is None:
+            log("[stack] cross-master: masters never overlap in the sample - fill only")
 
     writer = StackWriter(outbase, vp, system, git_commit)
+    # LDSTACK_FRAME_STATS=<file>: one line per output frame (does not change the stack):
+    # frame, picture, captures available / used (primary master), alt captures used, pixels
+    # cross-filled, pixels repaired, samples still flagged dropout, used names, alt names
+    fstats_fh = None
+    if os.environ.get("LDSTACK_FRAME_STATS"):
+        fstats_fh = open(os.environ["LDSTACK_FRAME_STATS"], "w")
+        fstats_fh.write("frame\tpicture\tavail\tused\tused_alt\tfilled\trepaired\tresid_do\tused_names\talt_names\n")
     efm_stream = []          # list of averaged int16 EFM waveforms (per field)
     nwritten = 0
     filled_total = 0
+    repaired_total = 0
+    extra_reg_total = 0
     import itertools
 
     P = dict(primary=primary, fill_sources=fill_sources, cross_fill=cross_fill,
              black=float(vp.get("black16bIre", 0)) or None,
              weights=weights, sig=sig, ra=ra, ca=ca, fh=fh, fw=fw,
              subpixel=subpixel, chroma_align=chroma_align, line_reg=line_reg,
-             reg_confidence=reg_confidence, reg_drop_mult=reg_drop_mult)
+             reg_confidence=reg_confidence, reg_drop_mult=reg_drop_mult,
+             xm=xm, xm_groups=xm_groups, fs_hz=fs_hz)
 
     def emit(r):
-        nonlocal nwritten, filled_total
+        nonlocal nwritten, filled_total, repaired_total, extra_reg_total
         if r is None:
             return
         for outu, meta, vbidata, resid_do, efm_avi, audio_n in r["fields"]:
@@ -1574,7 +2603,20 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             writer.write_field(outu, meta, vbidata, resid_do, efm_t, audio_n)
         if r["audio"] is not None:
             writer.write_audio(r["audio"])
+        if fstats_fh is not None:
+            fs = r.get("fstats") or {}
+            vb = [f[2] for f in r["fields"]]
+            pic = next((p for p in (cav_picture(v) for v in vb) if p is not None), None)
+            if pic is None and vb:
+                pic = clv_frame([x for v in vb for x in (v or [])])
+            nm = lambda ns: ",".join(os.path.basename(str(n)).replace(".tbc", "") for n in ns)
+            fstats_fh.write("%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n" % (
+                nwritten, "" if pic is None else pic, len(fs.get("avail", [])),
+                len(fs.get("used", [])), len(fs.get("used_alt", [])), r["filled"], r.get("repaired", 0),
+                sum(fs.get("resid_do", [])), nm(fs.get("used", [])), nm(fs.get("used_alt", []))))
         filled_total += r["filled"]
+        repaired_total += r.get("repaired", 0)
+        extra_reg_total += r.get("extra_reg", 0)
         nwritten += 1
         if nwritten % 50 == 0:
             log(f"  ... {nwritten} frames")
@@ -1638,34 +2680,41 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         everywhere = set.intersection(*keysets)
         n_partial = sum(1 for k in shared if k not in everywhere)
 
-        def _fd_for(key):
-            return {s.name: s.get(key) for s in sources if key in s.keys()}
+        blocks = [shared[i:i + BLOCK] for i in range(0, len(shared), BLOCK)]
+        global _WORKER_STATE
+        _WORKER_STATE = (sources, P)
 
-        if jobs and jobs > 1:
-            # frames are independent -> fan the per-frame computation out over
-            # a fork pool (sources/P inherited copy-on-write, .tbc via memmap);
-            # the parent writes results in key order
-            import multiprocessing as mp
-            from concurrent.futures import ProcessPoolExecutor
-            global _WORKER_STATE
-            log(f"[stack] parallel: {jobs} workers over {len(shared)} frames "
-                f"({n_partial} present on only some captures)")
-            _WORKER_STATE = (sources, P)
-            try:
+        def _retire(results):
+            for r in results:
+                emit(r)
+
+        try:
+            if jobs and jobs > 1:
+                # frames are independent -> fan blocks out over a fork pool
+                # (sources/P inherited copy-on-write); the parent writes the
+                # results in key order
+                import collections
+                import multiprocessing as mp
+                from concurrent.futures import ProcessPoolExecutor
+                log(f"[stack] parallel: {jobs} workers over {len(shared)} frames "
+                    f"in blocks of {BLOCK} ({n_partial} present on only some captures)")
                 with ProcessPoolExecutor(
                         max_workers=jobs,
                         mp_context=mp.get_context("fork")) as ex:
-                    _run(iter(shared),
-                         lambda key, h: ex.submit(_frame_by_key, (key, h)),
-                         HINT_LAG)
-            finally:
-                _WORKER_STATE = None
-        else:
-            log(f"[stack] sequential over {len(shared)} frames "
-                f"({n_partial} present on only some captures)")
-            _run(iter(shared),
-                 lambda key, h: _Now(_compute_frame(_fd_for(key), P, h)),
-                 HINT_LAG)
+                    inflight = collections.deque()
+                    for b in blocks:
+                        inflight.append(ex.submit(_frame_block, b))
+                        if len(inflight) >= 2 * jobs:
+                            _retire(inflight.popleft().result())
+                    while inflight:
+                        _retire(inflight.popleft().result())
+            else:
+                log(f"[stack] sequential over {len(shared)} frames in blocks of "
+                    f"{BLOCK} ({n_partial} present on only some captures)")
+                for b in blocks:
+                    _retire(_frame_block(b))
+        finally:
+            _WORKER_STATE = None
     else:
         # Streaming sources cannot be asked for a key twice, so the frames
         # arrive in lockstep order and are stacked as they come.
@@ -1750,10 +2799,14 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
             log(f"[stack] EFM merge: {got} data bytes recovered from {nd} "
                 f"captures (best single: {best}; +{got-best})")
     writer.close(efm_bytes)
+    if fstats_fh is not None:
+        fstats_fh.close()
     log(f"[stack] wrote {outbase}.tbc (+.tbc.json/.tbc.db), {outbase}.pcm"
         + (f", {outbase}.efm" if efm_bytes else "")
         + (f", {outbase}.data (merged EFM)" if efm_merged else "")
-        + f" ({nwritten} frames; {filled_total} px cross-master filled)")
+        + f" ({nwritten} frames; {filled_total} px cross-master filled; "
+        f"{repaired_total} px primary-master defects repaired from an alt master; "
+        f"{extra_reg_total} fields registered an alt master for the repair check)")
     return info
 
 
@@ -1817,6 +2870,11 @@ def main(argv=None):
                    help="disable cross-master dropout fill (by default, after "
                    "stacking the primary master, residual master-level dropouts "
                    "are patched from the registered alt-master stack)")
+    p.add_argument("--cross_master", action="store_true",
+                   help="blend ALL masters' captures, per frequency band, instead "
+                   "of using alt masters only to fill dropouts: on-disc noise is "
+                   "per glass master, so averaging masters reduces it.  Masters "
+                   "are grouped by their shared 5.5-7 MHz disc noise")
     p.add_argument("--masters", type=str, default=None,
                    help="explicit master grouping instead of auto-clustering; "
                    "groups separated by ';', captures by ',', first group is the "
@@ -1929,7 +2987,8 @@ def main(argv=None):
               max_frames=args.max_frames,
               reg_confidence=not args.no_reg_confidence,
               reg_drop_mult=args.reg_drop_mult, line_reg=args.line_reg,
-              jobs=args.jobs, git_commit=_git_commit())
+              jobs=args.jobs, git_commit=_git_commit(),
+              cross_master=args.cross_master)
     finally:
         for s in sources:
             s.close()
