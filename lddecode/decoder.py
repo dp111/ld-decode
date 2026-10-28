@@ -10,6 +10,7 @@ Reads RF from a loader, demodulates it (RFDecode), assembles fields
 cut (ld-cut) and start_finder.
 """
 
+import functools
 import os
 import sqlite3
 import sys
@@ -55,8 +56,20 @@ def applied_eq_db(applied_eq, freq_hz):
     """
     if not applied_eq:
         return 0.0
+    # The servos re-read every pooled field's curve at every packet on every
+    # field, and a PCHIP build per read was a third of the serial thread.
+    try:
+        return _applied_eq_db_memo(applied_eq, freq_hz)
+    except TypeError:                   # unhashable anchors or array freq
+        return _applied_eq_db(applied_eq, freq_hz)
+
+
+def _applied_eq_db(applied_eq, freq_hz):
     top = max(applied_eq[-1][0] + 1.0e6, freq_hz)
     return float(video_eq_db(applied_eq, freq_hz, top))
+
+
+_applied_eq_db_memo = functools.lru_cache(maxsize=8192)(_applied_eq_db)
 
 
 def pool_reading(pool, entry, keep):

@@ -183,16 +183,24 @@ class TBCFrameSource(FrameSource):
         turn into a seek storm: the 2026-10-12 South stack ran at ~22 MB/s
         with the CPUs 78% idle.  One read per capture per block of frames is
         one seek per ~35 MB instead of one per 0.7 MB."""
+        self.use_block(self.read_block(keys))
+
+    def use_block(self, blk):
+        """Serve reads from a block read by read_block."""
+        self._cache, self._acache = blk
+
+    def read_block(self, keys):
+        """The fields (and audio) of `keys` read in one go, as (cache,
+        audio cache) for use_block.  Touches no state of the source but the
+        index, so it can run in a thread while another block is stacked."""
         if not hasattr(self, "_idx"):
             self._build_index()
-        self._cache = {}
-        self._acache = None
         fis = sorted(self._idx[k] for k in keys if k in self._idx)
         if not fis:
-            return
+            return {}, None
         lo, hi = fis[0] * 2, fis[-1] * 2 + 1
         if hi - lo + 1 > 2 * (2 * len(fis)) + 16:    # scattered: per-field reads
-            return
+            return {}, None
         n = hi - lo + 1
         for attempt in range(8):
             try:
@@ -205,13 +213,15 @@ class TBCFrameSource(FrameSource):
         arr = np.frombuffer(buf, dtype="<u2")
         got = len(arr) // (self._fshape[0] * self._fshape[1])
         arr = arr[: got * self._fshape[0] * self._fshape[1]].reshape(got, *self._fshape)
-        self._cache = {lo + i: arr[i] for i in range(got)}
+        cache = {lo + i: arr[i] for i in range(got)}
+        acache = None
         if self._pcm_fd is not None and self._spf:
             f0, f1 = lo // 2, hi // 2 + 1
             a = self._pread(self._pcm_fd, (f1 - f0) * self._spf * 4, f0 * self._spf * 4)
             a = np.frombuffer(a, dtype="<i2")
             a = a[: len(a) // 2 * 2].reshape(-1, 2)
-            self._acache = (f0, a)
+            acache = (f0, a)
+        return cache, acache
 
     def drop_prefetch(self):
         self._cache = {}
@@ -265,7 +275,14 @@ class TBCFrameSource(FrameSource):
         self._spf = 0
         nframes = len(self.fields) // 2
         if self._pcm_fd is not None and nframes:
-            self._spf = self._pcm_len // nframes
+            # samples per frame from the decode's own per-field counts (44100
+            # / 25 = 1764 on PAL): a .pcm cut short would otherwise shift
+            # every frame's slice; .pcm length / frames only without them
+            per = [int(self.fields[2 * i].get("audioSamples", 0) or 0)
+                   + int(self.fields[2 * i + 1].get("audioSamples", 0) or 0) for i in range(nframes)]
+            vals, cnt = np.unique(per, return_counts=True)
+            spf = int(vals[np.argmax(cnt)])
+            self._spf = spf if spf > 0 else self._pcm_len // nframes
         prev = None
         raw = []
         for fi in range(nframes):
@@ -303,9 +320,15 @@ class TBCFrameSource(FrameSource):
         audio = None
         if self._pcm_fd is not None and self._spf:
             audio = self._read_audio(fi)
+        f0, f1 = self._read_field(fi * 2), self._read_field(fi * 2 + 1)
+        dh = getattr(self, "dh", None)
+        if dh is not None:
+            # the master's FM-beat herringbone removed (see herringbone_setup)
+            lib, black, white, hz = dh
+            f0 = lib.cancel_tbc_field(f0, black, white, f0=hz)[0]
+            f1 = lib.cancel_tbc_field(f1, black, white, f0=hz)[0]
         return Frame(
-            key,
-            self._read_field(fi * 2), self._read_field(fi * 2 + 1),
+            key, f0, f1,
             j0, j1, self._dropouts(j0), self._dropouts(j1),
             audio, None,
         )
@@ -596,22 +619,50 @@ REG_WALK_MAX = 8          # cold registration: re-centred 5x5 grids before givin
 # fraction of the search step), so the default is 0: the shift is then purely
 # horizontal and every transform is a 1-D one along the lines
 REG_MAX_DY = float(os.environ.get("LDSTACK_REG_MAX_DY", "0"))
-# largest horizontal shift (samples) the cold search accepts.  TBC'd captures
-# sit within ~1.5 samples of each other (masters included); on a black field
-# the luma correlation peak is random (South picture 3100: ds11 at +178)
-REG_MAX_DX = float(os.environ.get("LDSTACK_REG_MAX_DX", "6"))
-# level fit used by the analysis stage (capture noise, master clustering, the
-# cross-master blend weights): "ls" keeps the production measurement.  With
-# the unbiased fit there the two-master three-cornered hat handed a single
-# noisy alt master 39-46 % of the blend (South s3000: was 24-35 %), and
-# newdecode turned that into grain on held stills (bars rms 4.5 -> 8.7 8-bit
-# levels), although every composite noise measure was lower
-MEASURE_FIT = os.environ.get("LDSTACK_MEASURE_FIT", "ls")
+# largest horizontal shift (samples) the cold search accepts.  Captures of a
+# master sit within ~0.3 samples of each other, but a master's picture can
+# sit several samples off another's and step along the side (CommunityNorth
+# master 1: +0.2, +4.2 from picture ~19900, +8.1 at 28694 - a 6-sample limit
+# misregistered it there and its fields failed the alignment check); on a
+# black field the luma correlation peak is random (South 3100: +178, North
+# 41877: +422)
+REG_MAX_DX = float(os.environ.get("LDSTACK_REG_MAX_DX", "16"))
 # plausible range of the level-match gain (a capture vs the reference)
 REG_GAIN_MIN = float(os.environ.get("LDSTACK_REG_GAIN_MIN", "0.8"))
 REG_GAIN_MAX = float(os.environ.get("LDSTACK_REG_GAIN_MAX", "1.25"))
 # the gain is shrunk toward 1 by signal / (signal + SHRINK x noise) variance
-REG_GAIN_SHRINK = float(os.environ.get("LDSTACK_REG_GAIN_SHRINK", "10"))
+REG_GAIN_SHRINK = float(os.environ.get("LDSTACK_REG_GAIN_SHRINK", "3"))
+# Per-capture gain prior (see stack(): each capture's median gain against one
+# anchor capture over the analysis sample).  A field's gain is shrunk toward
+# its capture's prior - by signal / (signal + GAIN_PRIOR_SHRINK x noise) - not
+# toward 1, and the stacked frame is rescaled from its reference capture's
+# gain to the median capture's.  Without it the output followed whichever
+# capture was the frame's reference (the one nearest the consensus level,
+# changing frame to frame) and each field's own noisy gain: saturation
+# flicker 1.2-1.3x the old stacker's on BGB / Countryside.
+GAIN_PRIOR = os.environ.get("LDSTACK_GAIN_PRIOR", "0") not in ("0", "", "no")
+LEVEL_ROBUST = os.environ.get("LDSTACK_LEVEL_ROBUST", "1") not in ("0", "", "no")
+LEVEL_ROBUST_K = float(os.environ.get("LDSTACK_LEVEL_ROBUST_K", "16"))
+LEVEL_MASK_DO = os.environ.get("LDSTACK_LEVEL_MASK_DO", "1") not in ("0", "", "no")
+CHROMA_CONSENSUS = os.environ.get("LDSTACK_CHROMA_CONSENSUS", "0") not in ("0", "", "no")
+GAIN_RESCALE = os.environ.get("LDSTACK_GAIN_RESCALE", "0") not in ("0", "", "no")
+STABLE_REF = os.environ.get("LDSTACK_STABLE_REF", "0") not in ("0", "", "no")
+GAIN_PRIOR_SHRINK = float(os.environ.get("LDSTACK_GAIN_PRIOR_SHRINK", "100"))
+
+
+# luma / chroma crossover of the two-band level match, as a fraction of the
+# sample rate (4 fsc): 0.169 = 3.0 MHz PAL, 2.4 MHz NTSC; 0 = one gain
+LEVEL_SPLIT = float(os.environ.get("LDSTACK_LEVEL_SPLIT", "0"))
+
+
+def _band_split(x, fc, xover=0.028):
+    """(low, high) of each line of x, raised-cosine crossover at fc (cycles
+    per sample); low + high == x."""
+    W = x.shape[1]
+    f = np.fft.rfftfreq(W)
+    hl = 0.5 + 0.5 * np.cos(np.pi * np.clip((f - (fc - xover / 2)) / xover, 0, 1))
+    lo = np.fft.irfft(np.fft.rfft(x, axis=1) * hl[None], W, axis=1)
+    return lo, x - lo
 
 
 def level_fit_ls(x, y):
@@ -622,7 +673,7 @@ def level_fit_ls(x, y):
     return float(g), float(o)
 
 
-def level_fit(x, y, noise_ratio=1.0):
+def level_fit(x, y, noise_ratio=1.0, prior=None):
     """Gain/offset with g * x + o ~= y, both noisy.
 
     noise_ratio = var(noise of y) / var(noise of x).  Least squares of y on
@@ -640,19 +691,23 @@ def level_fit(x, y, noise_ratio=1.0):
     sxx, syy, sxy = float(np.dot(dx_, dx_)) / n, float(np.dot(dy_, dy_)) / n, float(np.dot(dx_, dy_)) / n
     d = max(float(noise_ratio), 1e-6)
     if sxy <= 0:
-        g = 1.0
+        g = 1.0 if prior is None else prior
     else:
         e = syy - d * sxx
         g = (e + np.sqrt(e * e + 4 * d * sxy * sxy)) / (2 * sxy)
         # signal variance ~ sxy; noise variance of the pair ~ what is left
         noise = max(sxx + syy - 2 * sxy, 0.0)
-        g = 1.0 + (g - 1.0) * sxy / (sxy + REG_GAIN_SHRINK * noise)
+        if prior is None:
+            g = 1.0 + (g - 1.0) * sxy / (sxy + REG_GAIN_SHRINK * noise)
+        else:
+            g = prior + (g - prior) * sxy / (sxy + GAIN_PRIOR_SHRINK * noise)
     g = float(np.clip(g, REG_GAIN_MIN, REG_GAIN_MAX))
     return g, float(my - g * mx)
 
 
 def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None,
-                   noise_ratio=1.0, return_level=False, fit="deming"):
+                   noise_ratio=1.0, return_level=False, fit="deming", gain_prior=None,
+                   fit_mask=None):
     """Return field resampled to align with ref, plus affine level-matched.
     ra/ca are the active row/col slices used for measuring the shift.
     line_reg>0 adds a per-line (==1) / within-line (>1, = #blocks) sub-pixel
@@ -783,9 +838,39 @@ def register_field(field, ref, ra, ca, subpixel=True, line_reg=0, hint=None,
     # affine level match (gain+offset) to the reference over the active area
     if fit == "ls":
         g, o = level_fit_ls(shifted[ra, ca].ravel(), ref[ra, ca].ravel())
+        out = g * shifted + o
+    elif LEVEL_SPLIT > 0:
+        # luma and chroma bands matched separately: players / masters differ
+        # in their chroma-to-luma ratio (South ds11 vs ds1/10/12: luma 0.97-0.98,
+        # chroma 1.04-1.05 after one common gain), and a single gain split
+        # the difference by content (bars: chroma-led, luma 5 % low; test
+        # card: luma-led) - a static picture-shaped difference that the
+        # blend put into every frame and newdecode v6 turned into grain
+        lo_s, hi_s = _band_split(shifted, LEVEL_SPLIT)
+        lo_r, hi_r = _band_split(ref, LEVEL_SPLIT)
+        g, o = level_fit(lo_s[ra, ca].ravel(), lo_r[ra, ca].ravel(), noise_ratio, gain_prior)
+        gc, _ = level_fit(hi_s[ra, ca].ravel(), hi_r[ra, ca].ravel(), noise_ratio)
+        out = g * lo_s + gc * hi_s + o
     else:
-        g, o = level_fit(shifted[ra, ca].ravel(), ref[ra, ca].ravel(), noise_ratio)
-    out = g * shifted + o
+        xs, ys = shifted[ra, ca], ref[ra, ca]
+        if fit_mask is not None:
+            fm = fit_mask[ra, ca]
+            if fm.sum() > 0.5 * fm.size:
+                xs, ys = xs[fm], ys[fm]
+        xs, ys = xs.ravel(), ys.ravel()
+        g, o = level_fit(xs, ys, noise_ratio, gain_prior)
+        if LEVEL_ROBUST:
+            # second pass without the pixels the first fit cannot explain
+            # (unflagged dropout tails, a capture's own defects): these moved
+            # a field's gain by up to ~1 % from frame to frame - level and
+            # saturation flicker on held stills
+            r = ys - (g * xs + o)
+            mad = float(np.median(np.abs(r - np.median(r)))) * 1.4826
+            if mad > 0:
+                keep = np.abs(r) <= LEVEL_ROBUST_K * mad
+                if keep.sum() > 0.8 * keep.size:
+                    g, o = level_fit(xs[keep], ys[keep], noise_ratio, gain_prior)
+        out = g * shifted + o
     if line_reg:
         out = subpixel_warp_x(out, ref, ra, ca, nblocks=line_reg)
     if return_level:
@@ -850,6 +935,19 @@ def chroma_rotate(field, ca, rot, fsc_norm=0.25, halfband=0.06):
     return out
 
 
+def chroma_scale(field, ca, g, fsc_norm=0.25, halfband=0.06):
+    """Scale each line's chroma band (active columns) by g."""
+    F = field.astype(np.float64)
+    seg = F[:, ca]
+    n = seg.shape[1]
+    band = _chroma_band(n, fsc_norm, halfband)
+    Ff = np.fft.rfft(seg, axis=1)
+    chroma = np.fft.irfft(np.where(band, Ff, 0), n, axis=1)
+    out = F.copy()
+    out[:, ca] = seg + (g - 1.0) * chroma
+    return out
+
+
 def chroma_align_field(field, ref, ca, fsc_norm=0.25, halfband=0.06, mask=None):
     """Make a capture's chroma subcarrier phase-coherent with the reference,
     per line, so it survives averaging.
@@ -890,7 +988,12 @@ LOCAL_SPREAD_K = float(os.environ.get("LDSTACK_LOCAL_SPREAD_K", "6.0"))
 # longer costs the 623 good lines around it.
 INTEGRITY_DROP_FRAC = float(os.environ.get("LDSTACK_INTEGRITY_DROP_FRAC", "0.20"))
 # residual (every-capture) dropouts are written as runs; runs closer than this many good samples are merged
+CONTENT_OFFSETS = os.environ.get("LDSTACK_CONTENT_OFFSETS", "1") not in ("0", "", "no")
 RESID_DO_GAP = int(os.environ.get("LDSTACK_RESID_DO_GAP", "8"))
+# residual dropouts: write the vertical interpolation of the good lines around them (still flagged)
+CONCEAL_RESID = os.environ.get("LDSTACK_CONCEAL_RESID", "1") not in ("0", "", "no")
+# combine_fields: majority vote of all captures (flagged too) at dropout tails
+TAIL_VOTE = os.environ.get("LDSTACK_TAIL_VOTE", "1") not in ("0", "", "no")
 # every capture outlier-rejected but most not dropout-flagged: output the median unflagged (0 = flag it)
 REJ_KEEP_MEDIAN = int(os.environ.get("LDSTACK_REJ_KEEP_MEDIAN", "1"))
 # cross-master fill must sit within K x the captures' noise of a simple vertical
@@ -980,6 +1083,11 @@ REPAIR_ALIGN_STD = float(os.environ.get("LDSTACK_REPAIR_ALIGN_STD", "1000"))
 
 
 REPAIR_ALIGN_BAND = int(os.environ.get("LDSTACK_REPAIR_ALIGN_BAND", "24"))
+# the blend leaves an alt master out of a field when its zero-shift corr is
+# below MIN_C (another picture: South 29733 at 0.01) or a 1-2 sample / 1 line
+# shift fits better by more than SHIFT_GAIN (South 16374 / 50144)
+XM_ALIGN_MIN_C = float(os.environ.get("LDSTACK_XM_ALIGN_MIN_C", "0.5"))
+XM_ALIGN_SHIFT_GAIN = float(os.environ.get("LDSTACK_XM_ALIGN_SHIFT_GAIN", "0.05"))
 # a band is only refused when a shifted alt matches clearly better than the
 # unshifted one: low correlation alone just means flat picture, different
 # master noise, or the primary's own defect in the band (North 12981: run-5
@@ -1395,6 +1503,32 @@ FRAME_LEVEL_K = float(os.environ.get("LDSTACK_FRAME_LEVEL_K", "8.0"))
 DIFF_DOD = os.environ.get("LDSTACK_DIFF_DOD", "0") not in ("0", "", "no")
 
 
+def conceal_vertical(out, bad, reach=3):
+    """Residual dropouts (bad in every capture) hold the median of the
+    captures' dropout values - garbage that any decoder not doing its own
+    dropout correction shows (South s3000 picture 3073: a bar line at 13000
+    rms against ~1800, the t2d per-bar grain 1.13).  They stay flagged; their
+    value becomes the mean of the nearest good samples above and below in the
+    field (within ``reach`` lines), as ld-dropout-correct would put there."""
+    out = out.copy()
+    H = out.shape[0]
+    ys, xs = np.nonzero(bad)
+    if not len(ys):
+        return out
+    acc = np.zeros(len(ys)); n = np.zeros(len(ys))
+    for sgn in (-1, 1):
+        found = np.zeros(len(ys), bool)
+        for d in range(1, reach + 1):
+            yy = ys + sgn * d
+            ok = (~found) & (yy >= 0) & (yy < H)
+            ok[ok] = ~bad[yy[ok], xs[ok]]
+            acc[ok] += out[yy[ok], xs[ok]]; n[ok] += 1
+            found |= ok
+    has = n > 0
+    out[ys[has], xs[has]] = acc[has] / n[has]
+    return out
+
+
 def masked_median(stack, good):
     """Per-pixel median along axis 0 over the entries where ``good``; where
     none is good, the median of all.  (np.median of a NaN-masked stack is
@@ -1412,16 +1546,6 @@ def masked_median(stack, good):
     if none.any():
         med[none] = np.median(stack[:, none], axis=0)
     return med
-
-
-def _robust_mean(v, floor):
-    """Mean of the values within max(3 robust sigmas, floor) of their median."""
-    v = np.asarray(v, dtype=np.float64)
-    if len(v) < 3:
-        return float(v.mean())
-    med = np.median(v)
-    mad = 1.4826 * np.median(np.abs(v - med))
-    return float(v[np.abs(v - med) <= max(3 * mad, floor)].mean())
 
 
 def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
@@ -1456,6 +1580,20 @@ def combine_fields(fields, masks, weights, sigma, diff_dod=False, info=None):
         mad = masked_median(dev, unflagged) * 1.4826
         floor = 3.0 * float(np.median(sigma))
         good &= dev <= np.maximum(LOCAL_SPREAD_K * mad, floor)[None]
+    # Dropout tails: where the unflagged captures are few (the rest flagged a
+    # dropout) and disagree, the 5-sigma test against their own median
+    # rejects them all and the pixel would be written as a dropout.  Let
+    # every capture vote (flagged ones too - detectors flag generously): the
+    # unflagged captures that sit with a majority of all of them around the
+    # all-capture median are kept.
+    if len(fields) >= 3 and TAIL_VOTE:
+        rescue = ~good.any(0) & unflagged.any(0)
+        if rescue.any():
+            vals = stack[:, rescue]
+            amed = np.median(vals, axis=0)
+            agree = np.abs(vals - amed[None]) <= thr[:, :, 0]
+            ok = (2 * agree.sum(0) > len(fields)) & (amed > 8192.0)
+            good[:, rescue] |= agree & unflagged[:, rescue] & ok[None]
     w = np.array(weights, dtype=np.float64).reshape(-1, 1, 1) * good
     wsum = w.sum(0)
     out = np.where(wsum > 0, (stack * w).sum(0) / np.maximum(wsum, 1e-9), med)
@@ -1506,7 +1644,15 @@ XM_REJECT_K = 6.0       # a master's pixel this many sigma from the primary's is
 XM_HF_BAND_MHZ = (5.9, 7.0)     # disc-noise band used to tell masters apart (above PAL chroma, 4.43 + 1.3 MHz)
 XM_HF_CORR_REL = 0.6            # ...and at least this fraction of the typical capture's best correlation
 XM_HF_CORR_MIN = 0.2            # same master: 0.40-0.44 at 5.9-7 MHz (0.6-0.95 at 5.5-7); different masters: 0.04-0.06
+# two masters (see xm_estimate): the primary's own error is capped at
+# XM_DISC_CAP x a typical capture's player noise; an alt beyond XM_BAD_X is dropped
+XM_DISC_CAP = float(os.environ.get("LDSTACK_XM_DISC_CAP", "4"))
+XM_BAD_X = float(os.environ.get("LDSTACK_XM_BAD_X", "1e9"))   # off: Countryside ds3 (the one case) is worth 0.2-0.3 on the raw-capture truth
+XM_HF_FLOOR_MULT = 5.0         # ...or at least this multiple of the between-master floor (see xm_clusters)
 XM_PAD = 64
+# non-averaging (static) per-capture error added to every master's variance, in
+# units of a typical capture's player noise (see xm_estimate)
+XM_STATIC_S = float(os.environ.get("LDSTACK_XM_STATIC_S", "0"))
 XM_GROW = 12             # a >K-sigma disagreement is a defect: exclude its tails too (samples)
 
 
@@ -1559,7 +1705,7 @@ def xm_clusters(frame_dicts, names, ra, ca, fs_hz):
         ref = fd[present[0]].f0.astype(np.float64)
         hp = {}
         for n in present:
-            r, _ = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True, fit=MEASURE_FIT)
+            r, _ = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True)
             X = np.fft.rfft(r[ra, ca], axis=1)
             X[:, ~band] = 0
             hp[n] = np.fft.irfft(X, width, axis=1)
@@ -1578,35 +1724,143 @@ def xm_clusters(frame_dicts, names, ra, ca, fs_hz):
     for (a, b), v in corr.items():
         best[a] = max(best.get(a, -1.0), v); best[b] = max(best.get(b, -1.0), v)
     thr = max(XM_HF_CORR_MIN, XM_HF_CORR_REL * float(np.median(list(best.values())))) if best else XM_HF_CORR_MIN
-    groups = []
-    for n in names:
-        linked = [g for g in groups
-                  if any(corr.get((n, m), corr.get((m, n), 0.0)) >= thr for m in g)]
-        merged = [n] + [m for g in linked for m in g]
-        groups = [g for g in groups if g not in linked] + [merged]
+
+    def link(t):
+        groups = []
+        for n in names:
+            linked = [g for g in groups
+                      if any(corr.get((n, m), corr.get((m, n), 0.0)) >= t for m in g)]
+            merged = [n] + [m for g in linked for m in g]
+            groups = [g for g in groups if g not in linked] + [merged]
+        return groups
+
+    groups = link(thr)
+    # A capture with much more player noise than the rest correlates less with
+    # its own master (the shared disc noise is a smaller part of its band
+    # power): NationalA ds3 0.44-0.49 with ds9/ds11 against 0.8-1.0 inside the
+    # other masters, so the threshold above (0.49 there) made it a master of
+    # its own, and the hat then gave that one master's disc noise two votes.
+    # Between masters the correlation sits at a floor (0.01-0.05; 0.11-0.14 on
+    # the CLV NationalB) far below any same-master pair, so a pair at
+    # XM_HF_FLOOR_MULT x the floor (and XM_HF_CORR_MIN) is linked too.
+    gid = {n: i for i, g in enumerate(groups) for n in g}
+    cross = [v for (a, b), v in corr.items() if gid.get(a) != gid.get(b)]
+    if cross:
+        thr2 = max(XM_HF_CORR_MIN, XM_HF_FLOOR_MULT * float(np.median(cross)))
+        if thr2 < thr:
+            groups = link(thr2)
     groups.sort(key=len, reverse=True)
     return groups, corr
 
 
-def xm_floor_variance(V, Q, P, groups):
+def single_capture_noise(n, P, noise=None):
+    """Player-noise band power (nb,) of capture ``n`` that has no
+    leave-one-out estimate (it is its master's only capture): the median P
+    of the captures that have one.  Scaling it by n's own analyse() noise
+    was tried and is wrong: that figure includes n's master's disc noise
+    and rendering differences (North ds3: 949-1353 against ~400, while its
+    error against held-run truth is the side's lowest)."""
+    if not P:
+        return None
+    return np.median([P[k] for k in P], 0)
+
+
+def xm_floor_variance(V, Q, P, groups, noise=None):
     """Floor every master's error variance V (M, nb) at its player noise Q
     (the within-master leave-one-out estimate, NaN where the master has one
-    capture).  A master with ONE capture has no such estimate: it takes a
-    typical capture's (median of the per-capture P over the captures that
-    have one).  Unfloored, a three-cornered-hat V <= 0 (sampling noise, or a
-    master that happens to sit between the others) was clamped to 1e-12 and
-    took ~all the weight."""
+    capture; see single_capture_noise for those).  Unfloored, a
+    three-cornered-hat V <= 0 (sampling noise, or a master that happens to
+    sit between the others) was clamped to 1e-12 and took ~all the weight.
+    noise: {capture: measured noise}, default all equal."""
     V = np.array(V, dtype=np.float64)
     Q = np.array(Q, dtype=np.float64)
-    allp = [P[n] for n in P]
+    noise = noise or {n: 1.0 for g in groups for n in g}
     for m, g in enumerate(groups):
-        if not np.all(np.isfinite(Q[m])) and allp:
-            Q[m] = np.median(allp, 0) / max(1, len(g))
+        if not np.all(np.isfinite(Q[m])) and P:
+            qs = [single_capture_noise(n, P, noise) for n in g]
+            qs = [q for q in qs if q is not None]
+            if qs:
+                Q[m] = 1.0 / np.sum([1.0 / np.maximum(q, 1e-12) for q in qs], 0)
     for m in range(len(V)):
         if np.all(np.isfinite(Q[m])):
             V[m] = np.maximum(V[m], Q[m])
         V[m] = np.where(np.isfinite(V[m]), np.maximum(V[m], 1e-12), np.inf)
     return V
+
+
+# per-master response equalisation (see xm_response): coherence below which
+# the measured response is not trusted (blended toward 1 between LO and HI)
+XM_EQ = os.environ.get("LDSTACK_XM_EQ", "1") not in ("0", "", "no")
+XM_EQ_COH_LO, XM_EQ_COH_HI = 0.5, 0.8
+XM_EQ_FMIN_MHZ = float(os.environ.get("LDSTACK_XM_EQ_FMIN", "1.5"))  # no correction below (ramped in over XM_EQ_RAMP_MHZ)
+XM_EQ_RAMP_MHZ = 1.0
+XM_EQ_FS_MHZ = 4 * 4.43361875
+XM_SOFT_R = float(os.environ.get("LDSTACK_XM_SOFT_R", "0.9"))
+XM_EQ_SMOOTH = 0.01            # smoothing half-width, cycles per sample (~0.18 MHz PAL)
+
+
+def xm_response(alts, prims, bads):
+    """Horizontal transfer function of an alt master's estimate relative to
+    the primary master's, H(f) = sum A conj(P) / sum |P|^2 over the lines of
+    the sample frames (picture area, per-line mean removed, samples flagged
+    bad replaced by the line median), smoothed over frequency, trusted only
+    where the two agree (coherence; elsewhere 1) and clamped to [0.8, 1.25].
+    Masters and players differ in response beyond one gain: South ds11 vs
+    the primary master ran 0.97 in the luma band and 1.03-1.05 at the
+    subcarrier with its chroma sidebands 0.92 - a static, picture-shaped
+    difference the blend put into every frame (newdecode v6: grain on held
+    stills).  Returns (normalised frequencies, complex H) or None."""
+    if not XM_EQ or not alts:
+        return None
+    W = alts[0].shape[1]
+    num = den = d1 = 0
+    for a, p, b in zip(alts, prims, bads):
+        if b.any():
+            a = np.where(b, np.median(a, 1, keepdims=True), a)
+            p = np.where(b, np.median(p, 1, keepdims=True), p)
+        A = np.fft.rfft(a - a.mean(1, keepdims=True), axis=1)
+        B = np.fft.rfft(p - p.mean(1, keepdims=True), axis=1)
+        num = num + (A * np.conj(B)).sum(0); den = den + (np.abs(B) ** 2).sum(0); d1 = d1 + (np.abs(A) ** 2).sum(0)
+    f = np.fft.rfftfreq(W)
+    k = max(1, int(XM_EQ_SMOOTH * W))
+    sm = lambda x: np.convolve(x, np.ones(2 * k + 1), "same")
+    num, den, d1 = sm(num), sm(den), sm(d1)
+    H = num / np.maximum(den, 1e-12)
+    # raw amplitude ratio (alt / primary power, noise included): a soft alt
+    # (Countryside ds3: 0.35x the text-band energy) shows here even where its
+    # coherence is too low for H to be trusted
+    R = np.sqrt(d1 / np.maximum(den, 1e-12))
+    coh = np.abs(num) ** 2 / np.maximum(den * d1, 1e-30)
+    t = np.clip((coh - XM_EQ_COH_LO) / (XM_EQ_COH_HI - XM_EQ_COH_LO), 0, 1)
+    H = 1 + (H - 1) * t
+    # not below XM_EQ_FMIN_MHZ: the per-field level fit has matched the
+    # masters' gain already, and the low-band H (0.955 at 0.5 MHz on South
+    # ds11) is the regression's noise dilution, not a response - dividing it
+    # out lifted the alt's low band and the held-run error at 0-2 MHz by 40 %
+    # (raw-capture truth, South s3000; 0.82x the old stacker without it)
+    fm = f * XM_EQ_FS_MHZ
+    r = np.clip((fm - XM_EQ_FMIN_MHZ) / XM_EQ_RAMP_MHZ, 0, 1)
+    H = 1 + (H - 1) * r
+    mag = np.clip(np.abs(H), 0.8, 1.25)
+    H = mag * np.exp(1j * np.angle(H))
+    H[0] = 1.0
+    return f, H, R
+
+
+def response_at(eq, fn):
+    if eq is None:
+        return 1.0
+    f, H = eq[0], eq[1]
+    return np.interp(fn, f, H.real) + 1j * np.interp(fn, f, H.imag)
+
+
+def apply_response(x, eq):
+    """x (rows) with an alt master's response divided out (see xm_response)."""
+    if eq is None:
+        return x
+    W = x.shape[1]
+    H = response_at(eq, np.fft.rfftfreq(W))
+    return np.fft.irfft(np.fft.rfft(x, axis=1) / H[None], W, axis=1)
 
 
 def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
@@ -1645,7 +1899,9 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
     amasks = xm_band_masks(ca.stop - ca.start, fs_hz)
     nb = bmasks.shape[0]
     within = {}; pair = {}; apair = {}; pairpix = {}; awithin = {}
+    frames_am = []
     fh, fw = frame_dicts[0][next(iter(frame_dicts[0]))].f0.shape
+    noise = {n: 1.0 / np.sqrt(max(w, 1e-30)) for n, w in weights.items()}
 
     def blank(fr):
         x = fr.f0.astype(np.float64)[BL, BX0:BX1]
@@ -1657,6 +1913,7 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
             continue
         ref = fd[ref_name].f0.astype(np.float64)
         means, ameans, amask = {}, {}, {}
+        pmean = None
         for m, g in enumerate(groups):
             pres = [n for n in g if n in fd]
             bl = {n: blank(fd[n]) for n in pres}
@@ -1677,13 +1934,17 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
                 dm = dropout_mask((fh, fw), fd[n].do0)
                 if n == ref_name:
                     regs.append(ref[ra, ca]); dmask |= dm[ra, ca]; continue
-                r, best = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True,
-                                         fit=MEASURE_FIT)
-                regs.append(chroma_align_field(r, ref, ca)[ra, ca])
+                r, best = register_field(fd[n].f0.astype(np.float64), ref, ra, ca, subpixel=True)
+                # alt masters are phase-aligned to the primary master's mean,
+                # not to one capture (that correlated every alt with it)
+                regs.append(chroma_align_field(r, ref if m == 0 or pmean is None else pmean, ca)[ra, ca])
                 dmask |= np.roll(dm, (int(round(best[0])), int(round(best[1]))), (0, 1))[ra, ca]
             stacka = np.stack(regs, 0)
             ameans[m] = np.tensordot(w, stacka, 1)
             amask[m] = dmask
+            if m == 0:
+                pmean = ref.copy()
+                pmean[ra, ca] = ameans[0]
             if len(pres) >= 2:          # picture-area player noise per capture (leave-one-out)
                 for i, n in enumerate(pres):
                     ow = np.delete(w, i)
@@ -1696,14 +1957,27 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
                     continue
                 acc = pair.setdefault((m, k), [np.zeros(nb), 0])
                 acc[0] += _xm_band_power(means[m] - means[k], bmasks); acc[1] += 1
-                if m in ameans and k in ameans:
-                    d = ameans[m] - ameans[k]
-                    bad = amask[m] | amask[k]
-                    # the same K-sigma (grown) rejection the blend applies
-                    bad |= _grow_x(np.abs(d) > XM_REJECT_K * np.sqrt(d.var()), XM_GROW)
-                    apair.setdefault((m, k), []).append(_xm_band_power(d, amasks, bad))
-                    if (~bad).any():
-                        pairpix.setdefault((m, k), []).append(float(d[~bad].var()))
+        # every pair from the same frames: those all masters carry
+        if len(ameans) == M:
+            frames_am.append((ameans, amask))
+    # each alt master's horizontal response relative to the primary master
+    # (see xm_response), fitted on these frames and applied before the pairs
+    # are measured, as the blend applies it
+    eq = {m: xm_response([fa[0][m] for fa in frames_am], [fa[0][0] for fa in frames_am],
+                         [fa[1][m] | fa[1][0] for fa in frames_am]) for m in range(1, M)} if frames_am else {}
+    for ameans, amask in frames_am:
+        am = {m: (apply_response(a, eq[m]) if m in eq else a) for m, a in ameans.items()}
+        for m in am:
+            for k in am:
+                if k <= m:
+                    continue
+                d = am[m] - am[k]
+                bad = amask[m] | amask[k]
+                # the same K-sigma (grown) rejection the blend applies
+                bad |= _grow_x(np.abs(d) > XM_REJECT_K * np.sqrt(d.var()), XM_GROW)
+                apair.setdefault((m, k), []).append(_xm_band_power(d, amasks, bad))
+                if (~bad).any():
+                    pairpix.setdefault((m, k), []).append(float(d[~bad].var()))
     if not any(k[0] == 0 for k in apair):
         return None
     P = {n: s / c * (k - 1) / k for n, (s, c, k) in awithin.items()}
@@ -1719,6 +1993,7 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
     # pooled mean let hand 92% of the low bands to a 2-capture master
     S = {k: np.median(v, 0) for k, v in apair.items()}
     V = np.full((M, nb), np.nan)
+    bad = []
     present = sorted({m for k in S for m in k})
     if len(present) >= 3:
         A = []; y = []
@@ -1729,15 +2004,73 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
             V[m] = sol[i]
     else:
         # two masters: assume equal on-disc noise; a single-capture master's
-        # player noise is taken as the primary's typical capture
+        # player noise is the typical capture's scaled by its own noise
         m0, m1 = present
-        prim = [P[n] for n in groups[0] if n in P]
         q0 = Q[m0] if np.all(np.isfinite(Q[m0])) else np.zeros(nb)
-        q1 = Q[m1] if np.all(np.isfinite(Q[m1])) else (np.median(prim, 0) if prim else q0)
+        q1 = Q[m1]
+        if not np.all(np.isfinite(q1)):
+            qs = [single_capture_noise(n, P, noise) for n in groups[m1]]
+            qs = [q for q in qs if q is not None]
+            q1 = 1.0 / np.sum([1.0 / np.maximum(q, 1e-12) for q in qs], 0) if qs else q0
         d = np.maximum((S[(m0, m1)] - q0 - q1) / 2, 0)
         V[m0], V[m1] = q0 + d, q1 + d
-    V = xm_floor_variance(V, Q, P, groups)
+        # Equal on-disc noise fails when the alt is a bad capture: Countryside
+        # S1 ds3 (4-50x a typical capture's held-run noise, chroma 75 deg off)
+        # differs from the primary by 9-22x a typical capture's player noise
+        # per master, and the equal split charged half of that to the primary
+        # (blend 0.49 / 0.51, held-run error 1.5-2.2x).  Where three or more
+        # masters let the hat measure it, a master's own error is at most
+        # ~4x a typical capture's player noise (North, NationalA/B, below
+        # 5.5 MHz), so the primary's share is capped there and the rest is
+        # the alt's; an alt that needs more than XM_BAD_X x in most of those
+        # bands is not blended (nor used for fill or repair) at all.
+        pt = np.median([P[k] for k in P], 0) if P else None
+        if pt is not None and m0 == 0:
+            low = np.arange(nb) < nb - 1            # below 5.5 MHz
+            x = d / np.maximum(pt, 1e-12)
+            cap = np.where(low, XM_DISC_CAP * pt, np.inf)
+            V[m0] = q0 + np.minimum(d, cap)
+            V[m1] = np.maximum(S[(m0, m1)] - V[m0], q1)
+            log("  two masters: alt-master excess over the primary per band, in typical-capture "
+                "player noise: " + " ".join(f"{v:.1f}" for v in x))
+            if np.sum(x[low] > XM_BAD_X) * 2 > np.sum(low):
+                bad.append(m1)
+    V = xm_floor_variance(V, Q, P, groups, noise)
+    # errors of a capture that are the same in every frame of a held still
+    # (player-specific patterns, not the frame-to-frame noise) are averaged
+    # only over the captures of its master; the hat, measured frame by frame,
+    # cannot see them.  newdecode v6 averages a still's frames and sets its
+    # regularisation from the frame-to-frame noise, so a heavier single-capture
+    # alt master came out as grain (South s3000 bars, per-bar luma rms 7-43
+    # against 1.4-6.6).  Each master carries XM_STATIC_S x a typical capture's
+    # player noise / its capture count on top.
+    if XM_STATIC_S > 0 and P:
+        pt = np.median([P[k] for k in P], 0)
+        for m, g in enumerate(groups):
+            V[m] = V[m] + XM_STATIC_S * pt / max(1, len(g))
     alpha = (1.0 / V) / (1.0 / V).sum(0, keepdims=True)
+    # an alt master that is softer than the response correction undoes
+    # carries less of the picture in that band than its noise figure says:
+    # blending it at the noise-optimal weight would blur.  Its weight is
+    # scaled by the band's residual signal power ratio (R / |H| < 0.9 only)
+    soft = {}
+    for m in range(1, M):
+        e = eq.get(m)
+        if e is None or len(e) < 3:
+            continue
+        fq, Hm, Rm = e
+        fn = np.fft.rfftfreq(ca.stop - ca.start)
+        res = np.minimum(1.0, np.interp(fn, fq, Rm) / np.maximum(np.abs(response_at(e, fn)), 1e-6))
+        for b in range(nb - 1):      # not above 5.5 MHz: no picture there, R is the noise ratio
+            wb = amasks[b]
+            r = float(np.sum(wb * res) / max(np.sum(wb), 1e-12))
+            if r < XM_SOFT_R:
+                alpha[m, b] *= r * r
+                soft[(m, b)] = r
+    if soft:
+        alpha = alpha / alpha.sum(0, keepdims=True)
+        log("  soft alt master: weight scaled by the residual signal power in "
+            + ", ".join(f"master {m} band {b} (amplitude {r:.2f})" for (m, b), r in sorted(soft.items())))
     # picture/blank-line power ratio of each master's difference from the
     # primary: information only (it is 4-8x even within one master, because
     # capture noise is level-dependent - see the docstring)
@@ -1763,7 +2096,10 @@ def xm_estimate(frame_dicts, groups, ra, ca, fs_hz, weights, log=print):
     Vb = 1.0 / (1.0 / V).sum(0)
     log("  predicted blend error vs primary alone per band: "
         + " ".join(f"{100 * (np.sqrt(b / a) - 1):+.0f}%" for a, b in zip(V[0], Vb)) + " rms")
-    return dict(alpha=alpha, sig=sig)
+    log("  alt-master response vs the primary (gain at 0.5 / 1.5 / 2.5 / 3.5 / 4.43 / 5.2 MHz): " + "; ".join(
+        f"master {m} " + " ".join(f"{abs(response_at(eq[m], fmhz / (fs_hz / 1e6))):.3f}" for fmhz in (0.5, 1.5, 2.5, 3.5, 4.43, 5.2))
+        for m in sorted(eq)))
+    return dict(alpha=alpha, sig=sig, V=V, P=P, eq=eq, bad=bad)
 
 
 def xm_blend(ests, alpha, active_rows, active_cols, fs_hz):
@@ -1957,7 +2293,7 @@ def analyse(frame_dicts, ra, ca, shift_tol=0.3, noise_mult=4.0,
         reg = {}
         for n, fr in fd.items():
             r, best = register_field(fr.f0.astype(np.float64), ref, ra, ca,
-                                     subpixel=True, fit=MEASURE_FIT)
+                                     subpixel=True)
             shifts[n].append(best[1])           # dx (sub-pixel)
             reg[n] = r[ra, ca]
         med = np.median(np.stack(list(reg.values()), 0), 0)
@@ -2011,30 +2347,29 @@ def _bcd(v, digits):
     return int("%0*d" % (digits, v), 16)
 
 
-def picture_vbi(prev_vbi, prev_key, key):
+def picture_vbi(key, cav=True):
     """VBI words (field 0, field 1) for a padded frame with picture/frame
-    number ``key``, in the form of the previous frame: CAV 0xFxxxxx on lines
-    17/18 of the first field, or the CLV picture number and time code, as
-    ld-discmap writes them.  Anything else: the previous frame's VBI."""
-    words = [w for v in prev_vbi for w in (v or [])]
-    if cav_picture(words) == prev_key:
+    number ``key``, as ld-discmap writes them: CAV 0xFxxxxx on lines 17/18 of
+    the first field, or the CLV picture number and time code.  Always
+    synthesised (a copy of the previous frame's could repeat a misread)."""
+    if cav:
         c = 0xF00000 | _bcd(key % 100000, 5)
         return [0, c, c], [0, 0, 0]
-    if clv_frame(words) == prev_key:
+    if True:
         sec, pic = divmod(key, 25)
         mins, sec = divmod(sec, 60)
         hr, mn = divmod(mins, 60)
         p = 0x80E000 | ((0xA + sec // 10) << 16) | ((sec % 10) << 8) | _bcd(pic, 2)
         t = 0xF0DD00 | ((hr & 0xF) << 16) | _bcd(mn, 2)
         return [p, t, t], [0, 0, 0]
-    return list(prev_vbi[0]), list(prev_vbi[1])
 
 
-def pad_frame(r, prev_key, key):
-    """A stack result repeating r's picture and audio as picture ``key``."""
-    v0, v1 = picture_vbi([f[2] for f in r["fields"]], prev_key, key)
-    fields = [(outu, meta, vb, [], None, audio_n)
-              for (outu, meta, _, _, _, audio_n), vb in zip(r["fields"], (v0, v1))]
+def pad_frame(r, key, cav=True):
+    """A stack result repeating r's picture, its residual dropout flags and
+    its audio as picture ``key``."""
+    v0, v1 = picture_vbi(key, cav)
+    fields = [(outu, meta, vb, list(do), None, audio_n)
+              for (outu, meta, _, do, _, audio_n), vb in zip(r["fields"], (v0, v1))]
     return {"fields": fields, "audio": r["audio"], "filled": 0, "repaired": 0,
             "extra_reg": 0, "key": key, "fstats": {}}
 
@@ -2283,6 +2618,99 @@ def merge_efm_sectors(efm_paths, out_data, scratch_dir=None, log=print):
         import shutil; shutil.rmtree(tmp, ignore_errors=True)
 
 
+# FM-beat herringbone, removed per capture before registration, the hat and
+# the blend: it is pressed into each glass master with the master's own carrier
+# frequency and phase, so a blend of masters mixes several beats that no single
+# fit removes afterwards (newdecode's canceller: -15 dB on one master, -5.6 dB
+# on a 3-master blend), and a beat that differs between masters is a static
+# master difference.  The canceller is newdecode's (deherring.cancel_tbc_field),
+# loaded from LDSTACK_DEHERRING_LIB (the directory holding newdecode's deherring.py / deghost.py);
+# unset = off with a log line, 0 = off, set but not loadable = error (never a silent fallback).
+DEHERRING_LIB = os.environ.get("LDSTACK_DEHERRING_LIB", "")
+DH_F0_GRID = np.arange(7.064e6, 7.1121e6, 0.003e6)
+DH_MIN_REMOVED = float(os.environ.get("LDSTACK_DH_MIN_REMOVED", "0.02"))   # fraction of the 2.2-3.9 MHz energy
+DH_SCAN = int(os.environ.get("LDSTACK_DH_SCAN", "300"))     # pictures scanned for flat colour when the sample has too little
+
+
+def _deherring_lib():
+    if not DEHERRING_LIB or DEHERRING_LIB == "0" or not os.path.isdir(DEHERRING_LIB):
+        return None
+    if DEHERRING_LIB not in sys.path:
+        sys.path.insert(0, DEHERRING_LIB)
+    try:
+        import deherring
+        import deghost
+        return deherring, deghost
+    except Exception:
+        return None
+
+
+def herringbone_setup(sources, frame_dicts, groups, vp, log=print):
+    """Calibrate the beat's carrier frequency per master on the sample frames
+    and switch per-capture cancelling on (TBCFrameSource.dh).  A master whose
+    best fit removes less than DH_MIN_REMOVED of the band energy carries no
+    beat (CommunityNorth master C) and is left alone.  Returns {master: f0 or None}."""
+    libs = _deherring_lib()
+    if libs is None:
+        if DEHERRING_LIB and DEHERRING_LIB != "0":
+            raise RuntimeError("LDSTACK_DEHERRING_LIB=%s: deherring/deghost not loadable" % DEHERRING_LIB)
+        log("[stack] herringbone: off (LDSTACK_DEHERRING_LIB not set)")
+        return {}
+    lib, dg = libs
+    black, white = float(vp.get("black16bIre", 16384)), float(vp.get("white16bIre", 54016))
+    by_name = {s.name: s for s in sources}
+    out = {}
+    from scipy.ndimage import uniform_filter1d
+
+    def flat_colour(f):
+        """samples of flat saturated colour (the canceller's own pre-gate)"""
+        a = np.asarray(f, np.float64)[24:308, 185:1107]
+        ch = uniform_filter1d(np.abs(a[:, 2:] - a[:, :-2]), 8, axis=1) * (np.pi / 4)
+        lu = uniform_filter1d(a, 4, axis=1)
+        flat = uniform_filter1d(np.abs(lu[:, 8:] - lu[:, :-8]), 16, axis=1)
+        return int(np.count_nonzero((ch[:, :flat.shape[1]] > lib.PRE_CHROMA) & (flat < lib.PRE_FLAT)))
+    for m, g in enumerate(groups):
+        fl = []
+        for fd in frame_dicts:
+            for n in g:
+                if n in fd:
+                    for f in (fd[n].f0, fd[n].f1):
+                        c = flat_colour(f)
+                        if c >= lib.PRE_COUNT:
+                            fl.append((c, f))
+        # the analysis sample rarely holds the side's flattest colour (North:
+        # maps and photos - a fit on those removed 0.2 % and took the beat for
+        # absent): look for it over the whole side too, first field of DH_SCAN
+        # pictures of the master's first capture
+        src = next((by_name[n] for n in g if isinstance(by_name.get(n), TBCFrameSource)), None)
+        if src is not None:
+            ks = sorted(src.keys())
+            for k in ks[::max(1, len(ks) // DH_SCAN)][:DH_SCAN]:
+                f = src._read_field(src._idx[k] * 2)
+                c = flat_colour(f)
+                if c >= lib.PRE_COUNT:
+                    fl.append((c, np.array(f)))
+        fl = [f for _, f in sorted(fl, key=lambda t: -t[0])[:12]]
+        hz, frac = float(lib.F0_HZ), None
+        if fl:
+            G = [dg.channel_inverse(np.asarray(f, np.float64)) for f in fl]
+            band = sum(float((lib._beat_basis(x.reshape(-1), black, white, hz)[2] ** 2).sum()) for x in G)
+            res = [sum(float(((x - lib.deherring_field(x, levels=(black, white), f0=f)[0]) ** 2).sum()) for x in G)
+                   for f in DH_F0_GRID]
+            hz = float(DH_F0_GRID[int(np.argmax(res))])
+            frac = max(res) / max(band, 1e-9)
+        on = frac is None or frac >= DH_MIN_REMOVED
+        out[m] = hz if on else None
+        for n in g:
+            if n in by_name and isinstance(by_name[n], TBCFrameSource):
+                by_name[n].dh = (lib, black, white, hz) if on else None
+        log(f"[stack] herringbone master {m}: " + (
+            "no flat colour in the sample, default carrier %.3f MHz" % (hz / 1e6) if frac is None else
+            "carrier %.3f MHz, removes %.1f%% of the 2.2-3.9 MHz energy (%.1f dB)%s" % (
+                hz / 1e6, 100 * frac, -10 * np.log10(max(1 - frac, 1e-6)), "" if on else " - no beat, left alone")))
+    return out
+
+
 def _tbcmeta():
     """Import tbcmeta whether stack.py is run as a module (lddecode.stack) or
     as a bare script, as _efm_pll_class does for the same reason."""
@@ -2392,8 +2820,16 @@ def _compute_frame(fd, P, hints=None):
                 if abs(means[n] - cons) <= FRAME_LEVEL_K * spread]
         if len(keep) >= 2:
             present_primary = keep
-        present_primary = sorted(present_primary,
-                                 key=lambda n: abs(means[n] - cons))
+        if STABLE_REF:
+            # the same reference frame after frame (the cleanest capture
+            # present): its gain is the output's, so a reference that changed
+            # with the frame's level put its gain step into the picture
+            rank = P.get("ref_rank") or {}
+            present_primary = sorted(present_primary,
+                                     key=lambda n: (rank.get(n, len(rank)), -P["weights"].get(n, 0.0)))
+        else:
+            present_primary = sorted(present_primary,
+                                     key=lambda n: abs(means[n] - cons))
     ref_frame = fd[present_primary[0]]
     ref_name = present_primary[0]
     filled = 0
@@ -2403,7 +2839,7 @@ def _compute_frame(fd, P, hints=None):
     out_fields = []
     fill_lim = max(FILL_SANITY_K * float(np.median(list(sig.values()))), 1500.0)
 
-    def fill_implausible(f):
+    def fill_implausible(f, usable):
         """Samples of a fill estimate whose local luma (8-sample box: two
         subcarrier cycles, chroma cancels) is further than fill_lim from that
         of its own lines above and below (FILL_SANITY_K).  On the composite
@@ -2411,10 +2847,16 @@ def _compute_frame(fd, P, hints=None):
         field lines, and clean alt-master fills of master-level dropouts
         were refused (South picture 7979)."""
         from scipy.ndimage import uniform_filter1d
-        est = np.empty_like(f)
-        est[1:-1] = 0.5 * (f[:-2] + f[2:])
-        est[0], est[-1] = f[1], f[-2]
-        return np.abs(uniform_filter1d(f - est, REPAIR_LUMA_W, axis=1)) > fill_lim
+        # the estimate takes only the neighbours the fill source can supply
+        # (usable); with neither, the sample cannot be judged and is refused
+        up = np.zeros_like(f); dn = np.zeros_like(f)
+        uok = np.zeros(f.shape, bool); dok = np.zeros(f.shape, bool)
+        up[1:], uok[1:] = f[:-1], usable[:-1]
+        dn[:-1], dok[:-1] = f[1:], usable[1:]
+        n = uok.astype(np.float64) + dok
+        est = np.where(n > 0, (up * uok + dn * dok) / np.maximum(n, 1), f)
+        bad = np.abs(uniform_filter1d(np.where(usable, f - est, 0.0), REPAIR_LUMA_W, axis=1)) > fill_lim
+        return bad | (n == 0)
 
     def log_misaligned(ai, c0, cs, sd):
         if REPAIR_DUMP:
@@ -2478,17 +2920,14 @@ def _compute_frame(fd, P, hints=None):
         if rib is not None and rib.any():
             ref_mask[rib, :] = True
         ref_an = None
-        # consensus of the primary captures (set by its combine_set): level
-        # (A, B) and chroma phase per line.  Everything registers to the
-        # reference capture, but the output is put at the mean of all the
-        # primary captures' levels and phases: tied to the reference alone it
-        # jumped whenever the reference changed (12,604 times on Community
-        # South: ~1 IRE level flicker, ~2 deg hue jitter between frames).
-        cons = {}
+        # (Putting the output at the primary captures' consensus level and
+        # chroma phase instead of the reference's was tried, Oct 2026: on the
+        # quickcheck panels it raised held-run level flicker 5.8 -> 6.5-6.8
+        # and left hue flicker unchanged, so the reference's are kept.)
 
-        def combine_set(names, diff_dod=False, info=None, primary=False):
+        def combine_set(names, diff_dod=False, info=None):
             nonlocal ref_an
-            regs, masks, ws, sigs, levels = [], [], [], [], []
+            regs, masks, ws, sigs = [], [], [], []
             for n in names:
                 fr = fd[n]
                 m = dropout_mask((fh, fw), getattr(fr, do_attr))
@@ -2502,17 +2941,25 @@ def _compute_frame(fd, P, hints=None):
                     # registering the reference to itself is an identity (the
                     # search provably lands at (0,0), the level fit at gain 1
                     # offset 0) -- skip it
-                    reg, lev = ref_field, (1.0, 0.0)
+                    reg = ref_field
                 else:
                     hk = (n, which)
                     # equal-noise level fit: analyse()'s noise leaves out the
                     # disc noise the reference carries, and as the ratio it
                     # put alt masters at gain 1.04 on the fq bench (truth 1)
-                    reg, shift, lev = register_field(
+                    gp = P.get("gain_prior") or {}
+                    fmask = None
+                    if LEVEL_MASK_DO:
+                        bad = m | ref_mask
+                        if bad.any():
+                            bad = _grow_x(bad, 16)
+                        fmask = ~bad
+                    reg, shift = register_field(
                         getattr(fr, which).astype(np.float64), ref_field,
                         ra, ca, P["subpixel"], line_reg=P["line_reg"],
                         hint=(hints or {}).get(hk) if WARM else None,
-                        return_level=True)
+                        gain_prior=(gp[n] / gp[ref_name]) if (n in gp and ref_name in gp) else None,
+                        fit_mask=fmask)
                     out_shifts[hk] = shift
                     # the dropout mask moves with the picture (alt masters sit 0.5-1.5 samples off)
                     sy, sx = int(round(shift[0])), int(round(shift[1]))
@@ -2520,29 +2967,24 @@ def _compute_frame(fd, P, hints=None):
                         m = np.roll(m, (sy, sx), (0, 1))
                 regs.append(reg)
                 masks.append(m)
-                levels.append(lev)
                 ws.append(weights[n]); sigs.append(sig[n])
             if P["chroma_align"]:
                 # per-line chroma phase of each capture vs the reference,
-                # dropouts (of either) left out; every capture is then rotated
-                # to the primary captures' consensus phase
+                # dropouts (of either) left out, then rotated onto it
                 if ref_an is None:
                     seg = ref_field[:, ca]
                     ref_an = _analytic_band(np.fft.rfft(seg, axis=1),
                                             _chroma_band(seg.shape[1]), seg.shape[1])
-                zs = [np.ones(fh, complex) if fd[n] is ref_frame
-                      else chroma_phase(r, ref_field, ca, m | ref_mask, ref_an=ref_an)
-                      for n, r, m in zip(names, regs, masks)]
-                ph = [np.angle(z) for z in zs]
-                if primary:
-                    c = sum(w * (np.abs(z) > 0) * np.exp(1j * p) for w, z, p in zip(ws, zs, ph))
-                    cons["phase"] = np.angle(c)
-                phc = cons.get("phase", 0.0)
-                regs = [chroma_rotate(r, ca, p - phc) for r, p in zip(regs, ph)]
-            if primary:
-                # (plain mean but for a gross outlier: > 5 % gain / ~5 IRE)
-                cons["level"] = (_robust_mean([1.0 / g for g, _ in levels], 0.05),
-                                 -_robust_mean([o / g for g, o in levels], 2000.0))
+                cps = [None if fd[n] is ref_frame
+                       else chroma_phase(r, ref_field, ca, m | ref_mask, ref_an=ref_an)
+                       for n, r, m in zip(names, regs, masks)]
+                regs = [r if cp is None else chroma_rotate(r, ca, np.angle(cp))
+                        for r, cp in zip(regs, cps)]
+                if info is not None and CHROMA_CONSENSUS and len(names) >= 3:
+                    # each capture's chroma amplitude against the reference's
+                    rp = float((np.abs(ref_an) ** 2).sum())
+                    amps = [1.0 if cp is None else float(np.abs(cp).sum()) / max(rp, 1e-9) for cp in cps]
+                    info["chroma_gain"] = float(np.median(amps))
             if P["reg_confidence"]:
                 ws = perframe_weights(regs, masks, ws, ra, ca,
                                       drop=True, drop_mult=P["reg_drop_mult"])
@@ -2553,8 +2995,7 @@ def _compute_frame(fd, P, hints=None):
         # flagged them (user instruction): leave them for the dropout
         # corrector rather than trusting flagged samples
         prim_info = {} if (REJ_KEEP_MEDIAN and len(present_primary) >= 3) else None
-        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD, info=prim_info,
-                                primary=True)
+        out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD, info=prim_info)
         # ---- cross-master blend: average the masters' estimates per band
         blended = False
         xm_alts = []                # (estimate, ok) per alt master, for repair
@@ -2567,16 +3008,30 @@ def _compute_frame(fd, P, hints=None):
                 if not pres:
                     continue
                 fo, fws = combine_set(pres)
+                eqm = (xm.get("eq") or {}).get(m)
+                if eqm is not None:
+                    # its response matched to the primary master's (xm_response)
+                    blk = fo[ra, ca]
+                    padded = np.pad(blk, ((0, 0), (XM_PAD, XM_PAD)), mode="reflect")
+                    fo = fo.copy()
+                    fo[ra, ca] = apply_response(padded, eqm)[:, XM_PAD:XM_PAD + blk.shape[1]]
                 # an alt master that does not line up with the primary on this
                 # field (another picture: South 29733; misregistered: 16374,
                 # 50144) is left out of the blend, not only of the repair
                 al, c0, cs, sd = alt_aligned(out, fo, (wsum > 0) & (fws > 0), rra, ca)
                 if not al:
                     log_misaligned(m - 1, c0, cs, sd)
+                # the blend refuses only a clear mismatch; the repair, which
+                # pastes the alt's samples in, keeps the strict test.  A noisy
+                # alt on a low-contrast field reaches corr ~0.82-0.88 with a
+                # shifted fit 0.01-0.03 better by chance (North: 4964 fields,
+                # 4.6 %, left out of the blend that way)
+                if not al and (c0 < XM_ALIGN_MIN_C or cs - c0 > XM_ALIGN_SHIFT_GAIN):
                     xm_misaligned += 1
                     continue
                 alt_sets.append((m, fo, fws > 0))
-                xm_alts.append((fo, fws > 0))
+                if al:
+                    xm_alts.append((fo, fws > 0))
             # repair primary-master defects BEFORE the blend: blended, a defect
             # is diluted by the alt and no longer passes the repair's tests
             # (North test card frames 2996-2999: streak halved, not repaired)
@@ -2596,9 +3051,17 @@ def _compute_frame(fd, P, hints=None):
                     # tail, and the grown mask refused the alt the fill)
                     ok = ok & ~(_grow_x(dis, XM_GROW) & prim_ok)
                 # where no primary capture is usable the alts are all there is
-                # (a fill): the fill path's plausibility test applies
+                # (a fill): the fill path's plausibility test applies - unless
+                # another alt master agrees there (a defect is on one master,
+                # not two; fine detail at a master-level dropout fails the
+                # vertical test: North 21282-84, line 256)
                 if FILL_SANITY_K > 0:
-                    ok = ok & ~(~prim_ok & fill_implausible(fo))
+                    agree = np.zeros_like(ok)
+                    for m2, fo2, ok2 in alt_sets:
+                        if m2 != m:
+                            lim2 = XM_REJECT_K * max(xm["sig"][m], xm["sig"][m2], 1.0)
+                            agree |= ok2 & (np.abs(fo - fo2) <= lim2)
+                    ok = ok & ~(~prim_ok & ~agree & fill_implausible(fo, ok))
                 ests.append((m, fo, ok))
             if len(ests) > 1:
                 out, anyok = xm_blend(ests, xm["alpha"], ra, ca, P["fs_hz"])
@@ -2620,7 +3083,7 @@ def _compute_frame(fd, P, hints=None):
             # neighbourhood; where it is not, leave the pixel flagged so the
             # downstream dropout corrector conceals it instead.
             if fillable.any() and FILL_SANITY_K > 0:
-                fillable &= ~fill_implausible(fout)
+                fillable &= ~fill_implausible(fout, fws > 0)
             if fillable.any():
                 out = out.copy()
                 out[fillable] = fout[fillable]
@@ -2650,15 +3113,26 @@ def _compute_frame(fd, P, hints=None):
                         del out_shifts[k]
                 out, n = repair_from(out, valid, [(fill_cache[0], fill_cache[1] > 0)])
                 repaired += n
-        # the primary captures' consensus level (see cons)
-        A, B = cons.get("level", (1.0, 0.0))
-        if A != 1.0 or B != 0.0:
-            out = A * out + B
+        if prim_info and "rej_only" in prim_info:
+            allbad = allbad & ~prim_info["rej_only"]      # disagreement, not dropout: keep the median
+        cg = (prim_info or {}).get("chroma_gain")
+        if cg and 0.7 < cg < 1.4 and abs(cg - 1.0) > 1e-3:
+            # chroma at the primary captures' median saturation, not the
+            # reference's: players' chroma gain differs by +-10 % and steps
+            # (Countryside S1 ds2: 0.90 -> 0.95 at picture 12142, the
+            # saturation flicker of a stack referenced to it)
+            out = chroma_scale(out, ca, 1.0 / cg)
+        gp = P.get("gain_prior") or {}
+        if GAIN_RESCALE and ref_name in gp and P.get("gain_norm"):
+            # from the reference capture's gain to the median capture's
+            sc = gp[ref_name] / P["gain_norm"]
+            piv = P.get("black") or 0.0
+            out = piv + (out - piv) * sc
+        if CONCEAL_RESID and allbad.any():
+            out = conceal_vertical(out, allbad)
         outu = np.clip(np.round(out), 0, 65535).astype(np.uint16)
         meta = ref_frame.meta0 if which == "f0" else ref_frame.meta1
         resid_do = []                   # still bad after cross-fill
-        if prim_info and "rej_only" in prim_info:
-            allbad = allbad & ~prim_info["rej_only"]      # disagreement, not dropout: keep the median
         if allbad.any():
             # one entry per RUN of bad samples (gaps <= RESID_DO_GAP merged), not one min..max span per
             # line: two bad pixels at x=200 and x=1000 used to flag the 800 good samples between them,
@@ -2755,10 +3229,16 @@ def _frame_by_key(args):
 BLOCK = int(os.environ.get("LDSTACK_BLOCK", "24"))
 
 
-def _frame_block(keys):
+def _frame_block(keys, blk=None):
+    """Stack one block of frames; blk: its reads, already done (read-ahead)."""
     sources, P = _WORKER_STATE
-    for s in sources:
-        s.prefetch(keys)
+    t0 = time.monotonic()
+    for i, s in enumerate(sources):
+        if blk is None:
+            s.prefetch(keys)
+        else:
+            s.use_block(blk[i])
+    t1 = time.monotonic()
     out, hints = [], None
     try:
         for key in keys:
@@ -2770,7 +3250,62 @@ def _frame_block(keys):
     finally:
         for s in sources:
             s.drop_prefetch()
+    # time spent reading vs stacking, for the end-of-run log
+    rs = [r for r in out if r]
+    if rs:
+        rs[0]["io"] = (t1 - t0, time.monotonic() - t1)
     return out
+
+
+# read-ahead: each worker reads its next block in a thread while it stacks
+# the current one (a 12-capture stack from hard disks spent 11 % of its worker
+# time waiting for reads).  Blocks are dealt to the workers in a fixed order
+# and stacked exactly as before, so the output is bit-identical.
+READAHEAD = os.environ.get("LDSTACK_READAHEAD", "1") not in ("0", "", "no")
+
+
+def _block_worker(w, nworkers, blocks, credit, resq):
+    """Worker w of nworkers: blocks w, w + nworkers, ...; each result goes to
+    resq as (block index, results); credit bounds how far it runs ahead of
+    the parent's in-order retirement."""
+    import threading
+    import traceback
+    sources, P = _WORKER_STATE
+    try:
+        for s in sources:
+            s.keys()                            # index once, before any thread
+        mine = list(range(w, len(blocks), nworkers))
+
+        def read(i, box):
+            try:
+                box.append([s.read_block(blocks[i]) for s in sources])
+            except BaseException as e:          # re-raised by the stacking side
+                box.append(e)
+        box, th = None, None
+        for j, bi in enumerate(mine):
+            credit.acquire()
+            t0 = time.monotonic()
+            if th is not None:
+                th.join()
+                blk = box[0]
+                if isinstance(blk, BaseException):
+                    raise blk
+            else:
+                blk = [s.read_block(blocks[bi]) for s in sources]
+            wait = time.monotonic() - t0
+            if j + 1 < len(mine):
+                box = []
+                th = threading.Thread(target=read, args=(mine[j + 1], box), daemon=True)
+                th.start()
+            else:
+                th = None
+            res = _frame_block(blocks[bi], blk)
+            rs = [r for r in res if r]
+            if rs:
+                rs[0]["io"] = (wait, rs[0]["io"][1])
+            resq.put((bi, res))
+    except BaseException:
+        resq.put((-1, traceback.format_exc()))
 
 
 def _frame_from_fd(args):
@@ -2786,6 +3321,141 @@ def _frame_from_fd(args):
 
 
 HEAD_WINDOW_CAP = 512
+
+
+def _thumb_field(src, k):
+    """Normalised 4x8-binned thumbnail of the first field of picture k."""
+    x = src._read_field(src._idx[k] * 2).astype(np.float32)
+    h, w = (x.shape[0] // 4) * 4, (x.shape[1] // 8) * 8
+    t = x[:h, :w].reshape(h // 4, 4, w // 8, 8).mean((1, 3))
+    t = t - t.mean()
+    return t / max(float(np.sqrt((t * t).mean())), 1e-6)
+
+
+CONTENT_ABS = 0.004  # ...and lower it by this much (a repeated picture matches two offsets to ~0.001)
+CONTENT_REL = 0.5    # an offset must at least halve the mismatch of the next best
+CONTENT_WIN = int(os.environ.get("LDSTACK_CONTENT_WIN", "1500"))   # pictures per offset test window
+
+
+def content_offsets(sources, log=print, maxd=2, per_win=6, probe=40):
+    """Picture-number offsets of each capture against the one with most
+    pictures, from the content, per window of CONTENT_WIN pictures (an offset
+    can change part-way: a skipped or repeated picture), boundaries refined
+    to the picture by bisection.
+
+    Countryside S1 ds3 labels every picture one lower than the other four
+    captures (its "10140" is their 10141: luma correlation 0.26 against
+    0.99), so stacked by number it blended the neighbouring picture - its
+    chroma 77 deg off (the next frame of the PAL sequence), its noise 4-50x,
+    a "master of its own" (its disc noise did not correlate with theirs).
+    Tested on pictures where the reference changes from one picture to the
+    next.  Returns {name: [(k0, k1, d), ...]}: the capture's pictures k0..k1
+    (its own numbers) are the reference's k + d; only captures with some
+    d != 0 are listed."""
+    tbc = [s for s in sources if isinstance(s, TBCFrameSource)]
+    if len(tbc) < 2:
+        return {}
+    anchor = max(tbc, key=lambda s: len(s.keys()))
+    ak = anchor.keys()
+    cache = {}
+
+    def th(src, k):
+        key = (src.name, k)
+        if key not in cache:
+            cache[key] = _thumb_field(src, k)
+        return cache[key]
+
+    def moving(k):
+        return all(k + d in ak for d in range(-maxd, maxd + 2)) and \
+            float((th(anchor, k) * th(anchor, k + 1)).mean()) < 0.99
+
+    def best_d(src, ks):
+        ks = [k for k in ks if k in src.keys()]
+        if len(ks) < 3:
+            return None
+        # mismatch 1 - correlation per offset; slow pans differ by 0.01-0.02
+        # only (Countryside S2 ds3 at 12000: 0.004 at +1, 0.020 at 0)
+        err = {d: float(np.median([1.0 - (th(src, k) * th(anchor, k + d)).mean() for k in ks]))
+               for d in range(-maxd, maxd + 1)}
+        d = min(err, key=err.get)
+        if err[d] > 0.1:
+            return None
+        if d != 0 and (err[d] > CONTENT_REL * err[0] or err[0] - err[d] < CONTENT_ABS):
+            return 0 if err[0] <= 0.1 else None
+        return d
+
+    keys = sorted(ak)
+    lo, hi = keys[0], keys[-1]
+    wins = []
+    for w0 in range(lo, hi + 1, CONTENT_WIN):
+        cand = [k for k in keys if w0 <= k < w0 + CONTENT_WIN]
+        mv = []
+        for k in cand[::max(1, len(cand) // probe)]:
+            if moving(k):
+                mv.append(k)
+                if len(mv) >= per_win:
+                    break
+        wins.append((w0, min(w0 + CONTENT_WIN - 1, hi), mv))
+    out = {}
+    for src in tbc:
+        if src is anchor:
+            continue
+        ds = [best_d(src, mv) if mv else None for _, _, mv in wins]
+        if not any(ds):
+            continue
+        # undecided windows (stills, no overlap) take the nearest decided one
+        known = [i for i, d in enumerate(ds) if d is not None]
+        ds = [ds[min(known, key=lambda j: abs(j - i))] if d is None else d for i, d in enumerate(ds)]
+        segs = []
+        for i, (w0, w1, mv) in enumerate(wins):
+            d = ds[i]
+            if segs and segs[-1][2] == d:
+                segs[-1][1] = w1
+                continue
+            if segs:
+                # refine the boundary between the previous window (dA) and this one (dB):
+                # the first picture of this capture that matches the reference at dB
+                dA = segs[-1][2]
+                sk = src.keys()
+
+                def fits_b(k, L, H):
+                    """(key, True/False) at the decidable picture nearest k in [L, H)."""
+                    for o in range(0, 64):
+                        for kk in ((k + o, k - o) if o else (k,)):
+                            if L <= kk < H and kk in sk and kk + dA in ak and kk + d in ak and moving(kk):
+                                ea = 1.0 - float((th(src, kk) * th(anchor, kk + dA)).mean())
+                                eb = 1.0 - float((th(src, kk) * th(anchor, kk + d)).mean())
+                                if min(ea, eb) < CONTENT_REL * max(ea, eb) and abs(ea - eb) >= CONTENT_ABS:
+                                    return kk, eb < ea
+                    return None, None
+                L, H = wins[i - 1][0], w1 + 1       # dA holds before L, dB from H on
+                while H - L > 1:
+                    kk, isb = fits_b((L + H) // 2, L, H)
+                    if kk is None:
+                        break
+                    if isb:
+                        H = kk
+                    else:
+                        L = kk + 1
+                b = H if H - L <= 1 else (L + H) // 2
+                segs[-1][1] = b - 1
+                segs.append([b, w1, d])
+            else:
+                segs.append([w0, w1, d])
+        segs = [tuple(x) for x in segs]
+        if any(d for _, _, d in segs):
+            out[src.name] = segs
+            log(f"[stack] {src.name}: picture numbers differ from {anchor.name}'s by content: "
+                + ", ".join(f"{k0}-{k1}: {d:+d}" for k0, k1, d in segs) + " (renumbered)")
+    return out
+
+
+def apply_content_offsets(src, segs):
+    new = {}
+    for k, fi in sorted(src._idx.items()):
+        d = next((d for k0, k1, d in segs if k0 <= k <= k1), 0)
+        new.setdefault(k + d, fi)
+    src._idx = new
 
 
 def head_window(merged, nsources, aw, cap=HEAD_WINDOW_CAP):
@@ -2830,12 +3500,19 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
           cross_fill=True, masters=None, sample=24, analysis_window=None,
           max_frames=None,
           scratch_dir=None, git_commit="", reg_confidence=True, reg_drop_mult=3.0,
-          line_reg=0, jobs=0, cross_master=False, log=print):
+          line_reg=0, jobs=0, cross_master=False, deherring=True, log=print):
     aw = analysis_window or max(sample * 2, 40)
     # indexed .tbc sources are sampled across the side and stacked by key
     # below: they need no head window (it held up to 512 frames of every
     # capture in memory for the whole stack)
     all_tbc = all(isinstance(s, TBCFrameSource) for s in sources)
+    if all_tbc and CONTENT_OFFSETS and len(sources) >= 2:
+        for src in sources:
+            src.keys()
+        offs = content_offsets(sources, log=log)
+        for src in sources:
+            if src.name in offs:
+                apply_content_offsets(src, offs[src.name])
     merged = None if all_tbc else lockstep(sources)
 
     # ---- buffer an initial window for the quality / master analysis ----
@@ -2951,10 +3628,79 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         xm_groups = [primary] + [[n for n in fill_sources if info[n]["master"] == m]
                                  for m in range(1, nmaster + 1)]
         xm_groups = [g for g in xm_groups if g]
+        if deherring and indexed:
+            herringbone_setup(sources, asample, xm_groups, vp, log=log)
+            asample = [{s.name: s.get(k) for s in sources if k in s.keys()} for k in pick]
         xm = xm_estimate(asample, xm_groups, ra, ca, fs_hz, weights, log=log)
-        if xm is None:
+        if xm is not None and xm.get("bad"):
+            gone = [n for m in xm["bad"] for n in xm_groups[m]]
+            for n in gone:
+                info[n]["reason"] = "noise outlier (alt master far noisier than the primary)"
+                log(f"  {n:24} noise={info[n]['noise']:.4g} master={info[n]['master']} DROP ({info[n]['reason']})")
+            fill_sources = [n for n in fill_sources if n not in gone]
+            xm_groups = [g for m, g in enumerate(xm_groups) if m not in xm["bad"]]
+            xm = (xm_estimate(asample, xm_groups, ra, ca, fs_hz, weights, log=log)
+                  if len(xm_groups) >= 2 else None)
+            if not fill_sources:
+                xm_groups = None
+                log("[stack] no alt master left: primary master only")
+        if xm is None and xm_groups:
             log("[stack] cross-master: masters never overlap in the sample - fill only")
 
+    gain_prior, gain_norm = {}, None
+    if GAIN_PRIOR and primary:
+        anchor = primary[0]
+        gs = {}
+        for fd in asample:
+            if anchor not in fd:
+                continue
+            ref0 = fd[anchor].f0.astype(np.float64)
+            for n, fr in fd.items():
+                if n == anchor:
+                    continue
+                _, _, (g, _) = register_field(fr.f0.astype(np.float64), ref0, ra, ca, True, return_level=True)
+                gs.setdefault(n, []).append(g)
+        gain_prior = {n: float(np.median(v)) for n, v in gs.items() if len(v) >= 3}
+        gain_prior[anchor] = 1.0
+        prim_g = [gain_prior[n] for n in primary if n in gain_prior]
+        gain_norm = float(np.median(prim_g)) if prim_g else None
+        log("[stack] capture gains vs %s (median of the sample): " % anchor
+            + " ".join(f"{n} {g:.4f}" for n, g in sorted(gain_prior.items()))
+            + (f"; output at the median primary capture's ({gain_norm:.4f})" if gain_norm else ""))
+    # reference preference: the output takes the reference capture's level and
+    # saturation, and players' chroma gain differs by +-10 % (Countryside S1:
+    # ds1 1.08, ds2 0.90, ds4 0.98, ds5 0.93 of the held-run truth) - the
+    # cleanest capture (ds2) put the far end of that range, and its steps,
+    # into the stack.  Prefer the primary capture nearest the median chroma
+    # and luma gain of the sample (ties: the cleanest).
+    ref_rank = {}
+    if STABLE_REF and len(primary) >= 3:
+        anchor = primary[0]
+        ca_, cl_ = {n: [] for n in primary}, {n: [] for n in primary}
+        for fd in asample:
+            if anchor not in fd:
+                continue
+            ref0 = fd[anchor].f0.astype(np.float64)
+            for n in primary:
+                if n not in fd:
+                    continue
+                if n == anchor:
+                    ca_[n].append(1.0); cl_[n].append(1.0)
+                    continue
+                r, _, (g, _) = register_field(fd[n].f0.astype(np.float64), ref0, ra, ca, True, return_level=True)
+                cp = chroma_phase(r, ref0, ca)
+                rp = chroma_phase(ref0, ref0, ca)
+                ca_[n].append(float(np.abs(cp).sum()) / max(float(np.abs(rp).sum()), 1e-9))
+                cl_[n].append(1.0 / max(g, 1e-6))
+        cg = {n: float(np.median(v)) for n, v in ca_.items() if v}
+        lg = {n: float(np.median(v)) for n, v in cl_.items() if v}
+        if len(cg) >= 3:
+            mc, ml = float(np.median(list(cg.values()))), float(np.median(list(lg.values())))
+            dist = {n: abs(np.log(cg[n] / mc)) + abs(np.log(lg[n] / ml)) for n in cg}
+            order = sorted(dist, key=lambda n: (round(dist[n] / 0.01), -weights.get(n, 0.0)))
+            ref_rank = {n: i for i, n in enumerate(order)}
+            log("[stack] reference preference (chroma / luma gain vs %s): " % anchor
+                + ", ".join(f"{n} {cg[n]:.3f}/{lg[n]:.3f}" for n in order))
     del asample
     writer = StackWriter(outbase, vp, system, git_commit)
     # LDSTACK_FRAME_STATS=<file>: one line per output frame (does not change the stack):
@@ -2976,9 +3722,11 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
              weights=weights, sig=sig, ra=ra, ca=ca, fh=fh, fw=fw,
              subpixel=subpixel, chroma_align=chroma_align, line_reg=line_reg,
              reg_confidence=reg_confidence, reg_drop_mult=reg_drop_mult,
-             xm=xm, xm_groups=xm_groups, fs_hz=fs_hz)
+             xm=xm, xm_groups=xm_groups, fs_hz=fs_hz,
+             gain_prior=gain_prior, gain_norm=gain_norm, ref_rank=ref_rank)
 
     last = {"key": None, "r": None}
+    cav = all(getattr(s, "cav", getattr(getattr(s, "_inner", None), "cav", True)) for s in sources)
     padded = []                 # (first, last) picture of each padded hole
 
     def write_result(r, pad=False):
@@ -3020,11 +3768,18 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         if r is None:
             return
         k, pk = r.get("key"), last["key"]
-        if pk is not None and k is not None and k - pk > 1:
+        carried = lambda x: len((x.get("fstats") or {}).get("avail", [])) + len((x.get("fstats") or {}).get("avail_alt", []))
+        if (pk is not None and k is not None and k - pk > 1
+                and min(carried(r), carried(last["r"])) < 2):
+            # a gap next to a frame that only one capture claims is far more
+            # likely a mis-sieved key than missing pictures: not padded
+            log(f"[stack] pictures {pk + 1}-{k - 1} missing next to a frame carried "
+                f"by one capture: not padded")
+        elif pk is not None and k is not None and k - pk > 1:
             hole = k - pk - 1
             if hole <= GAP_MAX:
                 for gk in range(pk + 1, k):
-                    write_result(pad_frame(last["r"], pk, gk), pad=True)
+                    write_result(pad_frame(last["r"], gk, cav), pad=True)
                 padded.append((pk + 1, k - 1))
                 log(f"[stack] pictures {pk + 1}-{k - 1} in no usable capture: "
                     f"padded with {hole} repeat(s) of picture {pk}")
@@ -3096,12 +3851,45 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
         global _WORKER_STATE
         _WORKER_STATE = (sources, P)
 
+        iot = [0.0, 0.0, 0]
+
         def _retire(results):
             for r in results:
+                if r and "io" in r:
+                    iot[0] += r["io"][0]; iot[1] += r["io"][1]; iot[2] += 1
                 emit(r)
 
         try:
-            if jobs and jobs > 1:
+            if jobs and jobs > 1 and READAHEAD:
+                import multiprocessing as mp
+                log(f"[stack] parallel: {jobs} workers over {len(shared)} frames "
+                    f"in blocks of {BLOCK} ({n_partial} present on only some captures), "
+                    f"reading ahead")
+                ctx = mp.get_context("fork")
+                resq = ctx.Queue()
+                credits = [ctx.Semaphore(2) for _ in range(jobs)]
+                procs = [ctx.Process(target=_block_worker, args=(w, jobs, blocks, credits[w], resq),
+                                     daemon=True) for w in range(jobs)]
+                for pr in procs:
+                    pr.start()
+                try:
+                    done, nexti = {}, 0
+                    while nexti < len(blocks):
+                        bi, res = resq.get()
+                        if bi < 0:
+                            raise RuntimeError("stack worker failed:\n" + res)
+                        done[bi] = res
+                        while nexti in done:
+                            _retire(done.pop(nexti))
+                            credits[nexti % jobs].release()
+                            nexti += 1
+                    for pr in procs:
+                        pr.join()
+                finally:
+                    for pr in procs:
+                        if pr.is_alive():
+                            pr.terminate()
+            elif jobs and jobs > 1:
                 # frames are independent -> fan blocks out over a fork pool
                 # (sources/P inherited copy-on-write); the parent writes the
                 # results in key order
@@ -3127,6 +3915,9 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
                     _retire(_frame_block(b))
         finally:
             _WORKER_STATE = None
+        if iot[2]:
+            log(f"[stack] worker time: {iot[0]:.0f} s reading, {iot[1]:.0f} s stacking "
+                f"({100 * iot[0] / max(iot[0] + iot[1], 1e-9):.0f}% reading) over {iot[2]} blocks")
     else:
         # Streaming sources cannot be asked for a key twice, so the frames
         # arrive in lockstep order and are stacked as they come.
@@ -3294,6 +4085,10 @@ def main(argv=None):
                    "of using alt masters only to fill dropouts: on-disc noise is "
                    "per glass master, so averaging masters reduces it.  Masters "
                    "are grouped by their shared 5.9-7 MHz disc noise")
+    p.add_argument("--no-deherring", action="store_true",
+                   help="(--cross_master) do not remove the FM-beat herringbone per capture "
+                   "before the masters are blended (default: removed, carrier calibrated "
+                   "per master; needs newdecode's deherring.py, LDSTACK_DEHERRING_LIB)")
     p.add_argument("--masters", type=str, default=None,
                    help="explicit master grouping instead of auto-clustering; "
                    "groups separated by ';', captures by ',', first group is the "
@@ -3407,7 +4202,7 @@ def main(argv=None):
               reg_confidence=not args.no_reg_confidence,
               reg_drop_mult=args.reg_drop_mult, line_reg=args.line_reg,
               jobs=args.jobs, git_commit=_git_commit(),
-              cross_master=args.cross_master)
+              cross_master=args.cross_master, deherring=not args.no_deherring)
     finally:
         for s in sources:
             s.close()

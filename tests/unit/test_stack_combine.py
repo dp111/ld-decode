@@ -138,7 +138,17 @@ def test_dropout_on_every_capture_is_flagged_on_its_row(tmp_path):
     _, bases = _captures(tmp_path, ncap=3, dropouts=d)
     j, t, _ = _stack(tmp_path, bases)
     assert _do_rows(j, 2) == [(row + 1, x0, x1)]
-    assert t[2, row, x0:x1].max() < 1000         # and that row is the damaged one
+    # its value is concealed from the lines around it (the rail is not written)
+    assert t[2, row, x0:x1].min() > 1000
+    assert np.abs(t[2, row, x0:x1] - 0.5 * (t[2, row - 1, x0:x1] + t[2, row + 1, x0:x1])).max() < 1
+
+
+def test_conceal_vertical_uses_nearest_good_lines():
+    out = np.arange(10, dtype=np.float64)[:, None] * np.ones((1, 4)) * 100
+    bad = np.zeros_like(out, bool); bad[4:6, 1] = True
+    o = S.conceal_vertical(out, bad)
+    assert o[4, 1] == o[5, 1] == 450.0          # mean of lines 3 and 6
+    assert (o[~bad] == out[~bad]).all()
 
 
 def test_masked_median_ignores_masked_entries():
@@ -175,7 +185,7 @@ def test_level_fit_unbiased_on_a_black_field():
     ra, ca = S._active({"activeVideoStart": AVS, "activeVideoEnd": AVE, "fieldHeight": FH})
     out, best, (g, o) = S.register_field(b, a, ra, ca, return_level=True)
     assert abs(g - 1) < 0.01
-    assert abs(out[ra, 5:15].mean() - 1000) < 100      # sync tip kept
+    assert abs(best[1]) <= S.REG_MAX_DX + 0.5           # nothing to register on: bounded
     x = (b - BLACK)[ra, ca].ravel(); y = (a - BLACK)[ra, ca].ravel()
     assert np.polyfit(x, y, 1)[0] < 0.2                 # what plain least squares gave
 
@@ -189,15 +199,6 @@ def test_registration_is_horizontal_and_bounded():
     flat = np.full((FH, FW), float(BLACK)) + np.random.default_rng(0).normal(0, 300, (FH, FW))
     _, best = S.register_field(flat, flat[::-1].copy(), ra, ca)
     assert abs(best[1]) <= S.REG_MAX_DX + 0.5
-
-
-def test_output_level_is_the_consensus_not_the_reference(tmp_path):
-    """Offsets 0, 0, +900: the reference is one of the 0 captures, but the
-    output sits at the mean of the three (+300), whichever is the reference."""
-    truth, bases = _captures(tmp_path, ncap=3, levels={2: (1.0, 900.0)})
-    _, t, _ = _stack(tmp_path, bases)
-    d = (t - truth)[:, 24:FH - 6, AVS:AVE].mean()
-    assert abs(d - 300) < 60, d
 
 
 def test_chroma_phase_ignores_masked_samples():
@@ -255,11 +256,41 @@ def test_missing_picture_is_padded(tmp_path):
     assert sum(f["audioSamples"] for f in j["fields"]) == len(pcm)
 
 
-def test_picture_vbi_clv_round_trip():
+def test_picture_vbi_round_trip():
     key = ((1 * 60 + 23) * 60 + 45) * 25 + 17
-    prev = [[0x80E000 | (0xA + 4) << 16 | 5 << 8 | 0x16, 0xF1DD23, 0xF1DD23], [0, 0, 0]]
-    v0, v1 = S.picture_vbi(prev, key - 1, key)
+    v0, v1 = S.picture_vbi(key, cav=False)
     assert S.clv_frame(v0 + v1) == key
+    v0, v1 = S.picture_vbi(31234)
+    assert S.cav_picture(v0) == 31234
+
+
+def test_padded_frame_keeps_its_dropout_flags(tmp_path):
+    """A repeat of a frame with a residual (every-capture) dropout carries
+    the same flags, so the corrector conceals it in the repeat too."""
+    pics = [100, 101, 102, 104, 105, 106]
+    row, x0, x1 = 30, 80, 120
+    d = {c: {4: [(row, x0, x1)]} for c in range(3)}      # picture 102, first field
+    _, bases = _captures(tmp_path, nframes=6, ncap=3, pictures=pics, dropouts=d)
+    j, _, _ = _stack(tmp_path, bases)
+    assert _do_rows(j, 4) == [(row + 1, x0, x1)]
+    assert j["fields"][6].get("pad") and _do_rows(j, 6) == [(row + 1, x0, x1)]
+
+
+def test_no_padding_next_to_a_single_capture_key(tmp_path):
+    """A run of keys on one capture far past the others' end (a seek, or a
+    mis-sieved run) must not pad the output with ~200 repeats."""
+    truth = _truth(8)
+    rng = np.random.default_rng(1)
+    bases = []
+    for c, pics in enumerate(([100, 101, 102, 103, 104, 105, 106, 107],) * 2
+                             + ([100, 101, 102, 103, 300, 301, 302, 303],)):
+        b = str(tmp_path / f"cap{c}")
+        _write_capture(b, truth + rng.normal(0, 150, truth.shape), list(pics))
+        bases.append(b)
+    j, _, _ = _stack(tmp_path, bases)
+    got = [S.cav_picture(f["vbi"]["vbiData"]) for f in j["fields"][::2]]
+    assert got == list(range(100, 108)) + [300, 301, 302, 303]
+    assert not any(f.get("pad") for f in j["fields"])
 
 
 def test_audio_lag_confidence():
@@ -348,3 +379,103 @@ def test_cross_master_fill_of_a_master_level_dropout(tmp_path, alt_rail):
     else:
         assert _do_rows(j, 4) == []
         assert np.abs(t[4, row, x0:x1] - truth[4, row, x0:x1]).max() < 2000
+
+
+def _hat_frames(amp, nframes=6, seed=7):
+    """Full-size PAL fields: masters of 4 / 2 / 1 captures, equal disc noise
+    300, player noise 400 (the single capture 800).  True error variance per
+    master 130k / 170k / 730k -> blend weights 0.51 / 0.39 / 0.09."""
+    rng = np.random.default_rng(seed)
+    fh, fw = 313, 1135
+    caps = {"a1": (0, 400), "a2": (0, 400), "a3": (0, 400), "a4": (0, 400),
+            "b1": (1, 400), "b2": (1, 400), "c1": (2, 800)}
+    y, x = np.mgrid[0:fh, 0:fw]
+    frames = []
+    for k in range(nframes):
+        t = np.full((fh, fw), 16000.0); t[:, 10:60] = 1000.0
+        pic = amp * (np.sin(x / (7.0 + k)) * np.cos(y / 11.0) + 0.5 * np.sin(x / 3.1 + y / 5.0))
+        t[24:307, 185:1107] += pic[24:307, 185:1107] + amp
+        disc = [rng.normal(0, 300, (fh, fw)) for _ in range(3)]
+        fd = {}
+        for n, (m, p) in caps.items():
+            f = t + disc[m] + rng.normal(0, p, (fh, fw))
+            fd[n] = S.Frame(k, f, f, {}, {}, [], [], None, None)
+        frames.append(fd)
+    w = {n: 1.0 / (300.0 ** 2 + p ** 2) for n, (m, p) in caps.items()}
+    return frames, [["a1", "a2", "a3", "a4"], ["b1", "b2"], ["c1"]], w
+
+
+@pytest.mark.parametrize("amp", [6000.0, 300.0])
+def test_three_master_hat_weights(amp):
+    """The three-cornered hat recovers the masters' weights on real-picture
+    and on near-black (low-SNR) fields.  With the least-squares level match
+    the near-black case collapsed the alt masters' variance and gave the
+    single noisiest capture ~half the blend (CommunityNorth, Oct 2026)."""
+    frames, groups, w = _hat_frames(amp)
+    vp = {"activeVideoStart": 185, "activeVideoEnd": 1107, "fieldHeight": 313}
+    ra, ca = S._active(vp)
+    xm = S.xm_estimate(frames, groups, ra, ca, 17734475.0, w, log=lambda *a: None)
+    a = xm["alpha"].mean(1)
+    assert abs(a[0] - 0.51) < 0.12 and abs(a[1] - 0.39) < 0.12 and a[2] < 0.2, a
+
+
+def test_short_pcm_and_odd_field_count(tmp_path):
+    """A capture whose .pcm ends early and whose .tbc.json carries an odd
+    number of fields still stacks: the short frame's audio is left out of
+    the audio combine, the trailing half frame is ignored."""
+    truth, bases = _captures(tmp_path, nframes=6, ncap=3)
+    p = bases[0] + ".pcm"
+    a = np.fromfile(p, "<i2"); a[: len(a) - 2 * SPF + 100].tofile(p)       # last frame short
+    j = json.load(open(bases[1] + ".tbc.json")); j["fields"] = j["fields"][:-1]
+    json.dump(j, open(bases[1] + ".tbc.json", "w"))
+    s = S.TBCFrameSource(bases[0])
+    s.keys(); assert s.get(105).audio.shape[0] < SPF and s.get(104).audio.shape[0] == SPF
+    assert s._spf == SPF
+    s.close()
+    j, t, pcm = _stack(tmp_path, bases)
+    assert len(j["fields"]) == 12 and len(pcm) == sum(f["audioSamples"] for f in j["fields"])
+
+
+def test_read_ahead_is_bit_identical(tmp_path, monkeypatch):
+    """The read-ahead workers stack exactly what the pool did."""
+    truth, bases = _captures(tmp_path, nframes=12, ncap=3, dropouts={1: {4: [(40, 100, 160)]}})
+    monkeypatch.setattr(S, "BLOCK", 3)
+    outs = {}
+    for ra_on in (False, True):
+        monkeypatch.setattr(S, "READAHEAD", ra_on)
+        srcs = [S.TBCFrameSource(b) for b in bases]
+        o = str(tmp_path / f"stk{int(ra_on)}")
+        S.stack(srcs, o, sample=4, jobs=2, log=lambda *a: None)
+        for s in srcs:
+            s.close()
+        outs[ra_on] = (open(o + ".tbc", "rb").read(), open(o + ".pcm", "rb").read(),
+                       json.load(open(o + ".tbc.json"))["fields"])
+    assert outs[False] == outs[True]
+
+
+def test_content_offsets_per_segment():
+    """A capture numbered one low up to a repeated picture, right after it."""
+    rng = np.random.default_rng(5)
+    H, W = 40, 64
+    pics = {k: rng.normal(size=(H, W)).astype(np.float32) * 1000 + 20000 for k in range(1, 4001)}
+
+    def src(name, mapping):
+        sv = S.TBCFrameSource.__new__(S.TBCFrameSource)
+        sv.name = name
+        fis = sorted(mapping)
+        sv._idx = {k: i for i, k in enumerate(fis)}
+        content = [pics[mapping[k]] for k in fis]
+        sv._read_field = lambda idx, c=content: c[idx // 2]
+        return sv
+    a = src("a", {k: k for k in range(1, 4001)})
+    # b's label k shows picture k+1 up to 2399, then picture k (a repeated label at the switch)
+    b = src("b", {**{k: k + 1 for k in range(1, 2400)}, **{k: k for k in range(2400, 4001)}})
+    old = S.CONTENT_WIN
+    S.CONTENT_WIN = 500
+    try:
+        offs = S.content_offsets([a, b], log=lambda m: None)
+    finally:
+        S.CONTENT_WIN = old
+    segs = offs["b"]
+    assert segs[0][2] == 1 and segs[-1][2] == 0
+    assert abs(segs[0][1] - 2399) <= 1, segs

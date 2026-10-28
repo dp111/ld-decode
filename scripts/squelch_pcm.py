@@ -14,7 +14,13 @@ Fallback - when no .tbc.json is beside the .pcm, or it carries no usable status
 codes, spans are detected from the audio itself. Real programme on these discs
 is band-limited (nothing above ~14 kHz) while carrier-less noise fills the
 spectrum to Nyquist, so a span is muted only when BOTH absolute HF power
-(>14 kHz) exceeds HF_THRESH and overall level exceeds RMS_THRESH.
+(>14 kHz) exceeds HF_THRESH and overall level exceeds RMS_THRESH, and the
+two channels are uncorrelated (|r| < CORR_MAX). The last test is what tells
+carrier-less noise from programme: the two FM demodulators' noise is
+independent (r ~0.0), while sound on these discs is mono or correlated
+stereo (r 0.9-1.0). Without it the spectral test muted bright programme -
+111 s of real sound on CommunitySouth, 61 s on CommunityNorth, 50 s on
+NationalA (every spectral span on those sides had r > 0.9).
 
 Both paths get raised-cosine fades at the edges. Input is s16le stereo
 44.1 kHz; output same format.
@@ -34,6 +40,8 @@ HF_THRESH = 60.0      # RMS-equivalent of >14 kHz band, max over channels
                       # (measured: programme <= ~13 incl. quiet passages and
                       # eruptions; carrier-off runout 145-175)
 RMS_THRESH = 700.0
+CORR_MAX = 0.3        # |L/R correlation|: carrier-off noise 0.0 +- 0.05,
+                      # programme >= 0.9 (Community/NationalA, 1 s windows)
 ENTER, EXIT = 3, 2    # hysteresis (windows)
 FADE = RATE // 10     # 100 ms
 
@@ -120,6 +128,9 @@ def classify(a):
         rms = np.sqrt((seg ** 2).mean())
         if rms <= RMS_THRESH:
             continue
+        l, r = seg[:, 0] - seg[:, 0].mean(), seg[:, 1] - seg[:, 1].mean()
+        if abs((l * r).sum()) > CORR_MAX * np.sqrt((l * l).sum() * (r * r).sum()):
+            continue
         hf_rms = 0.0
         for c in (0, 1):
             x = seg[:, c] - seg[:, c].mean()
@@ -186,10 +197,9 @@ def main():
     #     region the disc declares as having sound - inter-segment gaps and
     #     dropouts, which the status word cannot express because it only
     #     changes at region boundaries.
-    # Measured on CommunitySouth: the disc declares carriers back at 29:59 but
-    # they do not really return until 30:16, and 12 further spans between 30:18
-    # and 35:56 are genuinely carrier-less (HF 68-155). VBI alone would have
-    # left ~110 s of broadband noise unmuted, so the output is the UNION.
+    # (CommunitySouth's 30:00-35:56 spans, once thought carrier-less from
+    # their HF alone, are real mono programme, L/R r > 0.9: see CORR_MAX.)
+    # The output is the UNION.
     vsp = []
     if "--no-vbi" not in opts and os.path.exists(json_path):
         try:
