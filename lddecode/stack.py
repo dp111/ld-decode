@@ -3264,6 +3264,24 @@ def _frame_block(keys, blk=None):
 READAHEAD = os.environ.get("LDSTACK_READAHEAD", "1") not in ("0", "", "no")
 
 
+def _get_result(resq, procs, poll=30.0):
+    """Next (block index, results) from the workers.  A worker killed from
+    outside (e.g. by the kernel's OOM killer) never reports, and its blocks
+    never arrive: without this check the parent waited on resq for ever (a
+    North stack hung 12 h that way).  So fail as soon as the queue is quiet
+    while a worker has died with a non-zero exit code."""
+    import queue
+    while True:
+        try:
+            return resq.get(timeout=poll)
+        except queue.Empty:
+            dead = [(w, pr.exitcode) for w, pr in enumerate(procs)
+                    if pr.exitcode not in (None, 0)]
+            if dead:
+                raise RuntimeError("stack worker(s) died without reporting "
+                                   "(worker, exit code): %s" % dead)
+
+
 def _block_worker(w, nworkers, blocks, credit, resq):
     """Worker w of nworkers: blocks w, w + nworkers, ...; each result goes to
     resq as (block index, results); credit bounds how far it runs ahead of
@@ -3875,7 +3893,7 @@ def stack(sources, outbase, system="PAL", subpixel=True, chroma_align=True,
                 try:
                     done, nexti = {}, 0
                     while nexti < len(blocks):
-                        bi, res = resq.get()
+                        bi, res = _get_result(resq, procs)
                         if bi < 0:
                             raise RuntimeError("stack worker failed:\n" + res)
                         done[bi] = res
