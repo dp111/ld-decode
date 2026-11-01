@@ -1755,17 +1755,24 @@ class Field:
         n_ornotrange_scalar(iserr, demod, normal_min, normal_max)
         n_ornotrange_scalar(iserr, demod_05, normal_min_05, normal_max_05)
 
+        # The sync-region test reads demod less the PAL pilot.  The 3.75 MHz
+        # pilot rides the sync tip at some 60 IRE peak to peak in demod, so
+        # its troughs reach sync_min and the noise on them was flagged a
+        # sample or two at a time on every line.  NTSC has no pilot.  The
+        # normal-range test above still reads demod as it is.
+        demod_sync = (demod - f.data["video"]["demod_pilot"]) if isPAL else demod
+
         # Un-flag sync areas where the lower thresholds apply
         for line in range(1, len(f.linelocs)):
             if line in vsync_lines:
                 start = int(f.linelocs[line])
                 end = int(f.linelocs[line + 1])
-                _dropout_unflag_sync(iserr, demod, demod_05, start, end,
+                _dropout_unflag_sync(iserr, demod_sync, demod_05, start, end,
                                      sync_min, normal_max, sync_min_05, normal_max_05)
             else:
                 start = int(f.linelocs[line])
                 end = start + hsync_len
-                _dropout_unflag_sync(iserr, demod, demod_05, start, end,
+                _dropout_unflag_sync(iserr, demod_sync, demod_05, start, end,
                                      sync_min, normal_max, sync_min_05, normal_max_05)
 
         iserr |= iserr_rf
@@ -1801,7 +1808,9 @@ class Field:
                 errlist.append((curerr[0] - 8, curerr[1] + 4))
                 curerr = (e, e)
 
-        errlist.append(curerr)
+        # The last run takes the same margins as the rest: unpadded, a real
+        # dropout came out shorter whenever nothing followed it in the field.
+        errlist.append((curerr[0] - 8, curerr[1] + 4))
 
         return errlist
 
