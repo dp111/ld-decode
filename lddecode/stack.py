@@ -2994,7 +2994,12 @@ def _compute_frame(fd, P, hints=None):
         # dropout-flagged pixels are never used, even when every capture
         # flagged them (user instruction): leave them for the dropout
         # corrector rather than trusting flagged samples
-        prim_info = {} if (REJ_KEEP_MEDIAN and len(present_primary) >= 3) else None
+        # (>= 2, not >= 3: with two captures that disagree by more than the
+        # 5-sigma window -- players' saturated chroma differs by that much --
+        # BOTH are rejected (the median is their mean), and without rej_only
+        # every such pixel became a residual dropout, vertically concealed and
+        # flagged: garbled chroma on 2-capture stacks, South ds12+ds1 2930)
+        prim_info = {} if (REJ_KEEP_MEDIAN and len(present_primary) >= 2) else None
         out, wsum = combine_set(present_primary, diff_dod=DIFF_DOD, info=prim_info)
         # ---- cross-master blend: average the masters' estimates per band
         blended = False

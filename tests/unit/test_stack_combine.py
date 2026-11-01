@@ -479,3 +479,30 @@ def test_content_offsets_per_segment():
     segs = offs["b"]
     assert segs[0][2] == 1 and segs[-1][2] == 0
     assert abs(segs[0][1] - 2399) <= 1, segs
+
+
+def test_two_captures_that_disagree_keep_their_mean(tmp_path):
+    """Two captures whose saturated chroma differs by more than the 5-sigma
+    window (players' chroma gain differs by ~10-30 %) are both rejected by the
+    median test (with two, the median is their mean).  With three or more the
+    rejected-only pixels keep the median; with two they became residual
+    dropouts, vertically concealed and flagged -- garbled colour on every
+    2-capture stack (Community South ds12+ds1, picture ~3070)."""
+    truth = _truth(6)
+    x = np.arange(FW)
+    rows, xs = slice(30, 42), slice(96, 192)
+    chroma = 8000.0 * np.sin(2 * np.pi * x / 4.0)[None, xs]
+    rng = np.random.default_rng(3)
+    bases, caps = [], []
+    for c, g in enumerate((1.3, 1.0)):
+        f = truth.copy()
+        f[4, rows, xs] += g * chroma
+        f = f + rng.normal(0, 150.0, f.shape)
+        b = str(tmp_path / f"cap{c}")
+        _write_capture(b, f, list(range(100, 106)))
+        bases.append(b); caps.append(f)
+    j, t, _ = _stack(tmp_path, bases)
+    assert _do_rows(j, 4) == []
+    mean = 0.5 * (caps[0][4] + caps[1][4])
+    err = np.abs(t[4, rows, xs] - mean[rows, xs])
+    assert err.max() < 600, err.max()
